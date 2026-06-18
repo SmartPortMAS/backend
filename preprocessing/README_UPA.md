@@ -13,6 +13,7 @@ API 6종 전처리 모듈이다. 최종 staging 결과물은 **공통 컬럼명(
 | `upa_preprocess.py` | raw 로더 + API별 파이프라인 + 실행 엔트리 |
 | `upa_collector.py` | **Open API 수집기** (serviceKey로 호출 → raw 저장 → 전처리) |
 | `upa_scheduler.py` | **APScheduler 주기 수집 예시** (데이터별 주기 분리) |
+| `upa_loader.py` | **PostgreSQL(RDS) 적재기** (staging CSV → DB 멱등 UPSERT) |
 
 ## 0. 빠른 시작 (실제 데이터 수집 → 전처리)
 
