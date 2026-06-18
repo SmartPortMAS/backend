@@ -100,6 +100,23 @@ def validate_draught(df: pd.DataFrame, max_draught: float = 30.0) -> pd.DataFram
 # ===========================================================================
 # 공통 전처리 단계 (모든 API 공유)
 # ===========================================================================
+def drop_duplicate_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    완전 중복 행 제거.
+    (실행마다 바뀌는 collected_at_utc 는 비교에서 제외하여, 같은 원본 행이
+     여러 번 들어와도 1건만 남긴다. 운항정보는 이벤트 단위라 정상적으로 여러 행이
+     같은 port_call_id 를 가질 수 있으므로, 키가 아닌 '전체 컬럼' 기준으로만 제거한다.)
+    """
+    df = df.copy()
+    subset = [c for c in df.columns if c != "collected_at_utc"]
+    before = len(df)
+    df = df.drop_duplicates(subset=subset).reset_index(drop=True)
+    removed = before - len(df)
+    if removed:
+        print(f"  - 중복 {removed}행 제거 ({before} -> {len(df)})")
+    return df
+
+
 def _apply_common(df: pd.DataFrame, spec: dict, is_synthetic: bool) -> pd.DataFrame:
     """컬럼 표준화 -> 결측 표준화 -> 메타컬럼 -> 숫자형 -> 시간(KST->UTC)."""
     df = common.standardize_column_names(df, spec["column_map"])
@@ -130,6 +147,7 @@ def preprocess_vessel_nvgt(df: pd.DataFrame, is_synthetic: bool = False) -> pd.D
     df = common.create_port_call_id(df)
     df = common.flag_missing_key(df, spec["key_cols"])
     df = common.validate_date_order(df, "arrival_at_utc", "departure_at_utc")
+    df = drop_duplicate_rows(df)
     return df
 
 
@@ -142,6 +160,7 @@ def preprocess_vessel_position(df: pd.DataFrame, is_synthetic: bool = False) -> 
     df = common.flag_ulsan_bbox(df)
     df = common.validate_speed_course(df)
     df = validate_draught(df)
+    df = drop_duplicate_rows(df)
     return df
 
 

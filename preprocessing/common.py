@@ -82,7 +82,7 @@ def parse_datetime_utc(df: pd.DataFrame, columns: list) -> pd.DataFrame:
     df = df.copy()
     for col in columns:
         if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
+            df[col] = pd.to_datetime(df[col], errors="coerce", utc=True, format="mixed")
     return df
 
 
@@ -94,7 +94,7 @@ def parse_datetime_kst_to_utc(df: pd.DataFrame, columns: list) -> pd.DataFrame:
     df = df.copy()
     for col in columns:
         if col in df.columns:
-            dt = pd.to_datetime(df[col], errors="coerce")
+            dt = pd.to_datetime(df[col], errors="coerce", format="mixed")
             df[col] = (
                 dt
                 .dt.tz_localize("Asia/Seoul", nonexistent="NaT", ambiguous="NaT")
