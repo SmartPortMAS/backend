@@ -7,11 +7,11 @@ class DatabaseConnectionError(AppError):
 
 
 class MsdsNotFoundError(AppError):
-    """Raised when a CAS number has no matching record in KOSHA MSDS."""
+    """Raised when no matching MSDS record exists for a given CAS number or chem_id."""
 
-    def __init__(self, cas_no: str) -> None:
-        self.cas_no = cas_no
-        super().__init__(f"MSDS not found for CAS No. {cas_no}")
+    def __init__(self, identifier: str) -> None:
+        self.identifier = identifier
+        super().__init__(f"MSDS not found for identifier: {identifier}")
 
 
 class MsdsUpstreamError(AppError):
@@ -21,3 +21,12 @@ class MsdsUpstreamError(AppError):
         self.cas_no = cas_no
         self.reason = reason
         super().__init__(f"KOSHA MSDS API call failed for CAS No. {cas_no}: {reason}")
+
+
+class LLMGenerationError(AppError):
+    """Raised when the LLM provider fails to return a usable structured response."""
+
+    def __init__(self, provider: str, reason: str) -> None:
+        self.provider = provider
+        self.reason = reason
+        super().__init__(f"LLM generation failed (provider={provider}): {reason}")
