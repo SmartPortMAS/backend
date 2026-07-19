@@ -8,6 +8,7 @@ from app.api.v1.health import router as health_router
 from app.api.v1.msds import router as msds_router
 from app.api.v1.safety import router as safety_router
 from app.api.v1.scheduling import router as scheduling_router
+from app.api.v1.weather import router as weather_router
 from app.config import get_settings
 from app.core.logging import configure_logging
 from app.neo4j_client import neo4j_client
@@ -37,6 +38,7 @@ app.include_router(health_router, prefix="/api/v1")
 app.include_router(msds_router, prefix="/api/v1")
 app.include_router(safety_router, prefix="/api/v1")
 app.include_router(scheduling_router, prefix="/api/v1")
+app.include_router(weather_router, prefix="/api/v1")
 
 
 @app.get("/health")
