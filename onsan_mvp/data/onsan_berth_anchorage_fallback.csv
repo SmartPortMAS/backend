@@ -1,0 +1,15 @@
+﻿berth_id,berth_name,max_dwt,fallback_anchorage
+CY-OTK1,OTK 1부두,40000,E3
+CY-OTK2,OTK 2부두,10000,E1
+CY-UTK,UTK 부두,30000,E3
+CY-DHY,대한유화 부두,80000,E3
+SA-JI1,정일 1부두,40000,E3
+SA-JI2,정일 2부두,40000,E3
+SA-HS,효성 부두,30000,E3
+SA-SO1,S-Oil 1부두,50000,E3
+SA-SO2,S-Oil 2부두,120000,E3
+WS-SO3,S-Oil 3부두,50000,E3
+WS-SO4,S-Oil 4부두,30000,E3
+BU-SOIL,S-Oil 부이,350000,부이직접/외해대기
+BU-OILHUB,오일허브 부이,325000,부이직접/외해대기
+BU-KNOC,석유공사 부이,325000,부이직접/외해대기

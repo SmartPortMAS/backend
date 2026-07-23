@@ -1,0 +1,11 @@
+﻿a,b,수역_a,수역_b,distance_m
+CY-OTK1,CY-OTK2,처용리,처용리,0.0
+CY-OTK1,CY-DHY,처용리,처용리,279.7
+CY-OTK2,CY-DHY,처용리,처용리,279.7
+SA-JI1,SA-JI2,산암리,산암리,0.0
+SA-SO1,SA-SO2,산암리,산암리,0.0
+SA-SO1,WS-SO3,산암리,원산리,0.0
+SA-SO1,WS-SO4,산암리,원산리,0.0
+SA-SO2,WS-SO3,산암리,원산리,0.0
+SA-SO2,WS-SO4,산암리,원산리,0.0
+WS-SO3,WS-SO4,원산리,원산리,0.0

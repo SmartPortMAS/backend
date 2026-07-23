@@ -1,0 +1,15 @@
+﻿berth_id,berth_name,operator,선석수,internal_substitution,cross_substitutes,anchorage_only
+CY-OTK1,OTK 1부두,오드펠터미널코리아,2,Y,CY-OTK2,N
+CY-OTK2,OTK 2부두,오드펠터미널코리아,2,Y,CY-OTK1,N
+CY-UTK,UTK 부두,유나이티드터미널코리아,2,Y,,N
+CY-DHY,대한유화 부두,대한유화,2,Y,,N
+SA-JI1,정일 1부두,정일스톨트헤븐,2,Y,SA-JI2,N
+SA-JI2,정일 2부두,정일스톨트헤븐,2,Y,SA-JI1,N
+SA-HS,효성 부두,효성,1,N,,Y
+SA-SO1,S-Oil 1부두,S-OIL,2,Y,SA-SO2/WS-SO3/WS-SO4,N
+SA-SO2,S-Oil 2부두,S-OIL,3,Y,SA-SO1/WS-SO3/WS-SO4,N
+WS-SO3,S-Oil 3부두,S-OIL,2,Y,SA-SO1/SA-SO2/WS-SO4,N
+WS-SO4,S-Oil 4부두,S-OIL,3,Y,SA-SO1/SA-SO2/WS-SO3,N
+BU-SOIL,S-Oil 부이,S-OIL,1,N,BU-OILHUB,N
+BU-OILHUB,오일허브 부이,S-OIL,1,N,BU-SOIL,N
+BU-KNOC,석유공사 부이,한국석유공사,1,N,,Y
