@@ -1,8 +1,9 @@
 """안전관제 에이전트 오케스트레이션.
 
-흐름: 대상 화물 조회 -> 인접 화물 조회 -> Neo4j 혼재금지 충돌 탐색
--> 규칙엔진 하한(floor) 계산 -> MSDS 요약 -> LLM 종합 판단
--> floor로 하한 보정 -> 최종 결과 조립.
+흐름: 대상 화물 조회 -> 인접 화물 조회 -> Neo4j 혼재금지 충돌 탐색(MSDS 텍스트
+기반 + IMDG 공인 격리표 기반, 서로 독립적으로 병행 조회) -> 두 규칙엔진 하한
+(floor) 중 더 심각한 쪽 채택 -> MSDS 요약 -> LLM 종합 판단 -> floor로 하한
+보정 -> 최종 결과 조립.
 """
 
 from neo4j import AsyncDriver
@@ -11,11 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.llm.base import LLMClient
 from app.models import MsdsChemical
 
-from .graph_queries import find_incompatible_conflicts
+from .graph_queries import find_imdg_segregation_conflicts, find_incompatible_conflicts
 from .msds_context import resolve_cargo, summarize_hazard_sections
 from .prompt import SYSTEM_PROMPT, build_user_prompt
-from .rule_engine import compute_risk_floor
+from .rule_engine import compute_imdg_floor, compute_risk_floor
 from .schemas import (
+    ImdgSegregationConflict,
     IncompatibleConflict,
     LLMAssessment,
     SafetyAssessmentRequest,
@@ -47,6 +49,11 @@ async def assess_safety(
         target_chem_id=target_row.chem_id,
         adjacent_chem_ids=adjacent_chem_ids,
     )
+    raw_imdg_conflicts = await find_imdg_segregation_conflicts(
+        neo4j_driver,
+        target_chem_id=target_row.chem_id,
+        adjacent_chem_ids=adjacent_chem_ids,
+    )
 
     conflicts: list[IncompatibleConflict] = [
         IncompatibleConflict(
@@ -60,14 +67,30 @@ async def assess_safety(
         for berth_name, row in adjacent_resolved
         if row.chem_id == raw["chem_id"]
     ]
+    imdg_conflicts: list[ImdgSegregationConflict] = [
+        ImdgSegregationConflict(
+            adjacent_berth=berth_name,
+            adjacent_chem_id=raw["chem_id"],
+            adjacent_name=raw["name_ko"] or row.name_ko or row.chem_id,
+            target_imdg_class=raw["target_class"],
+            adjacent_imdg_class=raw["adjacent_class"],
+            segregation_code=raw["segregation_code"],
+        )
+        for raw in raw_imdg_conflicts
+        for berth_name, row in adjacent_resolved
+        if row.chem_id == raw["chem_id"]
+    ]
 
-    rule_engine_floor = compute_risk_floor(raw_conflicts)
+    rule_engine_floor = max_risk_level(
+        compute_risk_floor(raw_conflicts), compute_imdg_floor(raw_imdg_conflicts)
+    )
     hazard_summary = summarize_hazard_sections(target_row.msds_payload)
 
     user_prompt = build_user_prompt(
         target_cargo_name=_cargo_display_name(target_row),
         hazard_summary=hazard_summary,
         conflicts=conflicts,
+        imdg_conflicts=imdg_conflicts,
         rule_engine_floor=rule_engine_floor,
     )
 
@@ -86,6 +109,7 @@ async def assess_safety(
         key_hazards=llm_result.key_hazards,
         reasoning=llm_result.reasoning,
         conflicts=conflicts,
+        imdg_conflicts=imdg_conflicts,
         rule_engine_floor=rule_engine_floor,
         msds_sections_used=list(hazard_summary.keys()),
     )
