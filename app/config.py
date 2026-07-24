@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     neo4j_password: str
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
+    gemini_api_key: str | None = None
+    llm_provider: Literal["gemini", "openai"] = "gemini"
+    llm_model: str = "gemini-flash-latest"
     kma_api_key: str | None = None
     kosha_api_key: str | None = None
     port_mis_api_key: str | None = None
