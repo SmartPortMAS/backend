@@ -21,6 +21,12 @@ class OccupancyStatus(str, Enum):
 
 class VesselSpec(BaseModel):
     draught_m: float = Field(gt=0, description="선박 흘수(m)")
+    dwt_t: float | None = Field(
+        default=None,
+        description="재화중량톤수(DWT). SUBSTITUTABLE_WITH 대체 게이트(to_max_dwt)와 "
+        "정박지 톤수 배정에 쓰인다. 생략하면 흘수만으로 판단(대체 게이트의 DWT 조건은 "
+        "건너뜀 — 온산 MVP 이식, 9장 참고).",
+    )
     name_hint: str | None = Field(default=None, description="로그/에러 메시지용 참고 선명")
 
 
@@ -50,6 +56,12 @@ class BerthCandidate(BaseModel):
     wharf_name: str
     port_name: str | None
     depth_m: float
+    berth_group: str | None = Field(
+        default=None,
+        description="berth_weather_threshold.berth_group 매핑값. 있으면 오케스트레이터가 "
+        "이 선석 전용 기상 임계값으로 재판정할 수 있다(온산 MVP 이식 — '같은 기상, "
+        "선석마다 다른 판정' 차별점). 매핑이 없는(온산 스코프 밖) 선석은 None.",
+    )
     draught_margin_m: float = Field(description="depth_m - 요청 흘수(m). 클수록 여유")
     occupancy_status: OccupancyStatus
     conflicting_port_calls: list[ConflictingPortCall] = Field(default_factory=list)
@@ -64,3 +76,29 @@ class SchedulingResult(BaseModel):
     cargo_category: str
     candidates: list[BerthCandidate]
     total_eligible_count: int = Field(description="수심·화물 적합성만 통과한 선석 총 개수(점유 포함)")
+
+
+class AnchorageAssignment(BaseModel):
+    """정박지 대기 배정 (온산 MVP 이식: build_anchorage_assignment.py의 assign_anchorage 모델).
+
+    전용 선석이 점유 중이고 대체 가능한 선석도 없을 때(단독선석 등) 도달하는 최종 상태.
+    """
+
+    anchorage_id: str
+    name: str
+    tonnage_rule: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+
+
+class BerthResolution(BaseModel):
+    """전용 선석이 점유 중일 때의 '전용 -> 대체 -> 정박지 대기' 3단계 배정 결과.
+
+    scheduling.service.resolve_berth_assignment가 만든다. 오케스트레이터가 후보별로
+    이걸 호출해 실제 배정 가능 여부와 그 근거(trace)를 얻는다.
+    """
+
+    path: str = Field(description="전용 | 대체 | 정박지대기 | 배정불가")
+    berth: BerthCandidate | None = Field(default=None, description="path가 전용/대체일 때만 채워짐")
+    anchorage: AnchorageAssignment | None = Field(default=None, description="path가 정박지대기일 때만 채워짐")
+    trace: list[str] = Field(default_factory=list, description="판단 경로와 근거(관제사용 설명)")
