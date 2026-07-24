@@ -99,3 +99,33 @@ class WeatherObs(Base, CollectorMetadataMixin):
     __table_args__ = (
         Index("idx_weather_obs_natural_key", "station_id", "observed_at_utc", unique=True),
     )
+
+
+class WeatherForecast(Base, CollectorMetadataMixin):
+    """기상청 단기예보(getVilageFcst) 울산항 격자(nx=102, ny=84) 예보.
+
+    weather_obs/wave_obs와 달리 관측이 아니라 예측이다. nx+ny+fcst_at_utc로
+    upsert되며, 같은 미래 시각에 대한 예보가 재발표될 때마다(하루 8회) 최신 값으로
+    덮어써진다 — base_at_utc는 그 예보가 언제 발표됐는지 참고용으로만 남긴다.
+
+    스키마 소유권은 backend(Alembic)에 있다. data-pipeline은 insert만 한다.
+    """
+
+    __tablename__ = "weather_forecast"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    nx: Mapped[int | None] = mapped_column(Integer)
+    ny: Mapped[int | None] = mapped_column(Integer)
+    base_at_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    fcst_at_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    wind_speed_ms: Mapped[float | None] = mapped_column(Float)
+    wave_height_m: Mapped[float | None] = mapped_column(Float)
+    air_temp_c: Mapped[float | None] = mapped_column(Float)
+    precip_type_code: Mapped[float | None] = mapped_column(Float)
+    sky_code: Mapped[float | None] = mapped_column(Float)
+    precip_prob_pct: Mapped[float | None] = mapped_column(Float)
+
+    __table_args__ = (
+        Index("idx_weather_forecast_natural_key", "nx", "ny", "fcst_at_utc", unique=True),
+    )
