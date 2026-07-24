@@ -4,6 +4,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.v1.dashboard import router as dashboard_router
 from app.api.v1.health import router as health_router
 from app.api.v1.msds import router as msds_router
 from app.api.v1.orchestrator import router as orchestrator_router
@@ -41,6 +42,7 @@ app.include_router(safety_router, prefix="/api/v1")
 app.include_router(scheduling_router, prefix="/api/v1")
 app.include_router(weather_router, prefix="/api/v1")
 app.include_router(orchestrator_router, prefix="/api/v1")
+app.include_router(dashboard_router, prefix="/api/v1")
 
 
 @app.get("/health")
