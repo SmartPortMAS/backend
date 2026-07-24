@@ -73,6 +73,21 @@ class IncompatibleConflict(BaseModel):
     direction: str = Field(description="target_incompatible_with_adjacent | adjacent_incompatible_with_target")
 
 
+class ImdgSegregationConflict(BaseModel):
+    """IMDG Code Chapter 7.2 공인 일반 격리표 기반 충돌.
+
+    IncompatibleConflict(MSDS 텍스트 마이닝)와는 별도 신호 — 화물 개별 반응성이
+    아니라 위험물 대분류(Class) 간 국제 공인 규정에 근거한다.
+    """
+
+    adjacent_berth: str
+    adjacent_chem_id: str
+    adjacent_name: str
+    target_imdg_class: str
+    adjacent_imdg_class: str
+    segregation_code: str = Field(description="IMDG 격리 코드(1~4). 클수록 강한 물리적 이격 요구")
+
+
 class LLMAssessment(BaseModel):
     """Gemini response_schema로 강제할 구조화 출력. LLM은 이 필드만 채운다."""
 
@@ -89,5 +104,8 @@ class SafetyAssessmentResult(BaseModel):
     key_hazards: list[str]
     reasoning: str
     conflicts: list[IncompatibleConflict]
-    rule_engine_floor: RiskLevel = Field(description="그래프 탐색 기반 결정적 하한 등급")
+    imdg_conflicts: list[ImdgSegregationConflict] = Field(
+        default_factory=list, description="IMDG Code 공인 일반 격리표 기반 충돌"
+    )
+    rule_engine_floor: RiskLevel = Field(description="그래프 탐색 기반 결정적 하한 등급 (MSDS 텍스트 + IMDG 공인 규정 중 더 심각한 쪽)")
     msds_sections_used: list[str] = Field(description="프롬프트 근거로 사용된 MSDS detail 섹션 키 목록")
