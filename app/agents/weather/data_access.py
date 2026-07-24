@@ -15,6 +15,7 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models import GLOBAL_DEFAULT_BERTH_GROUP, BerthWeatherThreshold
 from app.models.environmental_obs import WaveObs, WeatherForecast, WeatherObs
 
 # 울산항 격자좌표 (data-pipeline의 weather_forecast_collector.py와 동일한 값).
@@ -41,6 +42,19 @@ async def get_latest_wave(db: AsyncSession, *, as_of: datetime) -> WaveObs | Non
         .limit(1)
     )
     return await db.scalar(stmt)
+
+
+async def get_berth_threshold(
+    db: AsyncSession, *, berth_group: str | None
+) -> BerthWeatherThreshold | None:
+    """부두그룹별 기상 임계값 조회. berth_group이 없으면(하위 호환) 전역 폴백 행을 쓴다.
+
+    지정된 berth_group이 테이블에 없으면 None을 그대로 반환한다 — rule_engine이
+    이를 '등록 안 된 부두그룹'으로 판단불가(UNKNOWN) 처리한다(임의 기본값으로
+    조용히 대체하지 않는다).
+    """
+    key = berth_group or GLOBAL_DEFAULT_BERTH_GROUP
+    return await db.get(BerthWeatherThreshold, key)
 
 
 async def get_forecast_range(

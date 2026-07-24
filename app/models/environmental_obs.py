@@ -125,6 +125,10 @@ class WeatherForecast(Base, CollectorMetadataMixin):
     precip_type_code: Mapped[float | None] = mapped_column(Float)
     sky_code: Mapped[float | None] = mapped_column(Float)
     precip_prob_pct: Mapped[float | None] = mapped_column(Float)
+    # 강수량(mm) 참고값. 기상청 PCP 원문(구간 텍스트)을 data-pipeline
+    # weather_forecast_preprocessor.normalize_pcp_mm()이 근사 정규화한 값이다.
+    # rule_engine 판정에는 아직 쓰지 않는다(임계값 출처 미검증) — 참고용으로만 노출한다.
+    precip_mm: Mapped[float | None] = mapped_column(Float)
 
     __table_args__ = (
         Index("idx_weather_forecast_natural_key", "nx", "ny", "fcst_at_utc", unique=True),
