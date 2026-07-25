@@ -12,21 +12,52 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class WorkStatus(str, Enum):
-    """작업 가능 여부 3단계 + 관측 데이터 부재 시의 4번째 상태.
+    """작업 가능 여부 4단계 에스컬레이션 + 관측 데이터 부재 시의 5번째 상태.
 
-    계획서는 "작업가능/조건부 가능/불가" 3단계만 명시하지만, 관측 데이터가
-    없거나 오래된 경우 "가능"으로 낙관 판단하면 안전상 위험하므로 UNKNOWN을
-    별도로 둔다 (모르면 가능하다고 하지 않는다 — scheduling 에이전트의
-    depth_m 미상 선석 제외 원칙과 동일).
+    온산 MVP(feature/onsan-mvp) 이식: 계획서 원안의 "가능/조건부가능/불가" 전역
+    3단계 대신, 부두그룹별 임계값 테이블(berth_weather_threshold)을 기준으로
+    정상 -> 하역중단 -> 이안 -> 호스분리 순으로 단계적으로 악화되는 모델을 쓴다.
+    "조건부가능"에 해당하는 중간 완충 구간은 없다 — 하역중단부터 이미 작업을
+    멈춰야 하는 상태이기 때문에(팀원의 weather_berth_agent.py와 동일 설계),
+    오케스트레이터는 NORMAL이 아니면 전부 "지금 하역을 진행하면 안 되는 상태"로
+    취급한다.
+
+    관측 데이터가 없거나 오래된 경우 "정상"으로 낙관 판단하면 안전상 위험하므로
+    UNKNOWN을 별도로 둔다(모르면 가능하다고 하지 않는다 — scheduling 에이전트의
+    depth_m 미상 선석 제외 원칙과 동일). 심각도는 NORMAL < STOP < UNBERTH <
+    DISCONNECT < UNKNOWN 순으로, "모르는 상태"를 가장 보수적으로 취급한다
+    (rule_engine.severity() 참고).
     """
 
-    AVAILABLE = "가능"
-    CONDITIONAL = "조건부가능"
-    BLOCKED = "불가"
+    NORMAL = "정상"
+    STOP = "하역중단"
+    UNBERTH = "이안"
+    DISCONNECT = "호스분리"
     UNKNOWN = "판단불가"
 
 
 class WeatherAssessmentRequest(BaseModel):
+    berth_group: str | None = Field(
+        default=None,
+        description="berth_weather_threshold.berth_group 값(예: 'OTK1/2부두(처용리)'). "
+        "생략하면 전역 폴백 임계값(GLOBAL_DEFAULT, 과거 단일 상수와 동일)을 쓴다 — "
+        "berth_group 도입 이전 호출부와의 하위 호환용.",
+    )
+    extra_condition_active: bool = Field(
+        default=False,
+        description="대기정체/심한뇌우/태풍경로 등 정성 조건 발효 여부. 현재는 자동 "
+        "판정 소스가 없어 수동 입력으로만 받는다(향후 자동화 대상, SIRE/CDI 이력과 "
+        "같은 성격의 미해결 항목).",
+    )
+    precip_observed: bool = Field(
+        default=False,
+        description="관제사가 육안으로 확인한 현재 강수 여부. weather_obs(항만기상정보"
+        "시스템 API)에는 강수량 실황 필드가 없어(2026-07-25 확인) 자동 판정이 불가능한 "
+        "지표다 — 파고와 달리 강수 유무는 육안으로 바로 확인 가능하므로, extra_condition_"
+        "active와 같은 방식의 수동 관측 입력으로 받는다. True면 최소 '하역중단'(강수량 "
+        "1mm/h 기준) 이상으로 즉시 반영한다. 정확한 mm 수치는 알 수 없으니 그 이상 단계"
+        "(이안/호스분리)로는 자동 격상하지 않는다 — 그 판단은 관제사가 직접 한다.",
+    )
     as_of: datetime | None = Field(
         default=None,
         description="판단 기준 시각(UTC). 생략 시 서버 현재 시각. 이 시각 이전의 "
@@ -67,6 +98,11 @@ class ForecastPoint(BaseModel):
     status: WorkStatus
     wind_speed_ms: float | None
     wave_height_m: float | None
+    precip_mm: float | None = Field(
+        default=None,
+        description="참고용 강수량(mm) 근사치. 기상청 PCP 원문(구간 텍스트)을 근사 "
+        "정규화한 값이며 status 판정에는 쓰지 않는다(임계값 출처 미검증).",
+    )
 
 
 class ForecastWarning(BaseModel):

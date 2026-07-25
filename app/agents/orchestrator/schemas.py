@@ -11,14 +11,14 @@ from enum import Enum
 from pydantic import BaseModel, Field, model_validator
 
 from app.agents.safety.schemas import CargoRef, SafetyAssessmentResult
-from app.agents.scheduling.schemas import BerthCandidate, VesselSpec
+from app.agents.scheduling.schemas import AnchorageAssignment, BerthCandidate, VesselSpec
 from app.agents.weather.schemas import WeatherAssessmentResult
 
 
 class OverallDecision(str, Enum):
-    """계획서 19p 로직의 4가지 귀결.
+    """계획서 19p 로직의 4가지 귀결 + 온산 MVP 이식으로 추가된 5번째 상태.
 
-    APPROVED 외 세 상태는 모두 "하역을 진행하면 안 되는" 상태라는 공통점이 있다 —
+    APPROVED 외 네 상태는 모두 "하역을 진행하면 안 되는" 상태라는 공통점이 있다 —
     관제사가 화면에서 한눈에 구분할 수 있도록 원인별로 분리했다.
     """
 
@@ -26,6 +26,9 @@ class OverallDecision(str, Enum):
     WEATHER_BLOCKED = "기상불가_중단권고"
     NO_ELIGIBLE_BERTH = "적합선석없음"
     ALL_CANDIDATES_UNSAFE = "전후보배정불가"
+    # 전용 선석 점유 + 대체 선석 없음(단독선석 등) -> 톤수에 맞는 정박지에서 대기
+    # (온산 MVP 이식: scheduling.service.resolve_berth_assignment의 '정박지대기' 경로).
+    WAITING_ANCHORAGE = "정박지대기"
 
 
 class OrchestratorRequest(BaseModel):
@@ -67,6 +70,14 @@ class OrchestratorResult(BaseModel):
     weather_assessment: WeatherAssessmentResult
     rejected_candidates: list[RejectedCandidate] = Field(
         default_factory=list, description="배정불가로 탈락해 재탐색된 후보 이력"
+    )
+    anchorage_assignment: AnchorageAssignment | None = Field(
+        default=None, description="overall_decision이 정박지대기일 때만 채워짐(온산 MVP 이식)"
+    )
+    assignment_trace: list[str] = Field(
+        default_factory=list,
+        description="전용/대체/정박지대기 판단 경로와 근거(온산 MVP 이식: 팀원 오케스트레이터의 "
+        "berth_decision.trace와 동일한 목적)",
     )
     summary: str = Field(description="관제사가 읽을 종합 의견 (1~2문단)")
 
