@@ -1,0 +1,110 @@
+{
+  "name": "MSDS 안전챗봇 검색 평가셋",
+  "version": "1.0",
+  "created": "2026-08-03",
+  "description": "울산항/온산항 액체화물 관제사·선박운전사가 실제로 물을 법한 질문 80개. 각 문항은 정답 근거가 어느 계층(그래프/정형컬럼/청크섹션)에 있는지 라벨링되어 있다. 챗봇 검색 품질 회귀 테스트용 고정 평가셋.",
+  "notes": [
+    "expect_layer: chunk(벡터검색) | column(msds_chemical 정형컬럼) | graph(Neo4j 관계) | none(미등재/범위밖)",
+    "expect_section: expect_layer=chunk일 때 정답이 있는 MSDS 섹션",
+    "chemical: 질문이 지목한 화물. 통칭/별칭도 그대로 두어 물질명 해석까지 함께 검증한다.",
+    "persona: vts(관제사) | crew(선박운전사)",
+    "화물명은 msds_chemical 등재 35종과 aliases.py 별칭 사전에서만 골랐다."
+  ],
+  "cases": [
+    {"id": 1, "persona": "vts", "chemical": "벤젠", "question": "인화점 몇 도야?", "expect_layer": "column", "expect_section": null},
+    {"id": 2, "persona": "vts", "chemical": "톨루엔", "question": "끓는점이 얼마나 되지?", "expect_layer": "column", "expect_section": null},
+    {"id": 3, "persona": "crew", "chemical": "메탄올", "question": "증기압이 어느 정도야?", "expect_layer": "column", "expect_section": null},
+    {"id": 4, "persona": "vts", "chemical": "스티렌", "question": "비중 알려줘", "expect_layer": "column", "expect_section": null},
+    {"id": 5, "persona": "vts", "chemical": "벤젠", "question": "작업환경 노출기준이 어떻게 되나?", "expect_layer": "column", "expect_section": null},
+    {"id": 6, "persona": "crew", "chemical": "암모니아", "question": "TWA 기준이 몇 ppm이야?", "expect_layer": "column", "expect_section": null},
+    {"id": 7, "persona": "crew", "chemical": "톨루엔", "question": "용기등급이 몇 급이지?", "expect_layer": "column", "expect_section": null},
+    {"id": 8, "persona": "crew", "chemical": "아세톤", "question": "화재 났을 때 EMS 코드가 뭐야?", "expect_layer": "column", "expect_section": null},
+
+    {"id": 9, "persona": "crew", "chemical": "벤젠", "question": "UN번호가 뭐지?", "expect_layer": "graph", "expect_section": null},
+    {"id": 10, "persona": "vts", "chemical": "암모니아", "question": "IMDG 등급이 어떻게 되나?", "expect_layer": "graph", "expect_section": null},
+    {"id": 11, "persona": "vts", "chemical": "황산", "question": "이 화물이랑 같이 두면 안 되는 물질 알려줘", "expect_layer": "graph", "expect_section": null},
+    {"id": 12, "persona": "vts", "chemical": "암모니아", "question": "어떤 물질과 혼재금지야?", "expect_layer": "graph", "expect_section": null},
+    {"id": 13, "persona": "vts", "chemical": "아세톤", "question": "혼재 피해야 할 물질 카테고리 알려줘", "expect_layer": "graph", "expect_section": null},
+    {"id": 14, "persona": "crew", "chemical": "스티렌", "question": "GHS 유해성 분류가 어떻게 되지?", "expect_layer": "graph", "expect_section": null},
+
+    {"id": 15, "persona": "crew", "chemical": "메탄올", "question": "눈에 들어갔을 때 어떻게 해야 해?", "expect_layer": "chunk", "expect_section": "detail04"},
+    {"id": 16, "persona": "crew", "chemical": "암모니아", "question": "피부에 닿으면 어떻게 조치해?", "expect_layer": "chunk", "expect_section": "detail04"},
+    {"id": 17, "persona": "crew", "chemical": "벤젠", "question": "작업자가 흡입했을 때 응급조치 알려줘", "expect_layer": "chunk", "expect_section": "detail04"},
+    {"id": 18, "persona": "crew", "chemical": "황산", "question": "실수로 삼켰으면 어떻게 하지?", "expect_layer": "chunk", "expect_section": "detail04"},
+    {"id": 19, "persona": "crew", "chemical": "아크릴로니트릴", "question": "노출된 작업자 응급처치 방법이 뭐야?", "expect_layer": "chunk", "expect_section": "detail04"},
+    {"id": 20, "persona": "vts", "chemical": "염화비닐", "question": "피폭 시 의사에게 알려야 할 주의사항 있나?", "expect_layer": "chunk", "expect_section": "detail04"},
+
+    {"id": 21, "persona": "crew", "chemical": "휘발유", "question": "화재 났을 때 무슨 소화제 써야 해?", "expect_layer": "chunk", "expect_section": "detail05"},
+    {"id": 22, "persona": "vts", "chemical": "프로판", "question": "불나면 어떻게 대응해야 하나?", "expect_layer": "chunk", "expect_section": "detail05"},
+    {"id": 23, "persona": "crew", "chemical": "톨루엔", "question": "탱크에 불 붙으면 물 뿌려도 되나?", "expect_layer": "chunk", "expect_section": "detail05"},
+    {"id": 24, "persona": "crew", "chemical": "벤젠", "question": "화재 진압할 때 어떤 보호구 착용해야 하지?", "expect_layer": "chunk", "expect_section": "detail05"},
+    {"id": 25, "persona": "vts", "chemical": "수소", "question": "연소 시 생기는 위험이 뭐가 있나?", "expect_layer": "chunk", "expect_section": "detail05"},
+    {"id": 26, "persona": "crew", "chemical": "벙커C", "question": "화재 시 부적절한 소화제가 있어?", "expect_layer": "chunk", "expect_section": "detail05"},
+
+    {"id": 27, "persona": "crew", "chemical": "톨루엔", "question": "하역 중에 새면 어떻게 대처해?", "expect_layer": "chunk", "expect_section": "detail06"},
+    {"id": 28, "persona": "vts", "chemical": "경유", "question": "해상 유출됐을 때 조치사항 알려줘", "expect_layer": "chunk", "expect_section": "detail06"},
+    {"id": 29, "persona": "crew", "chemical": "아세톤", "question": "갑판에 쏟았는데 어떻게 치워야 하지?", "expect_layer": "chunk", "expect_section": "detail06"},
+    {"id": 30, "persona": "vts", "chemical": "암모니아", "question": "누출 시 환경 보호를 위한 조치가 뭐야?", "expect_layer": "chunk", "expect_section": "detail06"},
+    {"id": 31, "persona": "crew", "chemical": "크실렌", "question": "누출 지역 격리 어떻게 해야 해?", "expect_layer": "chunk", "expect_section": "detail06"},
+    {"id": 32, "persona": "crew", "chemical": "메탄올", "question": "유출물 회수하려면 뭘 써야 하나?", "expect_layer": "chunk", "expect_section": "detail06"},
+
+    {"id": 33, "persona": "crew", "chemical": "염화비닐", "question": "저장할 때 주의사항 알려줘", "expect_layer": "chunk", "expect_section": "detail07", "note": "최초 작성 시 스티렌으로 뒀으나 스티렌의 detail07 원문이 '자료없음'이라 청크 자체가 없었다. 답이 존재하지 않는 질문이라 검색 성능 측정에 부적합해 교체."},
+    {"id": 34, "persona": "vts", "chemical": "1,3-부타디엔", "question": "탱크 보관 조건이 어떻게 되나?", "expect_layer": "chunk", "expect_section": "detail07"},
+    {"id": 35, "persona": "crew", "chemical": "에틸렌", "question": "안전하게 취급하는 요령이 뭐야?", "expect_layer": "chunk", "expect_section": "detail07"},
+    {"id": 36, "persona": "crew", "chemical": "테트라하이드로푸란", "question": "장기 보관해도 괜찮아?", "expect_layer": "chunk", "expect_section": "detail07"},
+    {"id": 37, "persona": "vts", "chemical": "아스팔트", "question": "취급 시 지켜야 할 사항이 있나?", "expect_layer": "chunk", "expect_section": "detail07"},
+
+    {"id": 38, "persona": "crew", "chemical": "벤젠", "question": "취급할 때 어떤 보호구 착용해야 해?", "expect_layer": "chunk", "expect_section": "detail08"},
+    {"id": 39, "persona": "crew", "chemical": "황산", "question": "호흡기 보호구 뭐 써야 하지?", "expect_layer": "chunk", "expect_section": "detail08"},
+    {"id": 40, "persona": "vts", "chemical": "암모니아", "question": "환기 설비 기준이 어떻게 되나?", "expect_layer": "chunk", "expect_section": "detail08"},
+    {"id": 41, "persona": "crew", "chemical": "트리클로로에틸렌", "question": "눈 보호 장비 필요해?", "expect_layer": "chunk", "expect_section": "detail08"},
+    {"id": 42, "persona": "crew", "chemical": "메탄올", "question": "장갑은 어떤 재질로 껴야 하나?", "expect_layer": "chunk", "expect_section": "detail08"},
+
+    {"id": 43, "persona": "crew", "chemical": "벤젠", "question": "자연발화온도가 몇 도야?", "expect_layer": "chunk", "expect_section": "detail09"},
+    {"id": 44, "persona": "crew", "chemical": "프로필렌", "question": "폭발 범위 상한 하한이 어떻게 되지?", "expect_layer": "chunk", "expect_section": "detail09"},
+    {"id": 45, "persona": "vts", "chemical": "톨루엔", "question": "물에 얼마나 녹아?", "expect_layer": "chunk", "expect_section": "detail09"},
+    {"id": 46, "persona": "crew", "chemical": "암모니아", "question": "냄새가 어떤가? 성상은?", "expect_layer": "chunk", "expect_section": "detail09"},
+    {"id": 47, "persona": "crew", "chemical": "황산", "question": "pH가 어떻게 되나?", "expect_layer": "chunk", "expect_section": "detail09"},
+
+    {"id": 48, "persona": "vts", "chemical": "아크릴로니트릴", "question": "피해야 할 조건이 뭐가 있어?", "expect_layer": "chunk", "expect_section": "detail10"},
+    {"id": 49, "persona": "crew", "chemical": "1,2-에폭시프로판", "question": "중합반응 위험이 있나?", "expect_layer": "chunk", "expect_section": "detail10"},
+    {"id": 50, "persona": "crew", "chemical": "스티렌", "question": "분해되면 어떤 유해물질이 생겨?", "expect_layer": "chunk", "expect_section": "detail10"},
+    {"id": 51, "persona": "vts", "chemical": "염화비닐", "question": "화학적으로 안정한 물질인가?", "expect_layer": "chunk", "expect_section": "detail10"},
+
+    {"id": 52, "persona": "vts", "chemical": "벤젠", "question": "반수치사량 LD50이 얼마야?", "expect_layer": "chunk", "expect_section": "detail11"},
+    {"id": 53, "persona": "crew", "chemical": "암모니아", "question": "흡입하면 얼마나 위험해? 급성독성 수치 알려줘", "expect_layer": "chunk", "expect_section": "detail11"},
+    {"id": 54, "persona": "vts", "chemical": "벤젠", "question": "발암성 등급이 어떻게 돼?", "expect_layer": "chunk", "expect_section": "detail11"},
+    {"id": 55, "persona": "crew", "chemical": "톨루엔", "question": "반복 노출되면 어느 장기에 문제가 생기나?", "expect_layer": "chunk", "expect_section": "detail11"},
+    {"id": 56, "persona": "crew", "chemical": "트리클로로에틸렌", "question": "피부 자극성이 있어?", "expect_layer": "chunk", "expect_section": "detail11"},
+    {"id": 57, "persona": "vts", "chemical": "염화비닐", "question": "생식독성 자료가 있나?", "expect_layer": "chunk", "expect_section": "detail11"},
+
+    {"id": 58, "persona": "vts", "chemical": "톨루엔", "question": "바다에 유출되면 어류에 어떤 영향이 있어?", "expect_layer": "chunk", "expect_section": "detail12"},
+    {"id": 59, "persona": "vts", "chemical": "크실렌", "question": "생분해가 잘 돼? 잔류성 알려줘", "expect_layer": "chunk", "expect_section": "detail12"},
+    {"id": 60, "persona": "vts", "chemical": "벤젠", "question": "수생환경 유해성 수치 알려줘", "expect_layer": "chunk", "expect_section": "detail12"},
+    {"id": 61, "persona": "vts", "chemical": "암모니아", "question": "갑각류에 대한 독성이 어느 정도야?", "expect_layer": "chunk", "expect_section": "detail12"},
+    {"id": 62, "persona": "crew", "chemical": "경유", "question": "생물농축성이 높은 편이야?", "expect_layer": "chunk", "expect_section": "detail12"},
+
+    {"id": 63, "persona": "crew", "chemical": "톨루엔", "question": "잔재물 폐기는 어떻게 해?", "expect_layer": "chunk", "expect_section": "detail13"},
+    {"id": 64, "persona": "vts", "chemical": "메탄올", "question": "폐기할 때 주의사항 알려줘", "expect_layer": "chunk", "expect_section": "detail13"},
+    {"id": 65, "persona": "crew", "chemical": "에탄올", "question": "빈 용기는 어떻게 처리해야 하지?", "expect_layer": "chunk", "expect_section": "detail13"},
+    {"id": 66, "persona": "vts", "chemical": "염화비닐", "question": "소각 처리 가능한가?", "expect_layer": "chunk", "expect_section": "detail13"},
+
+    {"id": 67, "persona": "vts", "chemical": "벤젠", "question": "위험물안전관리법상 몇 류 몇 석유류야?", "expect_layer": "chunk", "expect_section": "detail15"},
+    {"id": 68, "persona": "vts", "chemical": "톨루엔", "question": "산업안전보건법상 어떤 규제를 받아?", "expect_layer": "chunk", "expect_section": "detail15"},
+    {"id": 69, "persona": "vts", "chemical": "암모니아", "question": "화학물질관리법상 사고대비물질이야?", "expect_layer": "chunk", "expect_section": "detail15"},
+    {"id": 70, "persona": "vts", "chemical": "황산", "question": "폐기물관리법상 지정폐기물에 해당하나?", "expect_layer": "chunk", "expect_section": "detail15"},
+    {"id": 71, "persona": "vts", "chemical": "스티렌", "question": "화평법상 등록 대상 물질인가?", "expect_layer": "chunk", "expect_section": "detail15"},
+    {"id": 72, "persona": "vts", "chemical": "벤젠", "question": "작업환경측정 대상이야? 주기가 어떻게 되지?", "expect_layer": "chunk", "expect_section": "detail15"},
+
+    {"id": 73, "persona": "vts", "chemical": "벤젠", "question": "어떤 유해성 분류를 받았어?", "expect_layer": "chunk", "expect_section": "detail02"},
+    {"id": 74, "persona": "crew", "chemical": "아크릴로니트릴", "question": "경고표지에 뭐라고 적혀 있어야 해?", "expect_layer": "chunk", "expect_section": "detail02"},
+    {"id": 75, "persona": "crew", "chemical": "휘발유", "question": "유해위험문구 H코드가 뭐가 있지?", "expect_layer": "chunk", "expect_section": "detail02"},
+
+    {"id": 76, "persona": "vts", "chemical": "PX", "question": "이 화물 인화점이 몇 도야?", "expect_layer": "column", "expect_section": null},
+    {"id": 77, "persona": "crew", "chemical": "벙커씨유", "question": "누출되면 어떻게 대처하지?", "expect_layer": "chunk", "expect_section": "detail06"},
+    {"id": 78, "persona": "crew", "chemical": "IPA", "question": "취급 시 주의사항 알려줘", "expect_layer": "chunk", "expect_section": "detail07"},
+
+    {"id": 79, "persona": "vts", "chemical": "질산암모늄", "question": "인화점이 몇 도야?", "expect_layer": "none", "expect_section": null},
+    {"id": 80, "persona": "vts", "chemical": "과산화수소", "question": "혼재금지 물질 알려줘", "expect_layer": "none", "expect_section": null}
+  ]
+}

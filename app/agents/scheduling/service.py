@@ -113,6 +113,7 @@ async def find_berth_candidates(
                 port_name=row["port_name"],
                 depth_m=row["depth_m"],
                 berth_group=row.get("berth_group"),
+                onsan_scope=bool(row.get("onsan_scope")),
                 draught_margin_m=row["depth_m"] - request.vessel.draught_m,
                 occupancy_status=status,
                 conflicting_port_calls=[
@@ -127,8 +128,24 @@ async def find_berth_candidates(
             )
         )
 
-    # 여유 선석 우선, 그 다음 수심 여유가 큰 순(안전 마진이 큰 순)
-    candidates.sort(key=lambda c: (c.occupancy_status is OccupancyStatus.OCCUPIED, -c.draught_margin_m))
+    # 온산 스코프 우선 → 여유 선석 우선 → 수심 여유가 큰 순(안전 마진이 큰 순).
+    #
+    # 온산을 첫 키로 둔 것은 팀원 P1의 "스케줄링 후보풀 온산 제한" 요구사항을 하드
+    # 필터 대신 정렬로 구현한 것이다. 필터로 거르면 온산에 적합 선석이 MAX_CANDIDATES
+    # 미만인 화물에서 후보가 줄거나 사라진다 — 원유는 온산 부이 2기가 전부라
+    # 3순위 자리를 채울 수 없다. 정렬이면 온산이 채울 수 있는 만큼 앞을 차지하고,
+    # 모자란 자리만 스코프 밖(울산본항/신항)이 이어받는다.
+    #
+    # 온산 후보가 3개 이상이면 하드 필터와 결과가 완전히 같다 — 상위 3개가 잘리기
+    # 전에 온산이 다 차지하기 때문이다(2026-08-02 실측: 액체화학·유류 시나리오에서
+    # 하드/소프트 결과 동일, 원유에서만 3순위 폴백 유무가 갈림).
+    candidates.sort(
+        key=lambda c: (
+            not c.onsan_scope,
+            c.occupancy_status is OccupancyStatus.OCCUPIED,
+            -c.draught_margin_m,
+        )
+    )
 
     top_candidates = candidates[:MAX_CANDIDATES]
     for rank, candidate in enumerate(top_candidates, start=1):
@@ -199,6 +216,7 @@ async def resolve_berth_assignment(
             port_name=sub.get("port_name"),
             depth_m=sub["depth_m"],
             berth_group=sub.get("berth_group"),
+            onsan_scope=bool(sub.get("onsan_scope")),
             draught_margin_m=sub["depth_m"] - vessel.draught_m,
             occupancy_status=OccupancyStatus.AVAILABLE,
             adjacent_cargos=candidate.adjacent_cargos,

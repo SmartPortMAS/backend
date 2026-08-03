@@ -60,7 +60,15 @@ class BerthCandidate(BaseModel):
         default=None,
         description="berth_weather_threshold.berth_group 매핑값. 있으면 오케스트레이터가 "
         "이 선석 전용 기상 임계값으로 재판정할 수 있다(온산 MVP 이식 — '같은 기상, "
-        "선석마다 다른 판정' 차별점). 매핑이 없는(온산 스코프 밖) 선석은 None.",
+        "선석마다 다른 판정' 차별점). None은 '온산 스코프 밖'이 아니라 '이 선석의 "
+        "기상 임계값 자료가 없다'는 뜻이다 — 온산 소속 여부는 onsan_scope로 판단할 것. "
+        "실제로 온산 S-Oil 부이 2기는 onsan_scope=True이면서 berth_group=None이다.",
+    )
+    onsan_scope: bool = Field(
+        default=False,
+        description="온산 MVP 대상 선석인지(berth_neo4j_loader.ONSAN_SCOPE_WHARF_NAMES 14개). "
+        "후보 정렬에서 True가 먼저 온다. 하드 필터가 아니라 우선순위라, 온산 후보가 "
+        "부족하면 스코프 밖 선석이 뒤이어 채워진다.",
     )
     draught_margin_m: float = Field(description="depth_m - 요청 흘수(m). 클수록 여유")
     occupancy_status: OccupancyStatus
