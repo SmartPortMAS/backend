@@ -32,6 +32,24 @@ class LLMGenerationError(AppError):
         super().__init__(f"LLM generation failed (provider={provider}): {reason}")
 
 
+class EmbeddingGenerationError(AppError):
+    """Raised when the embedding provider fails to return usable vectors."""
+
+    def __init__(self, provider: str, reason: str) -> None:
+        self.provider = provider
+        self.reason = reason
+        super().__init__(f"Embedding generation failed (provider={provider}): {reason}")
+
+
+class EmbeddingIndexEmptyError(AppError):
+    """Raised when msds_embedding has no rows — scripts/embed_msds.py 미실행 상태."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "MSDS 임베딩 인덱스가 비어 있습니다. `python -m scripts.embed_msds`를 먼저 실행하세요."
+        )
+
+
 class CargoCategoryUnknownError(AppError):
     """Raised when a cargo has no cargo_category assigned in the Berth knowledge graph."""
 

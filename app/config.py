@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = None
     llm_provider: Literal["gemini", "openai"] = "gemini"
     llm_model: str = "gemini-flash-latest"
+    # 임베딩은 llm_provider와 독립적으로 고른다. 챗봇 RAG의 벡터 공간은 적재
+    # 시점(scripts/embed_msds.py)과 조회 시점이 반드시 같은 모델이어야 하는데,
+    # llm_provider는 답변 품질/비용 사정으로 자유롭게 바뀔 수 있기 때문이다.
+    embedding_provider: Literal["openai"] = "openai"
+    embedding_model: str = "text-embedding-3-small"
     kma_api_key: str | None = None
     kosha_api_key: str | None = None
     port_mis_api_key: str | None = None
