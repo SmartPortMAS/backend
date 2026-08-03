@@ -3,6 +3,7 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.routing import APIRoute
 
 from app.api.v1.chatbot import router as chatbot_router
 from app.api.v1.dashboard import router as dashboard_router
@@ -28,31 +29,58 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await neo4j_client.close()
 
 
+_API_DESCRIPTION = """
+울산항·온산항 액체화물 관제 지원 API.
+
+| 만들려는 화면 | 쓸 API |
+|---|---|
+| 선석 배정 판정 | `POST /orchestrator/assess` |
+| 안전 챗봇 | `POST /rag/query` |
+| 모니터링 대시보드 | `GET /dashboard/*` |
+
+개별 에이전트 API(`/scheduling` `/weather` `/safety`)를 각각 호출해 프론트에서 합치지
+마세요. 판단 순서와 조기 종료 조건이 `/orchestrator/assess` 안에 있습니다.
+
+**공통 규칙**
+
+- 시각은 UTC (`2026-08-04T09:00:00Z`)
+- 위험등급·상태는 한글 문자열 (`"안전"`, `"배정불가"`, `"하역중단"`)
+- **"판정 불가"는 "안전"이 아닙니다.** 데이터가 없어 판단하지 못한 상태이므로 가장
+  보수적으로 다루세요
+- 에러: `404` 미등재 화물 · `422` 요청 오류 · `502` 외부 API·LLM 실패(재시도 가능) ·
+  `503` 인덱스 미적재
+"""
+
 _TAGS_METADATA = [
-    {
-        "name": "rag",
-        "description":
-            "MSDS 안전 질의응답. 자연어 질문을 받아 MSDS 원문·지식그래프·정형 값을 "
-            "근거로 답합니다.\n\n"
-            "**프론트엔드가 먼저 볼 것** — `POST /rag/query`의 상세 설명에 응답 읽는 법이 "
-            "정리돼 있습니다. 특히 `citations[].score`가 `null`이면 확정값이고, "
-            "`unresolved`가 비어 있지 않으면 경고를 띄워야 합니다.",
-    },
-    {
-        "name": "chatbot",
-        "description":
-            "챗봇 화면 구성용 목록 조회. 질의응답은 `rag` 태그를 쓰세요.\n\n"
-            "목록 출처가 PostgreSQL이 아니라 Neo4j인 것은 의도적입니다 — MSDS 원문만 있고 "
-            "그래프에 없는 화물은 혼재금지 질문에 답할 수 없으므로, 사용자에게 보여줄 것은 "
-            "'물어보면 답이 나오는 목록'입니다.",
-    },
+    {"name": "orchestrator", "description": "선석 배정 종합 판정. **배정 화면의 주 엔드포인트.**"},
+    {"name": "rag", "description": "MSDS 안전 질의응답 (챗봇)."},
+    {"name": "scheduling", "description": "선석 후보 탐색. LLM 미사용."},
+    {"name": "weather", "description": "기상 기반 하역 가능 여부 판정. LLM 미사용."},
+    {"name": "safety", "description": "화물 혼재 위험 판정."},
+    {"name": "dashboard", "description": "모니터링 현황 조회. 판정 로직 없음."},
+    {"name": "chatbot", "description": "챗봇 화면용 목록 조회. 질의응답은 `rag`."},
+    {"name": "msds", "description": "MSDS 원문 조회."},
+    {"name": "health", "description": "서비스 상태 확인."},
 ]
+
+
+def _operation_id(route: APIRoute) -> str:
+    """`assess_api_v1_orchestrator_assess_post` 대신 `orchestrator_assess`로.
+
+    FastAPI 기본값은 경로와 메서드를 이어붙여 길고 읽기 어렵다. 이 값은 Swagger UI에
+    그대로 보이고, OpenAPI로 클라이언트를 생성하면 함수명이 되므로 짧게 유지한다.
+    """
+    tag = route.tags[0] if route.tags else "api"
+    return route.name if route.name.startswith(tag) else f"{tag}_{route.name}"
+
 
 app = FastAPI(
     title="Smart Port Backend",
     version="0.1.0",
+    description=_API_DESCRIPTION,
     lifespan=lifespan,
     openapi_tags=_TAGS_METADATA,
+    generate_unique_id_function=_operation_id,
 )
 
 app.add_middleware(

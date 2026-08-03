@@ -44,7 +44,6 @@ from .prompt import (
 from .retrieval import IDENTITY_STRONG_THRESHOLD, resolve_chemical_names, search_context
 from .schemas import (
     CargoHint,
-    ChatRequest,
     ChatResponse,
     ChemicalMatch,
     ChemicalProfile,
@@ -55,6 +54,7 @@ from .schemas import (
     LLMAnswer,
     MatchMethod,
     QueryPlan,
+    RagQueryRequest,
     RetrievedChunk,
 )
 
@@ -75,7 +75,7 @@ async def answer_question(
     neo4j_driver: AsyncDriver,
     llm_client: LLMClient,
     embedding_client: EmbeddingClient,
-    request: ChatRequest,
+    request: RagQueryRequest,
 ) -> ChatResponse:
     # cargo_hint가 오면 LLM 1차 호출(질문 분류·물질명 추출)을 건너뛴다. 호출 측이 이미
     # 화물을 특정했으므로 추출할 게 없고, 플래너가 물질을 놓치거나 out_of_scope로
@@ -311,7 +311,7 @@ async def _retrieve_context(
     """intent별 기본값으로 근거 청크를 모은다.
 
     top_k는 서버가 정한다 — 클라이언트가 조절하면 같은 질문에 다른 답이 나온다
-    (ChatRequest 독스트링 참고). 값을 바꿔 실험하려면 이 함수가 아니라
+    (RagQueryRequest 독스트링 참고). 값을 바꿔 실험하려면 이 함수가 아니라
     tests/eval/run_eval.py처럼 search_context()를 직접 부르면 된다.
     """
     chem_ids = [m.chem_id for m in resolved] or None

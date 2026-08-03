@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.chatbot.citations import build_citations
-from app.agents.chatbot.schemas import ChatRequest, RagAssessment, RagQueryResponse
+from app.agents.chatbot.schemas import RagAssessment, RagQueryRequest, RagQueryResponse
 from app.agents.chatbot.service import answer_question
 from app.core.deps import get_embedding_client, get_llm_client, get_session
 from app.core.exceptions import (
@@ -35,42 +35,22 @@ from app.neo4j_client import neo4j_client
 router = APIRouter(prefix="/rag", tags=["rag"])
 
 _DESCRIPTION = """
-MSDS 원문·지식그래프·정형 값을 근거로 자연어 질문에 답합니다. **근거에 없는 내용은
-답하지 않습니다** — 근거가 없으면 "없다"고 답하고 `confidence`를 `low`로 내립니다.
+MSDS 원문·지식그래프·정형 값을 근거로 자연어 질문에 답합니다. 근거에 없는 내용은
+답하지 않고 `confidence`를 `low`로 내립니다.
 
-### 응답을 읽는 법
+- **`citations[].score`가 `null`이면 확정값**(MSDS 정형 항목·지식그래프 관계)입니다.
+  검색으로 근사한 게 아니라 저장된 값이라 **유사도 0.82짜리 발췌보다 신뢰도가
+  높습니다.** 화면에서 유사도 뱃지 대신 "확정"으로 구분하세요.
+- **`unresolved`가 비어 있지 않으면 경고를 띄우세요.** DB 미등재 물질이며,
+  "혼재금지 관계가 없다(안전)"가 아니라 **"판정할 수 없다"**는 뜻입니다.
+- `assessment`는 혼재 판정 질문일 때만 채워집니다. 답변 문장이 아니라 이 필드의
+  `risk_level`을 결론으로 표시하세요.
+- `cargo_hint`는 **화면이 이미 화물을 특정한 경우에만** 보내세요. 자유 채팅에서는
+  생략합니다(사용자는 CAS번호를 모릅니다). `chem_id` 권장.
+- `top_k`는 받지 않습니다 — 클라이언트가 바꾸면 같은 질문에 다른 답이 나옵니다.
+  질문 유형에 따라 서버가 정합니다. **정의되지 않은 필드는 422로 거절합니다.**
 
-**`citations[].score`가 핵심입니다.**
-
-| `score` | 의미 | 화면 표시 |
-|---|---|---|
-| `null` | **확정값** — MSDS 정형 항목 또는 지식그래프 관계에서 온 값 | "확정" 뱃지. 유사도 표시 금지 |
-| 숫자 (0~1) | 벡터 검색으로 찾은 MSDS 원문 발췌. 값이 클수록 질문과 가까움 | 유사도 뱃지 |
-
-확정값(`null`)이 **더 신뢰도가 높습니다.** 인화점 `-11 ℃`는 검색으로 근사한 게 아니라
-MSDS에서 뽑아 컬럼에 저장한 값입니다. 유사도 0.82짜리 발췌와 같아 보이면 안 됩니다.
-
-**`unresolved`가 비어 있지 않으면 반드시 경고를 띄우세요.** DB에 없는 물질이라는
-뜻이고, 이는 *"혼재금지 관계가 없다(안전하다)"가 아니라 "판정할 수 없다"* 입니다.
-안전하다고 오독되면 사고로 이어집니다.
-
-**`assessment`는 혼재 판정 질문일 때만 채워집니다.** 규칙엔진 하한과 IMDG 공인
-격리표로 보정된 등급이라 대시보드와 같은 값을 씁니다. 답변 문장이 아니라 이 필드의
-`risk_level`을 결론으로 표시하세요.
-
-### 요청 필드
-
-- `question` (필수) — 자연어 질문. 1~1000자
-- `cargo_hint` (선택) — 화면이 이미 화물을 특정한 경우에만. 선석 배정 화면에서
-  "이 화물 문의" 같은 동선. **자유 채팅에서는 보내지 마세요**(사용자는 CAS번호를
-  모릅니다). 있으면 질문 분류 LLM 호출을 건너뛰어 응답이 빨라집니다.
-  `chem_id`를 권장합니다 — `cas_no`는 DB에서 nullable입니다.
-
-`top_k`는 받지 않습니다. 근거 개수는 질문 유형에 따라 서버가 정합니다(일반 안전질문 8 /
-혼재 판정 4 / 그 외 6). 클라이언트가 바꾸면 같은 질문에 다른 답이 나오기 때문입니다.
-근거를 더/덜 보여주는 것은 `citations`를 접었다 펴는 UI 문제입니다.
-
-**모르는 필드를 보내면 422로 거절합니다.** 조용히 무시하면 동작한다고 오해하게 됩니다.
+배경: `05_챗봇_에이전트_설계문서.md` · `06_MSDS_지식배치_설계문서.md`
 """
 
 _RESPONSES: dict = {
@@ -89,7 +69,7 @@ _RESPONSES: dict = {
     responses=_RESPONSES,
 )
 async def query(
-    request: ChatRequest,
+    request: RagQueryRequest,
     db: AsyncSession = Depends(get_session),
     llm_client: LLMClient = Depends(get_llm_client),
     embedding_client: EmbeddingClient = Depends(get_embedding_client),
