@@ -10,37 +10,24 @@ from app.neo4j_client import neo4j_client
 router = APIRouter(prefix="/scheduling", tags=["scheduling"])
 
 _DESCRIPTION = """
-화물 카테고리와 흘수 조건을 만족하는 **선석 후보 상위 3순위**를 반환합니다.
-**LLM을 쓰지 않습니다** — Neo4j 그래프 조회와 점유 확인만 하는 결정적 판단입니다.
+화물 카테고리와 흘수 조건을 만족하는 선석 후보 상위 3순위를 반환합니다. LLM을 쓰지
+않는 결정적 판단입니다.
 
-> 선석 배정 화면이라면 이 API 대신 **`POST /orchestrator/assess`**를 쓰세요. 기상과
-> 혼재 판정까지 묶어 최종 결론을 냅니다. 이 API는 후보 목록만 필요할 때 씁니다.
+> 선석 배정 화면이라면 `POST /orchestrator/assess`를 쓰세요. 이 API는 후보 목록만
+> 필요할 때 씁니다.
 
-### 정렬 순서 — 3단 키
-
-```
-1) onsan_scope  온산 MVP 대상 선석 우선
-2) 점유 여부     여유 선석 우선
-3) 흘수 여유     클수록 우선(안전 마진)
-```
-
-온산 우선은 **하드 필터가 아니라 정렬**입니다. 온산 후보가 3개 미만인 화물(원유는
-온산 부이 2기가 전부)에서 후보가 사라지지 않도록 하기 위함이고, 온산이 3개 이상이면
-필터와 결과가 같습니다.
-
-### 응답 읽을 때 주의
+정렬 키: `온산 스코프` → `여유 선석` → `흘수 여유 큰 순`. 온산 우선은 하드 필터가
+아니라 정렬이라, 온산 후보가 3개 미만인 화물(원유 등)에서도 후보가 사라지지 않습니다.
 
 - **`berth_group`이 `null`인 것을 "온산 밖"으로 읽지 마세요.** 그 필드는 "기상 임계값
-  자료가 있는가"이지 소속이 아닙니다. 온산 S-Oil 부이 2기는 `onsan_scope=true`이면서
-  `berth_group=null`입니다. 온산 여부는 **`onsan_scope`**로 판단하세요
-- `occupancy_status`가 `점유`면 `conflicting_port_calls`에 겹치는 입출항 기록이
-  들어옵니다. `departure_at_utc`가 `null`이면 아직 출항이 기록되지 않은 것이며,
-  보수적으로 점유로 판정합니다
-- `adjacent_cargos`는 인접 선석의 취급 화물입니다. **`POST /safety/assess`의 요청
-  바디로 변환 없이 그대로 넘길 수 있습니다**
-- `total_eligible_count`는 조건을 만족한 전체 선석 수입니다(반환은 상위 3개)
+  자료가 있는가"입니다. 온산 여부는 **`onsan_scope`**로 판단하세요.
+- `occupancy_status`가 `점유`면 `conflicting_port_calls`에 겹치는 입출항 기록이 옵니다.
+  `departure_at_utc`가 `null`이면 출항 미기록이며 보수적으로 점유 처리합니다.
+- **`adjacent_cargos`는 `POST /safety/assess` 요청 바디로 변환 없이 그대로 넘길 수
+  있습니다.**
+- `total_eligible_count`는 조건을 만족한 전체 수입니다(반환은 상위 3개).
 
-`depth_m`이 없는 선석은 후보에서 제외됩니다 — "모르면 추천하지 않는다"는 원칙입니다.
+배경: `02_스케줄링_에이전트_설계문서.md`
 """
 
 _RESPONSES: dict = {

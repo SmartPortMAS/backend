@@ -158,7 +158,7 @@ class CargoHint(BaseModel):
         return self
 
 
-class ChatRequest(BaseModel):
+class RagQueryRequest(BaseModel):
     """`POST /api/v1/rag/query` 요청.
 
     top_k(근거 청크 수)는 **의도적으로 받지 않는다.** 그 값은 화면에 몇 개를 보여줄지가

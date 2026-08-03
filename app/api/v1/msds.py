@@ -10,21 +10,13 @@ router = APIRouter(prefix="/msds", tags=["msds"])
 
 
 _DESCRIPTION = """
-CAS번호로 MSDS 원문을 조회합니다. **16개 섹션 전체가 `msds_payload`(JSONB)에 그대로
-들어 있어 응답이 큽니다** — 화면에 특정 값 하나만 필요하다면 `POST /rag/query`나
-선석 관련 API의 요약 필드를 쓰는 편이 낫습니다.
+CAS번호로 MSDS 원문을 조회합니다. **16개 섹션 전체가 `msds_payload`에 들어 있어 응답이
+큽니다** — 값 하나만 필요하면 `POST /rag/query`나 선석 API의 요약 필드를 쓰세요.
 
-### lazy-fetch 동작
+DB에 없는 CAS번호는 KOSHA API로 실시간 조회 후 저장합니다(첫 호출은 수 초).
 
-DB에 없는 CAS번호면 **KOSHA MSDS API를 실시간으로 호출해 가져온 뒤 저장**합니다.
-따라서 첫 호출은 느릴 수 있고(수 초), 두 번째부터는 DB에서 바로 나옵니다.
-
-> ⚠️ **이렇게 새로 들어온 화물은 지식그래프에 없습니다.** 혼재금지·IMDG 판정을 할 수
-> 없는 상태이며, `/rag/query`는 이를 "판정 불가"로 표시합니다. 그래프에 반영하려면
-> data-pipeline의 `msds_neo4j_loader` · `imdg_segregation_loader` ·
-> `cargo_category_loader`를 함께 실행해야 합니다.
-
-`GET /chatbot/chemicals`가 반환하는 목록이 "실제로 판정까지 가능한 화물"입니다.
+> ⚠️ 이렇게 새로 들어온 화물은 **지식그래프에 없어 혼재 판정을 할 수 없습니다.**
+> `GET /chatbot/chemicals`가 반환하는 목록이 "판정까지 가능한 화물"입니다.
 """
 
 
