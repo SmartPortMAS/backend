@@ -24,11 +24,17 @@ MATCH (c:Chemical {id: $chem_id})
 RETURN c.cargo_category AS category
 """
 
+# onsan_scope: 온산 MVP 대상 선석인지(berth_neo4j_loader.ONSAN_SCOPE_WHARF_NAMES).
+# WHERE로 거르지 않고 값만 실어 보낸다 — 후보풀 제한은 하드 필터가 아니라
+# service.py의 정렬 우선순위로 처리하기 때문이다. 하드로 거르면 온산에 적합
+# 선석이 3개 미만인 화물(원유는 온산 부이 2기뿐)에서 후보가 줄거나 0이 된다.
+# 속성이 없는 그래프(로더 재적재 전)에서는 NULL이 오므로 호출부가 falsy로 다룬다.
 _CYPHER_FIND_ELIGIBLE_BERTHS = """
 MATCH (b:Berth)-[:HANDLES]->(:CargoCategory {name: $category})
 WHERE b.depth_m IS NOT NULL AND b.depth_m >= $min_depth
 RETURN b.id AS berth_id, b.wharf_name AS wharf_name, b.port_name AS port_name,
-       b.depth_m AS depth_m, b.berth_group AS berth_group
+       b.depth_m AS depth_m, b.berth_group AS berth_group,
+       coalesce(b.onsan_scope, false) AS onsan_scope
 ORDER BY b.depth_m DESC
 """
 
@@ -39,6 +45,7 @@ _CYPHER_FIND_SUBSTITUTABLE_BERTHS = """
 MATCH (b:Berth {id: $berth_id})-[r:SUBSTITUTABLE_WITH]->(target:Berth)
 RETURN target.id AS berth_id, target.wharf_name AS wharf_name, target.port_name AS port_name,
        target.depth_m AS depth_m, target.berth_group AS berth_group,
+       coalesce(target.onsan_scope, false) AS onsan_scope,
        r.shared_products AS shared_products, r.to_max_dwt AS to_max_dwt, r.to_depth_m AS to_depth_m
 """
 
