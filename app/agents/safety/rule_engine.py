@@ -51,3 +51,46 @@ def compute_imdg_floor(imdg_conflicts: list[dict]) -> RiskLevel:
         level = IMDG_CODE_TO_RISK_LEVEL.get(conflict["segregation_code"], RiskLevel.SAFE)
         floor = max_risk_level(floor, level)
     return floor
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 포장·하역방식 부적합 — 인접 화물이 아니라 대상 화물 자신의 신고 내용만으로
+# 판정한다(위 두 floor와 다른 축). 실측(upa_cargo_manifest): unload_method_name은
+# '펌프'·'크레인' 둘뿐이고, packing_group은 Ⅰ/Ⅱ/Ⅲ 또는 결측이다.
+#
+# 근거: 「위험물 선박운송 및 저장규칙」제20조·「위험물 선박운송 기준」 —
+# 용기등급 Ⅰ(고위험)은 전용 용기·펌프 이송이 필요하다는 취지. 정확한 승인
+# 방식 목록은 법정 고시가 아니라 터미널·화물별 운영규정으로 갈리므로, 여기
+# 값은 관행값이다(berth_draught_check의 UKC 10%와 같은 성격의 한계 — 실제
+# 운영규정 확보 전까지는 최소 기준으로만 쓸 것).
+# ─────────────────────────────────────────────────────────────────────────────
+PACKING_GROUP_HIGH_RISK = "Ⅰ"
+APPROVED_METHODS_FOR_HIGH_RISK_PACKING = frozenset({"펌프"})
+
+
+def find_packing_violation(
+    packing_group: str | None, unload_method_name: str | None
+) -> dict | None:
+    """용기등급 대비 하역방식 부적합을 찾는다. 위반이 없거나 판정 불가면 None.
+
+    unload_method_name이 없으면(호출부가 안 넘겼거나 신고 자체가 없음) 판정하지
+    않는다 — "모른다"를 "위반"으로 단정하면 안 되기 때문(이 프로젝트 전반의
+    원칙, mart_views.sql의 UNKNOWN 판정과 동일).
+    """
+    if packing_group != PACKING_GROUP_HIGH_RISK or not unload_method_name:
+        return None
+    if unload_method_name in APPROVED_METHODS_FOR_HIGH_RISK_PACKING:
+        return None
+    return {
+        "packing_group": packing_group,
+        "unload_method_name": unload_method_name,
+        "reason": (
+            f"용기등급 {packing_group}(고위험) 화물은 전용 이송"
+            f"({'/'.join(sorted(APPROVED_METHODS_FOR_HIGH_RISK_PACKING))})이 필요하나 "
+            f"'{unload_method_name}' 하역으로 신고됨"
+        ),
+    }
+
+
+def compute_packing_floor(violation: dict | None) -> RiskLevel:
+    return RiskLevel.DANGER if violation else RiskLevel.SAFE

@@ -64,7 +64,8 @@ RETURN a.id AS anchorage_id, a.name AS name, a.tonnage_rule AS tonnage_rule,
 _CYPHER_FIND_ADJACENT_CATEGORIES = """
 MATCH (b:Berth)-[:ADJACENT_TO]->(n:Berth)-[:HANDLES]->(cat:CargoCategory)
 WHERE b.id IN $berth_ids
-RETURN b.id AS berth_id, n.id AS adjacent_berth_id, collect(DISTINCT cat.name) AS categories
+RETURN b.id AS berth_id, n.id AS adjacent_berth_id, n.wharf_name AS adjacent_wharf_name,
+       collect(DISTINCT cat.name) AS categories
 """
 
 
@@ -111,8 +112,12 @@ async def find_adjacent_categories(
 ) -> dict[str, list[dict]]:
     """각 후보 선석의 인접 선석과, 그 인접 선석이 취급하는 카테고리 목록.
 
+    adjacent_wharf_name은 mart.berth_current_cargo(실제 재항 화물)를 조회하는 키로
+    쓰인다(service.py `_real_adjacent_cargo_by_wharf`) — categories는 그게 없을 때의
+    폴백 근사치일 뿐이다.
+
     Returns:
-        { berth_id: [{"adjacent_berth_id": ..., "categories": [...]}, ...] }
+        { berth_id: [{"adjacent_berth_id": ..., "adjacent_wharf_name": ..., "categories": [...]}, ...] }
     """
     if not berth_ids:
         return {}
@@ -128,7 +133,11 @@ async def find_adjacent_categories(
     grouped: dict[str, list[dict]] = {}
     for row in rows:
         grouped.setdefault(row["berth_id"], []).append(
-            {"adjacent_berth_id": row["adjacent_berth_id"], "categories": row["categories"]}
+            {
+                "adjacent_berth_id": row["adjacent_berth_id"],
+                "adjacent_wharf_name": row["adjacent_wharf_name"],
+                "categories": row["categories"],
+            }
         )
     return grouped
 

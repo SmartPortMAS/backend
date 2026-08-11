@@ -14,7 +14,7 @@ from app.neo4j_client import neo4j_client
 router = APIRouter(prefix="/chatbot", tags=["chatbot"])
 
 
-@router.get("/chemicals", response_model=list[ChemicalListItem])
+@router.get("/chemicals", response_model=list[ChemicalListItem], summary="챗봇 추론 가능 화물 목록 조회")
 async def list_chemicals() -> list[ChemicalListItem]:
     """챗봇이 실제로 추론할 수 있는 화물 목록.
 
@@ -26,7 +26,11 @@ async def list_chemicals() -> list[ChemicalListItem]:
     return [ChemicalListItem(**row) for row in rows]
 
 
-@router.get("/chemicals/{chem_id}/incompatibles", response_model=list[IncompatibleCategoryGroup])
+@router.get(
+    "/chemicals/{chem_id}/incompatibles",
+    response_model=list[IncompatibleCategoryGroup],
+    summary="화물별 혼재금지 카테고리 조회",
+)
 async def list_incompatibles(chem_id: str) -> list[IncompatibleCategoryGroup]:
     """특정 화물의 혼재금지 카테고리와 각 카테고리에 속하는 등재 화물."""
     profiles = await graph_queries.fetch_profiles(neo4j_client.driver, [chem_id])

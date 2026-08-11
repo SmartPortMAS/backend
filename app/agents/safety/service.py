@@ -15,11 +15,17 @@ from app.models import MsdsChemical
 from .graph_queries import find_imdg_segregation_conflicts, find_incompatible_conflicts
 from .msds_context import resolve_cargo, summarize_hazard_sections
 from .prompt import SYSTEM_PROMPT, build_user_prompt
-from .rule_engine import compute_imdg_floor, compute_risk_floor
+from .rule_engine import (
+    compute_imdg_floor,
+    compute_packing_floor,
+    compute_risk_floor,
+    find_packing_violation,
+)
 from .schemas import (
     ImdgSegregationConflict,
     IncompatibleConflict,
     LLMAssessment,
+    PackagingViolation,
     SafetyAssessmentRequest,
     SafetyAssessmentResult,
     max_risk_level,
@@ -81,8 +87,16 @@ async def assess_safety(
         if row.chem_id == raw["chem_id"]
     ]
 
+    packing_violation_raw = find_packing_violation(
+        target_row.packing_group, request.target_cargo.unload_method_name
+    )
+    packaging_violations = (
+        [PackagingViolation(**packing_violation_raw)] if packing_violation_raw else []
+    )
+
     rule_engine_floor = max_risk_level(
-        compute_risk_floor(raw_conflicts), compute_imdg_floor(raw_imdg_conflicts)
+        max_risk_level(compute_risk_floor(raw_conflicts), compute_imdg_floor(raw_imdg_conflicts)),
+        compute_packing_floor(packing_violation_raw),
     )
     hazard_summary = summarize_hazard_sections(target_row.msds_payload)
 
@@ -91,6 +105,7 @@ async def assess_safety(
         hazard_summary=hazard_summary,
         conflicts=conflicts,
         imdg_conflicts=imdg_conflicts,
+        packaging_violations=packaging_violations,
         rule_engine_floor=rule_engine_floor,
     )
 
@@ -110,6 +125,7 @@ async def assess_safety(
         reasoning=llm_result.reasoning,
         conflicts=conflicts,
         imdg_conflicts=imdg_conflicts,
+        packaging_violations=packaging_violations,
         rule_engine_floor=rule_engine_floor,
         msds_sections_used=list(hazard_summary.keys()),
     )

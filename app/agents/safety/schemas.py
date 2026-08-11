@@ -43,6 +43,13 @@ class CargoRef(BaseModel):
     chem_id: str | None = None
     cas_no: str | None = None
     name_hint: str | None = Field(default=None, description="식별 실패 시 로그/에러 메시지용 참고 이름")
+    unload_method_name: str | None = Field(
+        default=None,
+        description="이번 하역에 신고된 하역 방식(예: '펌프', '크레인'). msds_chemical이 아니라 "
+        "화물 manifest(선적건)마다 다른 값이라 chem_id로는 알 수 없어 호출부가 직접 넘긴다. "
+        "target_cargo에만 의미가 있다(포장기준 판정은 대상 화물 자신에 대한 것 — 인접 화물 "
+        "혼재금지와는 다른 축의 판정). 생략하면 포장기준 판정 자체를 하지 않는다.",
+    )
 
     @model_validator(mode="after")
     def _require_one_identifier(self) -> "CargoRef":
@@ -88,6 +95,15 @@ class ImdgSegregationConflict(BaseModel):
     segregation_code: str = Field(description="IMDG 격리 코드(1~4). 클수록 강한 물리적 이격 요구")
 
 
+class PackagingViolation(BaseModel):
+    """포장·하역방식 부적합. IncompatibleConflict/ImdgSegregationConflict와 달리
+    인접 화물이 아니라 대상 화물 자신의 신고 내용(용기등급 vs 하역방식)만으로 판정한다."""
+
+    packing_group: str
+    unload_method_name: str
+    reason: str
+
+
 class LLMAssessment(BaseModel):
     """Gemini response_schema로 강제할 구조화 출력. LLM은 이 필드만 채운다."""
 
@@ -107,5 +123,9 @@ class SafetyAssessmentResult(BaseModel):
     imdg_conflicts: list[ImdgSegregationConflict] = Field(
         default_factory=list, description="IMDG Code 공인 일반 격리표 기반 충돌"
     )
-    rule_engine_floor: RiskLevel = Field(description="그래프 탐색 기반 결정적 하한 등급 (MSDS 텍스트 + IMDG 공인 규정 중 더 심각한 쪽)")
+    packaging_violations: list[PackagingViolation] = Field(
+        default_factory=list,
+        description="용기등급 대비 하역방식 부적합 (target_cargo.unload_method_name을 넘긴 경우만 판정됨)",
+    )
+    rule_engine_floor: RiskLevel = Field(description="그래프 탐색 기반 결정적 하한 등급 (MSDS 텍스트 + IMDG 공인 규정 + 포장기준 중 가장 심각한 쪽)")
     msds_sections_used: list[str] = Field(description="프롬프트 근거로 사용된 MSDS detail 섹션 키 목록")

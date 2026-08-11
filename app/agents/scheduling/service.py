@@ -18,6 +18,7 @@ LLM을 쓰지 않는다 — 계획서상 스케줄링 에이전트는 Neo4j Cyph
 from datetime import datetime
 
 from neo4j import AsyncDriver
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.safety.msds_context import resolve_cargo
@@ -54,10 +55,70 @@ def _cargo_display_name(row: MsdsChemical) -> str:
     return row.name_ko or row.name_en or row.chem_id
 
 
-def _adjacent_cargos_for(categories_by_neighbor: list[dict]) -> list[AdjacentCargo]:
-    """인접 선석별 취급 카테고리를 대표 화학물질로 근사해 AdjacentCargo 목록을 만든다."""
+_QUERY_REAL_ADJACENT_CARGO = text("""
+    -- mart.berth_current_cargo(실제 재항 화물) -> facility_alias -> wharf_name.
+    --
+    -- facility_alias의 사전(source_names)이 upa_port_call(VTS 원문)과
+    -- upa_cargo_manifest(합성 화물의 자체 표기, 예: 'S-Oil 1부두') 둘 다 포함한다
+    -- (mart_views.sql 0-B절) — berth_current_cargo.facility_name이
+    -- COALESCE(cm.facility_name, ip.facility_name)라 두 어휘가 섞여 나오는데,
+    -- 사전이 이제 둘 다 알고 있으므로 단일 조인으로 끝난다(예전엔 여기서
+    -- COALESCE 폴백 정규화를 따로 했었는데, 근본 원인을 사전 쪽에서 없앴다).
+    SELECT fa.wharf_name, bcc.chem_id, bcc.cas_no
+    FROM mart.berth_current_cargo bcc
+    JOIN mart.facility_alias fa
+      ON fa.source_name = bcc.facility_name AND fa.facility_type = 'BERTH'
+    WHERE bcc.chem_id IS NOT NULL
+      AND fa.wharf_name = ANY(CAST(:wharf_names AS text[]))
+""")
+
+
+async def _real_adjacent_cargo_by_wharf(
+    db: AsyncSession, wharf_names: list[str]
+) -> dict[str, list[dict]]:
+    """mart.berth_current_cargo에서 실제 재항 화물을 wharf_name별로 조회.
+
+    chem_id가 NULL인 행(위험물인데 정체 미확인, UN번호 결측 등)은 CargoRef를
+    만들 수 없어 제외한다 — safety/schemas.py의 CargoRef 제약과 동일 이유
+    (V-DG-01과 같은 성격의 한계: 식별 불가 화물은 애초에 판정 입력이 안 된다).
+    """
+    if not wharf_names:
+        return {}
+    rows = (
+        await db.execute(_QUERY_REAL_ADJACENT_CARGO, {"wharf_names": wharf_names})
+    ).mappings().all()
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(row["wharf_name"], []).append(
+            {"chem_id": row["chem_id"], "cas_no": row["cas_no"]}
+        )
+    return grouped
+
+
+def _adjacent_cargos_for(
+    categories_by_neighbor: list[dict], real_cargo_by_wharf: dict[str, list[dict]]
+) -> list[AdjacentCargo]:
+    """인접 선석별 화물을 채운다.
+
+    mart.berth_current_cargo(실제 재항 화물)가 있으면 그걸 쓰고, 없으면(화물
+    manifest가 아직 합성 데이터 위주라 커버리지가 낮음·재항 선박 없음·facility_alias
+    매칭 실패 등) 카테고리 대표값으로 근사한다 — category_map.py의 원래 설계를
+    완전히 버리지 않고 폴백으로 남긴 이유는, "실데이터가 없다"를 "위험이 없다"로
+    착각하면 안전 판정을 낙관적으로 왜곡하기 때문이다. 실데이터가 있으면 그게
+    항상 우선한다 — 근사값보다 신뢰도가 높다(cargo_msds ★ 안전관제 핵심 뷰 참고).
+    """
     adjacent_cargos: list[AdjacentCargo] = []
     for entry in categories_by_neighbor:
+        real_cargos = real_cargo_by_wharf.get(entry.get("adjacent_wharf_name") or "", [])
+        if real_cargos:
+            for rc in real_cargos:
+                adjacent_cargos.append(
+                    AdjacentCargo(
+                        berth_name=entry["adjacent_berth_id"],
+                        cargo=CargoRef(chem_id=rc["chem_id"], cas_no=rc["cas_no"]),
+                    )
+                )
+            continue
         for category in entry["categories"]:
             chem_id = representative_chem_id(category)
             if chem_id is None:
@@ -100,6 +161,13 @@ async def find_berth_candidates(
         window_end=request.window_end,
     )
     adjacency_map = await find_adjacent_categories(neo4j_driver, berth_ids=berth_ids)
+    adjacent_wharf_names = list({
+        entry["adjacent_wharf_name"]
+        for entries in adjacency_map.values()
+        for entry in entries
+        if entry.get("adjacent_wharf_name")
+    })
+    real_cargo_by_wharf = await _real_adjacent_cargo_by_wharf(db, adjacent_wharf_names)
 
     candidates: list[BerthCandidate] = []
     for row in eligible:
@@ -124,7 +192,9 @@ async def find_berth_candidates(
                     )
                     for c in conflicts
                 ],
-                adjacent_cargos=_adjacent_cargos_for(adjacency_map.get(row["berth_id"], [])),
+                adjacent_cargos=_adjacent_cargos_for(
+                    adjacency_map.get(row["berth_id"], []), real_cargo_by_wharf
+                ),
             )
         )
 

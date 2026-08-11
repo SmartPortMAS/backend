@@ -43,6 +43,8 @@ class PortmisVessel(Base, CollectorMetadataMixin):
     dest_arrival_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_liquid_cargo_vessel: Mapped[bool | None] = mapped_column(Boolean)
     is_domestic_voyage: Mapped[bool | None] = mapped_column(Boolean)
+    is_liquid_cargo_barge: Mapped[bool | None] = mapped_column(Boolean, comment="액체화물 부선 여부")
+    is_bunkering_vessel: Mapped[bool | None] = mapped_column(Boolean, comment="급유선 여부")
 
     __table_args__ = (
         Index(

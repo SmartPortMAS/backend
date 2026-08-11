@@ -102,6 +102,6 @@ app.include_router(chatbot_router, prefix="/api/v1")
 app.include_router(rag_router, prefix="/api/v1")
 
 
-@app.get("/health")
+@app.get("/health", summary="서비스 상태 확인")
 def health_check() -> dict[str, str]:
     return {"status": "ok"}
