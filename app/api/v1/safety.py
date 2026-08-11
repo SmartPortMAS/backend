@@ -23,6 +23,9 @@ _DESCRIPTION = """
   위험"을 구분할 수 있습니다.
 - **`imdg_conflicts`가 법적 근거**(IMDG Code Ch.7.2)라 `conflicts`(MSDS 텍스트 추출)보다
   우선 표시하세요. `segregation_code`는 1~4이며 클수록 강한 격리를 요구합니다.
+- `packaging_violations`는 인접 화물과 무관하게 대상 화물 자신의 용기등급 대비
+  하역방식만으로 판정합니다. `target_cargo.unload_method_name`을 안 보내면 이
+  목록은 항상 비어 있습니다(판정 안 함이지 "적합"이 아님).
 - `msds_sections_used`는 판정 근거로 쓴 MSDS 섹션 키입니다.
 
 배경: `01_안전관제_에이전트_설계문서.md`
