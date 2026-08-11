@@ -48,4 +48,12 @@ class MsdsEmbedding(Base):
         ),
         Index("idx_msds_embedding_chem_id", "chem_id"),
         Index("idx_msds_embedding_chunk_kind", "chunk_kind"),
+        # migration 0006이 raw SQL로 만든 인덱스(HNSW는 SQLAlchemy Index()의 기본
+        # postgresql_using 경로로 안 만들어져 raw SQL을 씀). 여기 선언이 없으면
+        # autogenerate가 "모델에 없는 인덱스"로 보고 DROP을 제안한다 — 챗봇 RAG
+        # 벡터 검색이 순차 스캔으로 조용히 떨어지는 사고로 이어진다.
+        Index(
+            "idx_msds_embedding_vec", "embedding",
+            postgresql_using="hnsw", postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
     )
