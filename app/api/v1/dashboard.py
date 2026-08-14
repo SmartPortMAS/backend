@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.safety.berth_alerts import build_berth_alerts
 from app.core.deps import get_session
 from app.neo4j_client import neo4j_client
 
@@ -442,3 +443,22 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_session)) -> dict:
         "port_calls_by_facility_type": {row["facility_type"]: row["n"] for row in facility_type_rows},
         "liquid_callsgns": list(liquid_callsgns),
     }
+
+
+# --------------------------------------------------------------------------
+# 관제 경고 센터 — 재항 현황을 safety 규칙엔진에 통과시켜 만든 상시 경고.
+#
+# /safety/assess 는 "이 화물을 배정해도 되나"를 묻는 요청형이라, 아무도 묻지
+# 않으면 아무것도 알려주지 않는다. 경고 센터는 그 반대가 필요하다 — 지금 이미
+# 붙어 있는 위험한 조합을 스스로 찾아 띄워야 한다.
+#
+# 판정은 전부 safety 에이전트 함수를 그대로 재사용한다(berth_alerts.py 주석 참고).
+# 프론트(frontend/mock-server)가 "IMDG 등급 2종 동시 재항 — 확인 필요"까지만
+# 말할 수 있었던 건 그쪽에 판정 권위가 없어서다. 여기서는 실제 등급이 나온다.
+# --------------------------------------------------------------------------
+
+
+@router.get("/alerts", summary="관제 경고 목록 조회")
+async def get_dashboard_alerts(db: AsyncSession = Depends(get_session)) -> list[dict]:
+    """재항 화물 혼재금지·IMDG 격리·흘수 위반 경고. 0건이면 위험 없음(정상)."""
+    return await build_berth_alerts(db, neo4j_client.driver)
