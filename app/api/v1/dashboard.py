@@ -18,6 +18,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.safety.berth_alerts import build_berth_alerts
+from app.agents.safety.safety_index import build_safety_index
 from app.core.deps import get_session
 from app.neo4j_client import neo4j_client
 
@@ -462,3 +463,19 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_session)) -> dict:
 async def get_dashboard_alerts(db: AsyncSession = Depends(get_session)) -> list[dict]:
     """재항 화물 혼재금지·IMDG 격리·흘수 위반 경고. 0건이면 위험 없음(정상)."""
     return await build_berth_alerts(db, neo4j_client.driver)
+
+
+# --------------------------------------------------------------------------
+# 다차원 안전 평가 지수 — 관제 화면 레이더 차트용.
+#
+# 화면의 6축이 원래 탱크 압력·가스 농도 등 우리가 수집하지 않는 센서값이라
+# 하드코딩돼 있었다. 실제로 계산 가능한 안전 차원으로 축을 바꾸고, 각 축마다
+# 그 점수가 나온 원자료(basis)를 함께 내려준다 (safety_index.py 주석 참고).
+# 재료가 없는 축은 0/100 이 아니라 null 이다 — "모름"을 "안전"으로 만들지 않는다.
+# --------------------------------------------------------------------------
+
+
+@router.get("/safety-index", summary="다차원 안전 평가 지수 조회")
+async def get_safety_index(db: AsyncSession = Depends(get_session)) -> dict:
+    """기상·흘수·혼재·화물식별·선석특정·신선도 6축 점수(0~100)와 근거."""
+    return await build_safety_index(db, neo4j_client.driver)
