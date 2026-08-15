@@ -118,6 +118,31 @@ class ForecastWarning(BaseModel):
     points: list[ForecastPoint]
 
 
+class ThresholdStep(BaseModel):
+    """에스컬레이션 한 단계의 임계값. 값이 없는 항목은 None(그 단계에 그 조건 없음)."""
+
+    wind_ms: float | None = None
+    wave_m: float | None = None
+
+
+class ThresholdsUsed(BaseModel):
+    """이번 판정에 실제로 적용한 berth_weather_threshold 행.
+
+    [왜 응답에 싣나]
+    이 값을 안 실어 보내면 화면이 임계값을 자기 쪽에 따로 적어 두는 수밖에 없다.
+    실제로 프론트에 로컬 임계표가 생겼고, DB에 8개 부두그룹이 있는데 표에는 3개만
+    있어서 "판정은 DB 임계(석유공사부이 중단 12m/s)로, 화면 표시는 다른 임계(14m/s)로"
+    하는 상태가 됐다. 판정의 근거는 판정한 쪽이 함께 돌려주는 게 맞다.
+    """
+
+    berth_group: str = Field(description="적용된 임계 행의 키. 전역 폴백이면 __GLOBAL_DEFAULT__")
+    is_global_default: bool = Field(description="요청 berth_group 전용 임계가 없어 전역 폴백을 쓴 경우 True")
+    stop: ThresholdStep = Field(description="하역중단 임계")
+    unberth: ThresholdStep = Field(description="이안 임계")
+    disconnect: ThresholdStep = Field(description="로딩암/호스 분리 임계")
+    source: str | None = Field(default=None, description="임계값 출처(터미널 입항정보 등)")
+
+
 class WeatherAssessmentResult(BaseModel):
     status: WorkStatus
     assessed_at_utc: datetime = Field(description="실제로 사용한 판단 기준 시각(요청의 as_of 또는 현재 시각)")
@@ -126,6 +151,11 @@ class WeatherAssessmentResult(BaseModel):
     visibility_m: float | None = Field(
         default=None,
         description="참고용 시정 정보. 판단에는 사용하지 않음(알려진 한계 참고)",
+    )
+    thresholds_used: ThresholdsUsed | None = Field(
+        default=None,
+        description="이번 판정에 적용한 임계값. 요청한 berth_group이 테이블에 없으면 "
+        "None(판단불가 사유가 reasons에 남는다)",
     )
     reasons: list[str] = Field(description="상태 판단 근거 (임계값 비교 결과, 관측 결측 등)")
     forecast_warning: ForecastWarning | None = Field(

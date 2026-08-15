@@ -59,6 +59,8 @@ async def _segregation_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dic
         by_berth.setdefault(row["facility_name"], []).append(dict(row))
 
     alerts: list[dict] = []
+    # 선석별 충돌 쌍을 모았다가 마지막에 한 건으로 묶는다
+    pairs_by_berth: dict[str, list[dict]] = {}
     for berth, cargos in by_berth.items():
         identified = [c for c in cargos if c["chem_id"]]
         unidentified = len(cargos) - len(identified)
@@ -116,14 +118,57 @@ async def _segregation_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dic
                 else:
                     why = f"혼재금지({raw.get('category', '분류 미상')})"
 
-                alerts.append({
+                pairs_by_berth.setdefault(berth, []).append({
                     "level": _LEVEL_TO_ALERT[floor],
-                    "type": "SEGREGATION",
-                    "berth_name": berth,
-                    "message": f"{berth}: {target_name} ↔ {other_name} {why} → {floor.value}",
-                    "risk_level": floor.value,
-                    "basis": "safety 규칙엔진(Neo4j 혼재금지 + IMDG 격리표)",
+                    "risk_level": floor,
+                    "text": f"{target_name} ↔ {other_name} {why}",
+                    # 이 조합에 실제로 걸린 배들. 화면이 경고에서 선박 상세로 갈
+                    # 수 있게 하려면 선석 이름만으로는 부족하다.
+                    "callsgns": [
+                        c["callsgn"]
+                        for c in identified
+                        if c["chem_id"] in (target["chem_id"], other_id) and c["callsgn"]
+                    ],
+                    # 이 경고가 지목한 두 물질. 화면이 "이 경고를 심사"로 넘어갈 때
+                    # 무엇을 폼에 넣어야 하는지가 이 값이다 — 없으면 그 선석의 아무
+                    # 화물이나 집어넣게 되어, 경고는 "가솔린↔부탄"인데 심사는 케로젠을
+                    # 하는 상황이 된다.
+                    "chem_ids": [target["chem_id"], other_id],
                 })
+
+    # 선석 단위로 묶는다.
+    #
+    # 한 선석에 위험물이 여러 종 재항하면 쌍의 수가 제곱으로 늘어난다(실측: 화물
+    # 배정을 액체화물선 전수로 넓히자 121건). 관제사는 쌍이 아니라 **선석 단위로**
+    # 조치하므로, 선석마다 가장 심각한 조합을 대표로 올리고 나머지는 건수로 알린다.
+    # 전체 목록은 details 에 그대로 담아 화면이 펼쳐 볼 수 있게 한다 — 묶는 것이지
+    # 버리는 것이 아니다.
+    for berth, pairs in pairs_by_berth.items():
+        worst = max(pairs, key=lambda x: risk_level_rank(x["risk_level"]))
+        more = len(pairs) - 1
+        suffix = f" 외 {more}쌍" if more else ""
+        # 이 선석 경고에 걸린 배 전체(중복 제거, 등장 순서 유지)
+        callsgns: list[str] = []
+        for p in pairs:
+            for cs in p.get("callsgns", []):
+                if cs not in callsgns:
+                    callsgns.append(cs)
+        alerts.append({
+            "level": worst["level"],
+            "type": "SEGREGATION",
+            "berth_name": berth,
+            "message": f"{berth}: {worst['text']} → {worst['risk_level'].value}{suffix}",
+            "risk_level": worst["risk_level"].value,
+            "basis": "safety 규칙엔진(Neo4j 혼재금지 + IMDG 격리표)",
+            "pair_count": len(pairs),
+            "details": [p["text"] for p in pairs],
+            # 화면이 경고 → 선박 상세로 갈 수 있게 하는 유일한 키.
+            # (port_call_id 는 이 경로에 존재하지 않는다 — 경고는 요청형 판정이
+            #  아니라 재항 현황 전수 판정에서 나오기 때문이다.)
+            "callsgns": callsgns,
+            # 대표로 올린 조합(worst)의 두 물질 — "이 경고를 심사"가 재현해야 할 입력
+            "chem_ids": worst.get("chem_ids", []),
+        })
     return alerts
 
 
@@ -141,6 +186,8 @@ async def _draught_alerts(db: AsyncSession) -> list[dict]:
                        f"흘수 여유 부족 ({ukc}, {row['draught_verdict']})",
             "risk_level": None,
             "basis": "mart.berth_draught_check (조위 반영 가용수심)",
+            # 흘수 경고는 배 한 척의 문제다 — 그 배로 바로 갈 수 있게 한다
+            "callsgns": [row["callsgn"]] if row["callsgn"] else [],
         })
     return out
 

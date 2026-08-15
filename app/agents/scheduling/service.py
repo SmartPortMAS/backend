@@ -88,8 +88,18 @@ async def _real_adjacent_cargo_by_wharf(
         await db.execute(_QUERY_REAL_ADJACENT_CARGO, {"wharf_names": wharf_names})
     ).mappings().all()
     grouped: dict[str, list[dict]] = {}
+    # 같은 선석에 같은 물질을 실은 배가 여럿이면 뷰에서 행이 여러 개 나온다
+    # (berth_current_cargo 는 (callsgn, 물질) 단위). 혼재 판정에는 "그 선석에 그
+    # 물질이 있는가"만 중요하므로 물질 단위로 눌러 담는다 — 안 그러면 후보 응답에
+    # 같은 화물이 예닐곱 번 반복돼 화면과 LLM 프롬프트가 함께 부풀었다.
+    seen_by_wharf: dict[str, set[str]] = {}
     for row in rows:
-        grouped.setdefault(row["wharf_name"], []).append(
+        wharf = row["wharf_name"]
+        seen = seen_by_wharf.setdefault(wharf, set())
+        if row["chem_id"] in seen:
+            continue
+        seen.add(row["chem_id"])
+        grouped.setdefault(wharf, []).append(
             {"chem_id": row["chem_id"], "cas_no": row["cas_no"]}
         )
     return grouped
