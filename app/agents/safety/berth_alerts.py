@@ -59,6 +59,8 @@ async def _segregation_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dic
         by_berth.setdefault(row["facility_name"], []).append(dict(row))
 
     alerts: list[dict] = []
+    # 선석별 충돌 쌍을 모았다가 마지막에 한 건으로 묶는다
+    pairs_by_berth: dict[str, list[dict]] = {}
     for berth, cargos in by_berth.items():
         identified = [c for c in cargos if c["chem_id"]]
         unidentified = len(cargos) - len(identified)
@@ -116,14 +118,33 @@ async def _segregation_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dic
                 else:
                     why = f"혼재금지({raw.get('category', '분류 미상')})"
 
-                alerts.append({
+                pairs_by_berth.setdefault(berth, []).append({
                     "level": _LEVEL_TO_ALERT[floor],
-                    "type": "SEGREGATION",
-                    "berth_name": berth,
-                    "message": f"{berth}: {target_name} ↔ {other_name} {why} → {floor.value}",
-                    "risk_level": floor.value,
-                    "basis": "safety 규칙엔진(Neo4j 혼재금지 + IMDG 격리표)",
+                    "risk_level": floor,
+                    "text": f"{target_name} ↔ {other_name} {why}",
                 })
+
+    # 선석 단위로 묶는다.
+    #
+    # 한 선석에 위험물이 여러 종 재항하면 쌍의 수가 제곱으로 늘어난다(실측: 화물
+    # 배정을 액체화물선 전수로 넓히자 121건). 관제사는 쌍이 아니라 **선석 단위로**
+    # 조치하므로, 선석마다 가장 심각한 조합을 대표로 올리고 나머지는 건수로 알린다.
+    # 전체 목록은 details 에 그대로 담아 화면이 펼쳐 볼 수 있게 한다 — 묶는 것이지
+    # 버리는 것이 아니다.
+    for berth, pairs in pairs_by_berth.items():
+        worst = max(pairs, key=lambda x: risk_level_rank(x["risk_level"]))
+        more = len(pairs) - 1
+        suffix = f" 외 {more}쌍" if more else ""
+        alerts.append({
+            "level": worst["level"],
+            "type": "SEGREGATION",
+            "berth_name": berth,
+            "message": f"{berth}: {worst['text']} → {worst['risk_level'].value}{suffix}",
+            "risk_level": worst["risk_level"].value,
+            "basis": "safety 규칙엔진(Neo4j 혼재금지 + IMDG 격리표)",
+            "pair_count": len(pairs),
+            "details": [p["text"] for p in pairs],
+        })
     return alerts
 
 
