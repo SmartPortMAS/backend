@@ -16,12 +16,16 @@ from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models import GLOBAL_DEFAULT_BERTH_GROUP
+
 from .data_access import get_berth_threshold, get_forecast_range, get_latest_wave, get_latest_weather
 from .rule_engine import PRECIP_STOP_MM, MAX_STALENESS, evaluate, severity
 from .schemas import (
     ForecastPoint,
     ForecastWarning,
     ObservationFactor,
+    ThresholdStep,
+    ThresholdsUsed,
     WeatherAssessmentRequest,
     WeatherAssessmentResult,
     WorkStatus,
@@ -32,6 +36,27 @@ def _is_stale(observed_at_utc: datetime | None, as_of: datetime) -> bool:
     if observed_at_utc is None:
         return True
     return (as_of - observed_at_utc) > MAX_STALENESS
+
+
+def _thresholds_used(threshold, *, requested_group: str | None) -> ThresholdsUsed | None:
+    """판정에 쓴 임계 행을 응답용으로 옮긴다.
+
+    화면이 임계값을 따로 적어 두지 않아도 되게 하려는 것이다 — 판정과 표시가
+    서로 다른 임계를 쓰는 상태를 구조적으로 막는다.
+    """
+    if threshold is None:
+        return None
+    return ThresholdsUsed(
+        berth_group=threshold.berth_group,
+        is_global_default=threshold.berth_group == GLOBAL_DEFAULT_BERTH_GROUP
+        and requested_group not in (None, GLOBAL_DEFAULT_BERTH_GROUP),
+        stop=ThresholdStep(wind_ms=threshold.stop_wind_ms, wave_m=threshold.stop_wave_m),
+        unberth=ThresholdStep(wind_ms=threshold.unberth_wind_ms, wave_m=threshold.unberth_wave_m),
+        disconnect=ThresholdStep(
+            wind_ms=threshold.disconnect_wind_ms, wave_m=threshold.disconnect_wave_m
+        ),
+        source=threshold.source,
+    )
 
 
 async def _build_forecast_warning(
@@ -141,6 +166,7 @@ async def assess_weather(db: AsyncSession, request: WeatherAssessmentRequest) ->
             is_stale=wave_is_stale,
         ),
         visibility_m=weather_row.visibility_m if weather_row else None,
+        thresholds_used=_thresholds_used(threshold, requested_group=request.berth_group),
         reasons=reasons,
         forecast_warning=forecast_warning,
     )

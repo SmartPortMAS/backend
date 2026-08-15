@@ -122,6 +122,18 @@ async def _segregation_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dic
                     "level": _LEVEL_TO_ALERT[floor],
                     "risk_level": floor,
                     "text": f"{target_name} ↔ {other_name} {why}",
+                    # 이 조합에 실제로 걸린 배들. 화면이 경고에서 선박 상세로 갈
+                    # 수 있게 하려면 선석 이름만으로는 부족하다.
+                    "callsgns": [
+                        c["callsgn"]
+                        for c in identified
+                        if c["chem_id"] in (target["chem_id"], other_id) and c["callsgn"]
+                    ],
+                    # 이 경고가 지목한 두 물질. 화면이 "이 경고를 심사"로 넘어갈 때
+                    # 무엇을 폼에 넣어야 하는지가 이 값이다 — 없으면 그 선석의 아무
+                    # 화물이나 집어넣게 되어, 경고는 "가솔린↔부탄"인데 심사는 케로젠을
+                    # 하는 상황이 된다.
+                    "chem_ids": [target["chem_id"], other_id],
                 })
 
     # 선석 단위로 묶는다.
@@ -135,6 +147,12 @@ async def _segregation_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dic
         worst = max(pairs, key=lambda x: risk_level_rank(x["risk_level"]))
         more = len(pairs) - 1
         suffix = f" 외 {more}쌍" if more else ""
+        # 이 선석 경고에 걸린 배 전체(중복 제거, 등장 순서 유지)
+        callsgns: list[str] = []
+        for p in pairs:
+            for cs in p.get("callsgns", []):
+                if cs not in callsgns:
+                    callsgns.append(cs)
         alerts.append({
             "level": worst["level"],
             "type": "SEGREGATION",
@@ -144,6 +162,12 @@ async def _segregation_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dic
             "basis": "safety 규칙엔진(Neo4j 혼재금지 + IMDG 격리표)",
             "pair_count": len(pairs),
             "details": [p["text"] for p in pairs],
+            # 화면이 경고 → 선박 상세로 갈 수 있게 하는 유일한 키.
+            # (port_call_id 는 이 경로에 존재하지 않는다 — 경고는 요청형 판정이
+            #  아니라 재항 현황 전수 판정에서 나오기 때문이다.)
+            "callsgns": callsgns,
+            # 대표로 올린 조합(worst)의 두 물질 — "이 경고를 심사"가 재현해야 할 입력
+            "chem_ids": worst.get("chem_ids", []),
         })
     return alerts
 
@@ -162,6 +186,8 @@ async def _draught_alerts(db: AsyncSession) -> list[dict]:
                        f"흘수 여유 부족 ({ukc}, {row['draught_verdict']})",
             "risk_level": None,
             "basis": "mart.berth_draught_check (조위 반영 가용수심)",
+            # 흘수 경고는 배 한 척의 문제다 — 그 배로 바로 갈 수 있게 한다
+            "callsgns": [row["callsgn"]] if row["callsgn"] else [],
         })
     return out
 
