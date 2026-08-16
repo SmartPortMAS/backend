@@ -40,15 +40,42 @@ IMDG_CODE_TO_RISK_LEVEL: dict[str, RiskLevel] = {
     "4": RiskLevel.BLOCKED,
 }
 
+# 2026-08-16 추가 — 코드 1·2는 "실제로 얼마나 떨어져 있는지"를 반영한다.
+# 이 항의 실측 부두 간격(60개 부두 최근접거리 중앙값 316.5m)에 맞춰 잡은
+# 운영 정책값이다 — IMDG 자체엔 부두 단위(선박 대 선박) 이격거리 규정이
+# 없다(원 규정은 선내 화물창 포장 간격 기준, 3m 단위라 항 규모에 안 맞음).
+# 소방청 위험물안전관리법의 육상 저장탱크 이격거리(3~30m)보다는 크게,
+# 실측으로 못 찾은 대용량 위험물 저장시설 기준(수백m대로 추정)과는 같은
+# 자릿수로 잡았다 — 규정으로 검증된 값이 아니므로 추후 항만 안전 전문
+# 자료 확보 시 조정 대상이다.
+#
+# 코드 3·4는 거리로 대체할 수 없다("완전 격창 분리" 요구 자체가 표면
+# 거리 개념이 아님) — 이격거리 무관하게 항상 배정불가 유지.
+IMDG_CODE_DISTANCE_THRESHOLD_M: dict[str, float] = {
+    "1": 300.0,
+    "2": 400.0,
+}
+
 
 def compute_imdg_floor(imdg_conflicts: list[dict]) -> RiskLevel:
     """IMDG Code 공인 일반 격리표 기반 충돌의 하한 등급.
 
     여러 인접 화물과 동시에 격리 규정이 걸리면 그중 가장 심각한 등급을 채택한다.
+
+    코드 1·2는 실측 거리(distance_m)가 임계값 이상으로 "확인"된 경우에만
+    SAFE로 완화한다 — distance_m이 None(거리 모름, 예: 수동 큐레이션 인접쌍)이면
+    기존처럼 코드 자체의 등급을 그대로 적용한다. "모르면 안전하다고 보지 않는다"
+    원칙(V-DG-01과 같은 성격) — 결측을 위험 완화 근거로 쓰지 않는다.
     """
     floor = RiskLevel.SAFE
     for conflict in imdg_conflicts:
-        level = IMDG_CODE_TO_RISK_LEVEL.get(conflict["segregation_code"], RiskLevel.SAFE)
+        code = conflict["segregation_code"]
+        threshold = IMDG_CODE_DISTANCE_THRESHOLD_M.get(code)
+        distance_m = conflict.get("distance_m")
+        if threshold is not None and distance_m is not None and distance_m >= threshold:
+            level = RiskLevel.SAFE
+        else:
+            level = IMDG_CODE_TO_RISK_LEVEL.get(code, RiskLevel.SAFE)
         floor = max_risk_level(floor, level)
     return floor
 

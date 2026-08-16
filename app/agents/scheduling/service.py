@@ -116,6 +116,7 @@ def _adjacent_cargos_for(
                     AdjacentCargo(
                         berth_name=entry["adjacent_berth_id"],
                         cargo=CargoRef(chem_id=rc["chem_id"], cas_no=rc["cas_no"]),
+                        distance_m=entry.get("distance_m"),
                     )
                 )
             continue
@@ -124,7 +125,11 @@ def _adjacent_cargos_for(
             if chem_id is None:
                 continue
             adjacent_cargos.append(
-                AdjacentCargo(berth_name=entry["adjacent_berth_id"], cargo=CargoRef(chem_id=chem_id))
+                AdjacentCargo(
+                    berth_name=entry["adjacent_berth_id"],
+                    cargo=CargoRef(chem_id=chem_id),
+                    distance_m=entry.get("distance_m"),
+                )
             )
     return adjacent_cargos
 

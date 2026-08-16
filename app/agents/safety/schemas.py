@@ -61,6 +61,12 @@ class CargoRef(BaseModel):
 class AdjacentCargo(BaseModel):
     berth_name: str
     cargo: CargoRef
+    distance_m: float | None = Field(
+        default=None,
+        description="대상 선석과의 실측 거리(m, berth_neo4j_loader의 좌표 계산). "
+        "PILOT_ADJACENT_PAIRS(수동 큐레이션) 유래거나 좌표 결측이면 None — "
+        "rule_engine.compute_imdg_floor가 None을 '거리 모름'으로 보수적으로 다룬다.",
+    )
 
 
 class SafetyAssessmentRequest(BaseModel):
@@ -93,6 +99,9 @@ class ImdgSegregationConflict(BaseModel):
     target_imdg_class: str
     adjacent_imdg_class: str
     segregation_code: str = Field(description="IMDG 격리 코드(1~4). 클수록 강한 물리적 이격 요구")
+    distance_m: float | None = Field(
+        default=None, description="실측 거리(m). None이면 거리 미상 — 등급 판정 시 보수적으로 처리됨"
+    )
 
 
 class PackagingViolation(BaseModel):

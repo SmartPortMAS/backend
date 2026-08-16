@@ -62,10 +62,10 @@ RETURN a.id AS anchorage_id, a.name AS name, a.tonnage_rule AS tonnage_rule,
 """
 
 _CYPHER_FIND_ADJACENT_CATEGORIES = """
-MATCH (b:Berth)-[:ADJACENT_TO]->(n:Berth)-[:HANDLES]->(cat:CargoCategory)
+MATCH (b:Berth)-[r:ADJACENT_TO]->(n:Berth)-[:HANDLES]->(cat:CargoCategory)
 WHERE b.id IN $berth_ids
 RETURN b.id AS berth_id, n.id AS adjacent_berth_id, n.wharf_name AS adjacent_wharf_name,
-       collect(DISTINCT cat.name) AS categories
+       r.distance_m AS distance_m, collect(DISTINCT cat.name) AS categories
 """
 
 
@@ -116,8 +116,14 @@ async def find_adjacent_categories(
     쓰인다(service.py `_real_adjacent_cargo_by_wharf`) — categories는 그게 없을 때의
     폴백 근사치일 뿐이다.
 
+    distance_m은 좌표 계산으로 구해진 쌍만 값이 있고(PILOT_ADJACENT_PAIRS 수동
+    큐레이션 쌍은 None) — safety/rule_engine.py가 IMDG 격리코드별 거리 임계값
+    판정에 쓴다(2026-08-16). None이면 "인접은 확인됐지만 정확한 거리는 모름"
+    이라는 뜻이라, 호출부가 보수적으로(임계값 통과로 보지 않고) 다뤄야 한다.
+
     Returns:
-        { berth_id: [{"adjacent_berth_id": ..., "adjacent_wharf_name": ..., "categories": [...]}, ...] }
+        { berth_id: [{"adjacent_berth_id": ..., "adjacent_wharf_name": ...,
+                       "distance_m": ..., "categories": [...]}, ...] }
     """
     if not berth_ids:
         return {}
@@ -136,6 +142,7 @@ async def find_adjacent_categories(
             {
                 "adjacent_berth_id": row["adjacent_berth_id"],
                 "adjacent_wharf_name": row["adjacent_wharf_name"],
+                "distance_m": row["distance_m"],
                 "categories": row["categories"],
             }
         )
