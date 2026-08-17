@@ -401,6 +401,36 @@ async def get_recent_port_call_history(
 
 
 # --------------------------------------------------------------------------
+# 선석별 재항 소요시간 통계 (mart.berth_dwell_stats)
+#
+# 스케줄링 에이전트는 지금까지 "점유인가 여유인가"만 답할 수 있었다. 관제사가
+# 실제로 묻는 것은 "그럼 언제 비는가"인데, 출항 예정 시각(ETD)이 원천에 전혀
+# 오지 않아(portmis_vessel.departure_sched_utc 779행 전부 NULL) 답할 수단이
+# 없었다. 대신 실제 재항 이력 3만 건의 분포에서 추정한다.
+#
+# 화면은 이 값으로 점유 선석에 "약 N시간 후 해제 예상"을 붙인다. 추정임을
+# 숨기지 않도록 표본 수와 P90 을 같이 내보낸다.
+# --------------------------------------------------------------------------
+
+_QUERY_BERTH_DWELL = text("""
+    SELECT wharf_name, sample_count, median_hours, p90_hours
+    FROM mart.berth_dwell_stats
+    ORDER BY sample_count DESC
+""")
+
+
+@router.get("/berth-dwell", summary="선석별 재항 소요시간 통계 조회")
+async def get_berth_dwell_stats(db: AsyncSession = Depends(get_session)) -> list[dict]:
+    """선석별 재항 소요시간(입항~출항 실측)의 중앙값·P90·표본 수.
+
+    '하역 시간'이 아니라 '재항 시간'이다 — 접안 대기·검사·급유가 모두 포함돼
+    있어 실제 작업시간보다 길다. 표본 5건 미만 선석은 뷰에서 이미 제외된다.
+    """
+    rows = (await db.execute(_QUERY_BERTH_DWELL)).mappings().all()
+    return [dict(row) for row in rows]
+
+
+# --------------------------------------------------------------------------
 # 수집 규모 통계 — 목서버(frontend/mock-server/dashboard_server.py)의
 # stats.total_port_calls/liquid_callsgns 를 정식 엔드포인트로 대체.
 #

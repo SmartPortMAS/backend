@@ -225,11 +225,21 @@ async def find_berth_candidates(
     # 온산 후보가 3개 이상이면 하드 필터와 결과가 완전히 같다 — 상위 3개가 잘리기
     # 전에 온산이 다 차지하기 때문이다(2026-08-02 실측: 액체화학·유류 시나리오에서
     # 하드/소프트 결과 동일, 원유에서만 3순위 폴백 유무가 갈림).
+    # 마지막 키는 "여유가 큰 순"이 아니라 "잘 맞는 순"이다(best fit).
+    #
+    # 예전엔 -draught_margin_m 이라 여유가 가장 큰 선석이 1순위였다. 그 결과
+    # 흘수 6 m 짜리 제품유 운반선에게 수심 27 m 원유부이가 1순위로 나왔다
+    # (2026-08-18 실측). 깊은 선석일수록 무조건 앞에 오니, 작은 배가 큰 배용
+    # 선석을 차지하는 방향으로 정렬이 굴러간 것이다.
+    #
+    # 실제 배정은 반대로 한다 — 조건을 만족하는 선석 중 가장 작은(딱 맞는) 곳에
+    # 대고, 깊은 선석은 깊은 배를 위해 비워 둔다. 안전 하한은 이미 위 필터
+    # (depth >= draught + margin)가 보장하므로, 남은 여유는 작을수록 좋다.
     candidates.sort(
         key=lambda c: (
             not c.onsan_scope,
             c.occupancy_status is OccupancyStatus.OCCUPIED,
-            -c.draught_margin_m,
+            c.draught_margin_m,
         )
     )
 
