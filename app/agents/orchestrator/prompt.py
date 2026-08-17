@@ -5,11 +5,15 @@
 승인/거부 판단을 새로 내리지 않는다.
 """
 
+from datetime import timedelta, timezone
+
 from app.agents.safety.schemas import SafetyAssessmentResult
 from app.agents.scheduling.schemas import BerthCandidate
 from app.agents.weather.schemas import WeatherAssessmentResult
 
 from .schemas import RejectedCandidate
+
+_KST = timezone(timedelta(hours=9))
 
 SYSTEM_PROMPT = """\
 당신은 울산항 액체화물 하역 관제를 보조하는 AI입니다.
@@ -20,13 +24,19 @@ SYSTEM_PROMPT = """\
 """
 
 
-def _format_weather(weather: WeatherAssessmentResult) -> str:
-    lines = [f"현재 상태: {weather.status.value}"]
+def _format_weather(weather: WeatherAssessmentResult, *, is_global_fallback: bool = False) -> str:
+    label = "현재 상태(전역 기본값 — 이 후보의 배정 실패 사유가 아닐 수 있음)" if is_global_fallback else "현재 상태"
+    lines = [f"{label}: {weather.status.value}"]
     if weather.forecast_warning:
         fw = weather.forecast_warning
         if fw.will_deteriorate:
+            deteriorate_at_kst = (
+                fw.earliest_deterioration_at_utc.astimezone(_KST).strftime("%m월 %d일 %H:%M")
+                if fw.earliest_deterioration_at_utc
+                else "미상"
+            )
             lines.append(
-                f"예보 경고: {fw.earliest_deterioration_at_utc} 부터 {fw.worst_status.value} 수준으로 악화 예상"
+                f"예보 경고: {deteriorate_at_kst}(KST)부터 {fw.worst_status.value} 수준으로 악화 예상"
             )
         else:
             lines.append("예보 경고: 하역 완료 예정 시각까지 악화 없음")
@@ -55,6 +65,7 @@ def build_user_prompt(
     safety: SafetyAssessmentResult | None,
     weather: WeatherAssessmentResult,
     rejected_candidates: list[RejectedCandidate],
+    is_global_fallback_weather: bool = False,
 ) -> str:
     berth_desc = (
         f"{selected_berth.rank}순위 {selected_berth.wharf_name} "
@@ -70,7 +81,7 @@ def build_user_prompt(
 {_format_safety(safety)}
 
 [기상 상태]
-{_format_weather(weather)}
+{_format_weather(weather, is_global_fallback=is_global_fallback_weather)}
 
 [재탐색 과정에서 탈락한 후보]
 {_format_rejected(rejected_candidates)}

@@ -61,11 +61,19 @@ RETURN a.id AS anchorage_id, a.name AS name, a.tonnage_rule AS tonnage_rule,
        a.latitude AS latitude, a.longitude AS longitude
 """
 
+_CYPHER_GET_BERTH_BY_WHARF_NAME = """
+MATCH (b:Berth {wharf_name: $wharf_name})
+RETURN b.id AS berth_id, b.wharf_name AS wharf_name, b.port_name AS port_name,
+       b.depth_m AS depth_m, b.berth_group AS berth_group,
+       coalesce(b.onsan_scope, false) AS onsan_scope
+LIMIT 1
+"""
+
 _CYPHER_FIND_ADJACENT_CATEGORIES = """
-MATCH (b:Berth)-[:ADJACENT_TO]->(n:Berth)-[:HANDLES]->(cat:CargoCategory)
+MATCH (b:Berth)-[r:ADJACENT_TO]->(n:Berth)-[:HANDLES]->(cat:CargoCategory)
 WHERE b.id IN $berth_ids
 RETURN b.id AS berth_id, n.id AS adjacent_berth_id, n.wharf_name AS adjacent_wharf_name,
-       collect(DISTINCT cat.name) AS categories
+       r.distance_m AS distance_m, collect(DISTINCT cat.name) AS categories
 """
 
 
@@ -105,6 +113,23 @@ async def find_eligible_berths(
         return await session.execute_read(_tx)
 
 
+async def get_berth_by_wharf_name(driver: AsyncDriver, *, wharf_name: str) -> dict | None:
+    """Berth.wharf_name 정확히 일치하는 선석 하나를 조회한다(검증모드: 사전배정 선석 확인용).
+
+    find_eligible_berths처럼 카테고리/수심으로 거르지 않는다 — 이미 정해진 선석
+    하나가 맞는지만 보는 용도라, 없으면 그대로 None(호출부가 "선석을 찾을 수
+    없음"으로 처리한다).
+    """
+    async with driver.session() as session:
+
+        async def _tx(tx):
+            result = await tx.run(_CYPHER_GET_BERTH_BY_WHARF_NAME, wharf_name=wharf_name)
+            record = await result.single()
+            return record.data() if record else None
+
+        return await session.execute_read(_tx)
+
+
 async def find_adjacent_categories(
     driver: AsyncDriver,
     *,
@@ -116,8 +141,14 @@ async def find_adjacent_categories(
     쓰인다(service.py `_real_adjacent_cargo_by_wharf`) — categories는 그게 없을 때의
     폴백 근사치일 뿐이다.
 
+    distance_m은 좌표 계산으로 구해진 쌍만 값이 있고(PILOT_ADJACENT_PAIRS 수동
+    큐레이션 쌍은 None) — safety/rule_engine.py가 IMDG 격리코드별 거리 임계값
+    판정에 쓴다(2026-08-16). None이면 "인접은 확인됐지만 정확한 거리는 모름"
+    이라는 뜻이라, 호출부가 보수적으로(임계값 통과로 보지 않고) 다뤄야 한다.
+
     Returns:
-        { berth_id: [{"adjacent_berth_id": ..., "adjacent_wharf_name": ..., "categories": [...]}, ...] }
+        { berth_id: [{"adjacent_berth_id": ..., "adjacent_wharf_name": ...,
+                       "distance_m": ..., "categories": [...]}, ...] }
     """
     if not berth_ids:
         return {}
@@ -136,6 +167,7 @@ async def find_adjacent_categories(
             {
                 "adjacent_berth_id": row["adjacent_berth_id"],
                 "adjacent_wharf_name": row["adjacent_wharf_name"],
+                "distance_m": row["distance_m"],
                 "categories": row["categories"],
             }
         )

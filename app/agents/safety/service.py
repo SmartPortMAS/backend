@@ -44,11 +44,11 @@ async def assess_safety(
 ) -> SafetyAssessmentResult:
     target_row = await resolve_cargo(db, request.target_cargo)
 
-    adjacent_resolved: list[tuple[str, MsdsChemical]] = [
-        (adjacent.berth_name, await resolve_cargo(db, adjacent.cargo))
+    adjacent_resolved: list[tuple[str, float | None, MsdsChemical]] = [
+        (adjacent.berth_name, adjacent.distance_m, await resolve_cargo(db, adjacent.cargo))
         for adjacent in request.adjacent_cargos
     ]
-    adjacent_chem_ids = list({row.chem_id for _, row in adjacent_resolved})
+    adjacent_chem_ids = list({row.chem_id for _, _, row in adjacent_resolved})
 
     raw_conflicts = await find_incompatible_conflicts(
         neo4j_driver,
@@ -60,6 +60,18 @@ async def assess_safety(
         target_chem_id=target_row.chem_id,
         adjacent_chem_ids=adjacent_chem_ids,
     )
+    # rule_engine.compute_imdg_floor가 거리 기준으로 등급을 완화할 수 있게
+    # chem_id -> 최단거리를 붙여준다(2026-08-16). 같은 화학물질이 여러 인접
+    # 선석에 걸쳐 있으면 가장 가까운(가장 보수적인) 거리를 쓴다.
+    chem_to_min_distance: dict[str, float | None] = {}
+    for _, distance_m, row in adjacent_resolved:
+        current = chem_to_min_distance.get(row.chem_id, None)
+        if distance_m is not None and (current is None or distance_m < current):
+            chem_to_min_distance[row.chem_id] = distance_m
+        elif row.chem_id not in chem_to_min_distance:
+            chem_to_min_distance[row.chem_id] = None
+    for raw in raw_imdg_conflicts:
+        raw["distance_m"] = chem_to_min_distance.get(raw["chem_id"])
 
     conflicts: list[IncompatibleConflict] = [
         IncompatibleConflict(
@@ -70,7 +82,7 @@ async def assess_safety(
             direction=raw["direction"],
         )
         for raw in raw_conflicts
-        for berth_name, row in adjacent_resolved
+        for berth_name, _distance_m, row in adjacent_resolved
         if row.chem_id == raw["chem_id"]
     ]
     imdg_conflicts: list[ImdgSegregationConflict] = [
@@ -81,9 +93,10 @@ async def assess_safety(
             target_imdg_class=raw["target_class"],
             adjacent_imdg_class=raw["adjacent_class"],
             segregation_code=raw["segregation_code"],
+            distance_m=raw.get("distance_m"),
         )
         for raw in raw_imdg_conflicts
-        for berth_name, row in adjacent_resolved
+        for berth_name, _distance_m, row in adjacent_resolved
         if row.chem_id == raw["chem_id"]
     ]
 

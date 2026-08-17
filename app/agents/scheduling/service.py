@@ -33,6 +33,7 @@ from .graph_queries import (
     find_anchorage_candidates,
     find_eligible_berths,
     find_substitutable_berths,
+    get_berth_by_wharf_name,
     get_chemical_category,
     select_anchorage_for_dwt,
 )
@@ -126,6 +127,7 @@ def _adjacent_cargos_for(
                     AdjacentCargo(
                         berth_name=entry["adjacent_berth_id"],
                         cargo=CargoRef(chem_id=rc["chem_id"], cas_no=rc["cas_no"]),
+                        distance_m=entry.get("distance_m"),
                     )
                 )
             continue
@@ -134,7 +136,11 @@ def _adjacent_cargos_for(
             if chem_id is None:
                 continue
             adjacent_cargos.append(
-                AdjacentCargo(berth_name=entry["adjacent_berth_id"], cargo=CargoRef(chem_id=chem_id))
+                AdjacentCargo(
+                    berth_name=entry["adjacent_berth_id"],
+                    cargo=CargoRef(chem_id=chem_id),
+                    distance_m=entry.get("distance_m"),
+                )
             )
     return adjacent_cargos
 
@@ -237,6 +243,103 @@ async def find_berth_candidates(
         candidates=top_candidates,
         total_eligible_count=len(eligible),
     )
+
+
+_QUERY_RESOLVE_WHARF_ALIAS = text("""
+    SELECT wharf_name FROM mart.facility_alias
+    WHERE source_name = :name AND facility_type = 'BERTH'
+""")
+
+
+async def build_candidate_for_wharf_name(
+    db: AsyncSession,
+    neo4j_driver: AsyncDriver,
+    *,
+    wharf_name: str,
+    vessel: VesselSpec,
+    window_start: datetime,
+    window_end: datetime,
+    draught_margin_m: float = 1.0,
+) -> tuple[BerthCandidate | None, str | None]:
+    """이미 정해진 선석 이름(사전배정 선석) 하나를 검증용 BerthCandidate로 만든다.
+
+    find_berth_candidates(카테고리로 top-3 새로 탐색)와 달리, 특정 선석 하나가
+    지금 안전한지만 확인하는 용도다(검증모드) — 화물 카테고리로 거르지 않는다.
+
+    입력 wharf_name은 실시간 위치 조인(mart.berth_current_cargo.facility_name)에서
+    올 수 있어 VTS 원문 표기('SK2부두 01')일 수 있다. Neo4j Berth.wharf_name은
+    선석 제원 마스터 표기('SK2부두(민유)' 등)라 문자 그대로 다를 수 있으므로,
+    mart.facility_alias로 먼저 정규화한다(occupancy.py가 아직 못 하고 있는 것과
+    같은 매칭 문제 — 여기서는 새로 만드는 경로라 처음부터 정규화를 거친다).
+    별칭 사전에 없으면 입력값을 그대로 시도한다(이미 정본 표기일 수 있으므로).
+
+    Returns:
+        (candidate, None) — 찾았고 흘수 여유(draught_margin_m) 조건도 만족
+        (None, reason) — 선석을 못 찾았거나 흘수 여유가 부족함
+    """
+    alias_row = (
+        await db.execute(_QUERY_RESOLVE_WHARF_ALIAS, {"name": wharf_name})
+    ).mappings().first()
+    canonical_wharf_name = alias_row["wharf_name"] if alias_row else wharf_name
+
+    berth = await get_berth_by_wharf_name(neo4j_driver, wharf_name=canonical_wharf_name)
+    if berth is None:
+        return None, f"선석 '{wharf_name}'을(를) 찾을 수 없습니다(선석 제원 마스터 미등록)."
+
+    if berth["depth_m"] is None:
+        return None, f"선석 '{canonical_wharf_name}'의 수심 정보가 없어 안전 여부를 판단할 수 없습니다."
+
+    # find_berth_candidates(탐색모드)의 min_depth = draught + draught_margin_m와
+    # 같은 기준. 검증모드라고 더 느슨하게 볼 이유가 없다 — 같은 배가 같은
+    # 안전여유 기준을 통과해야 한다.
+    actual_margin_m = berth["depth_m"] - vessel.draught_m
+    if actual_margin_m < draught_margin_m:
+        return None, (
+            f"선석 '{canonical_wharf_name}' 수심({berth['depth_m']}m) 대비 흘수여유가 "
+            f"{actual_margin_m:.1f}m로 요구 기준({draught_margin_m}m)에 못 미칩니다"
+            f"(선박 흘수 {vessel.draught_m}m)."
+        )
+
+    occupancy_map = await find_overlapping_port_calls(
+        db,
+        wharf_names=[canonical_wharf_name],
+        window_start=window_start,
+        window_end=window_end,
+    )
+    conflicts = occupancy_map.get(canonical_wharf_name, [])
+    status = OccupancyStatus.OCCUPIED if conflicts else OccupancyStatus.AVAILABLE
+
+    adjacency_map = await find_adjacent_categories(neo4j_driver, berth_ids=[berth["berth_id"]])
+    adjacent_wharf_names = list({
+        entry["adjacent_wharf_name"]
+        for entry in adjacency_map.get(berth["berth_id"], [])
+        if entry.get("adjacent_wharf_name")
+    })
+    real_cargo_by_wharf = await _real_adjacent_cargo_by_wharf(db, adjacent_wharf_names)
+
+    candidate = BerthCandidate(
+        rank=1,
+        berth_id=berth["berth_id"],
+        wharf_name=berth["wharf_name"],
+        port_name=berth["port_name"],
+        depth_m=berth["depth_m"],
+        berth_group=berth.get("berth_group"),
+        onsan_scope=bool(berth.get("onsan_scope")),
+        draught_margin_m=actual_margin_m,
+        occupancy_status=status,
+        conflicting_port_calls=[
+            ConflictingPortCall(
+                vessel_name=c["vessel_name"],
+                arrival_at_utc=c["arrival_at_utc"],
+                departure_at_utc=c["departure_at_utc"],
+            )
+            for c in conflicts
+        ],
+        adjacent_cargos=_adjacent_cargos_for(
+            adjacency_map.get(berth["berth_id"], []), real_cargo_by_wharf
+        ),
+    )
+    return candidate, None
 
 
 async def resolve_berth_assignment(
