@@ -43,6 +43,12 @@ class OrchestratorRequest(BaseModel):
     weather_as_of: datetime | None = Field(
         default=None, description="기상 판단 기준 시각(UTC). 생략 시 서버 현재 시각(=지금 기상으로 판단)"
     )
+    assigned_wharf_name: str | None = Field(
+        default=None,
+        description="이미 정해진 선석(예: 실시간 위치 조인의 현재 접안 선석명). 있으면 "
+        "top-3 재탐색 대신 이 선석 하나만 검증한다(검증모드). 없으면 기존 top-3 "
+        "탐색 경로(탐색모드, 하위 호환).",
+    )
 
     @model_validator(mode="after")
     def _window_must_be_ordered(self) -> "OrchestratorRequest":
@@ -78,6 +84,12 @@ class OrchestratorResult(BaseModel):
         default_factory=list,
         description="전용/대체/정박지대기 판단 경로와 근거(온산 MVP 이식: 팀원 오케스트레이터의 "
         "berth_decision.trace와 동일한 목적)",
+    )
+    assignment_changed: bool = Field(
+        default=False,
+        description="검증모드(assigned_wharf_name 지정)에서, 최종 selected_berth.wharf_name이 "
+        "assigned_wharf_name과 다르면 True — 원래 있던 자리가 아니라 대체 선석으로 바뀌었다는 "
+        "뜻이라 관제사가 바로 알아야 한다. 탐색모드에서는 항상 False.",
     )
     summary: str = Field(description="관제사가 읽을 종합 의견 (1~2문단)")
 

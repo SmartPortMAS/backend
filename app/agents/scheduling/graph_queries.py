@@ -61,6 +61,14 @@ RETURN a.id AS anchorage_id, a.name AS name, a.tonnage_rule AS tonnage_rule,
        a.latitude AS latitude, a.longitude AS longitude
 """
 
+_CYPHER_GET_BERTH_BY_WHARF_NAME = """
+MATCH (b:Berth {wharf_name: $wharf_name})
+RETURN b.id AS berth_id, b.wharf_name AS wharf_name, b.port_name AS port_name,
+       b.depth_m AS depth_m, b.berth_group AS berth_group,
+       coalesce(b.onsan_scope, false) AS onsan_scope
+LIMIT 1
+"""
+
 _CYPHER_FIND_ADJACENT_CATEGORIES = """
 MATCH (b:Berth)-[r:ADJACENT_TO]->(n:Berth)-[:HANDLES]->(cat:CargoCategory)
 WHERE b.id IN $berth_ids
@@ -101,6 +109,23 @@ async def find_eligible_berths(
                 min_depth=min_depth,
             )
             return [record.data() async for record in result]
+
+        return await session.execute_read(_tx)
+
+
+async def get_berth_by_wharf_name(driver: AsyncDriver, *, wharf_name: str) -> dict | None:
+    """Berth.wharf_name 정확히 일치하는 선석 하나를 조회한다(검증모드: 사전배정 선석 확인용).
+
+    find_eligible_berths처럼 카테고리/수심으로 거르지 않는다 — 이미 정해진 선석
+    하나가 맞는지만 보는 용도라, 없으면 그대로 None(호출부가 "선석을 찾을 수
+    없음"으로 처리한다).
+    """
+    async with driver.session() as session:
+
+        async def _tx(tx):
+            result = await tx.run(_CYPHER_GET_BERTH_BY_WHARF_NAME, wharf_name=wharf_name)
+            record = await result.single()
+            return record.data() if record else None
 
         return await session.execute_read(_tx)
 
