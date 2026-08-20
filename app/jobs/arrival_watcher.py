@@ -227,7 +227,11 @@ async def watch_arrivals() -> None:
         )
 
         request = OrchestratorRequest(
-            vessel=VesselSpec(draught_m=row["draught_m"], dwt_t=None, name_hint=row["vessel_name"]),
+            vessel=VesselSpec(
+                draught_m=row["draught_m"], dwt_t=None, name_hint=row["vessel_name"],
+                # 자기 예약을 점유로 세지 않도록 호출부호를 같이 넘긴다.
+                call_sign=row["callsgn"],
+            ),
             cargo=CargoRef(chem_id=row["chem_id"]),
             window_start=window_start,
             window_end=window_end,

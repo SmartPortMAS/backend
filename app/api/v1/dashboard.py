@@ -551,7 +551,21 @@ _QUERY_BERTH_ASSIGNMENTS = text("""
     FROM upa_berth_facility b
     JOIN mart.berth_handling_cargo bhc ON bhc.record_uid = b.record_uid
     LEFT JOIN berth_assignment ba
-      ON ba.berth_id = b.wharf_name
+      -- berth_id 는 부두명이거나, 이름이 겹칠 때는 "부두명(수역구분)" 이다.
+      --
+      -- 같은 이름을 쓰는 부두가 실제로 있다 — 'SK2부두' 는 SK가스㈜(국유,
+      -- LPG 7.5m)와 SK에너지㈜(민유, 석유제품 8.0m) 두 곳이다. 그래서
+      -- berth_neo4j_loader 가 그래프 노드 id 를 'SK2부두(국유)' 처럼 구분해
+      -- 만들고, 배정도 그 id 로 저장된다.
+      --
+      -- 그런데 여기 조인은 부두명만 봤다. 그 결과 SK2부두에 난 배정은 어느
+      -- 행에도 붙지 못해, 승인까지 끝난 배가 지도와 목록에서 통째로 사라졌다
+      -- (2026-08-21 실측 — DB 는 APPROVED 인데 화면에는 없었다).
+      -- 접미사를 붙여 되돌리면 국유/민유가 각각 제 행에만 붙는다.
+      ON (
+           ba.berth_id = b.wharf_name
+        OR ba.berth_id = b.wharf_name || '(' || COALESCE(b.wharf_se_name, '?') || ')'
+      )
      AND ba.status IN ('REQUESTED', 'APPROVED', 'SCHEDULED', 'BERTHED')
      -- 관제사가 승인/반려하지 않고 방치한 REQUESTED 추천은 계획기간(planned_window)이
      -- 이미 끝나면 뺀다(2026-08-20, 실사용 중 발견 — SK5부두 슬롯 1에 8/11·8/18·8/20

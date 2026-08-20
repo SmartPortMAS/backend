@@ -28,6 +28,12 @@ class VesselSpec(BaseModel):
         "건너뜀 — 온산 MVP 이식, 9장 참고).",
     )
     name_hint: str | None = Field(default=None, description="로그/에러 메시지용 참고 선명")
+    call_sign: str | None = Field(
+        default=None,
+        description="이 배의 호출부호. 점유 판정에서 '자기 자신이 잡아 둔 예약'을 "
+        "제외하는 데 쓴다 — 이 값이 없으면 추천을 받은 배가 재판정 때 자기 예약에 "
+        "막혀 영원히 승인할 수 없다(2026-08-21 실측).",
+    )
 
 
 class SchedulingRequest(BaseModel):

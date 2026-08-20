@@ -180,7 +180,8 @@ async def find_berth_candidates(
     # 자체의 신뢰도가 이 판단에 못 미쳤다), 애초에 스케줄링 에이전트를 두는 이유
     # (우리 기준으로 직접 배정)와도 맞지 않는다.
     reservation_map = await find_overlapping_reservations(
-        db, berth_ids=berth_ids, window_start=request.window_start, window_end=request.window_end,
+        db, berth_ids=berth_ids, window_start=request.window_start,
+        window_end=request.window_end, exclude_call_sign=request.vessel.call_sign,
     )
     adjacency_map = await find_adjacent_categories(neo4j_driver, berth_ids=berth_ids)
     adjacent_wharf_names = list({
@@ -321,6 +322,7 @@ async def build_candidate_for_wharf_name(
     # 동일 결정(2026-08-19, 위 주석 참고).
     reservation_map = await find_overlapping_reservations(
         db, berth_ids=[berth["berth_id"]], window_start=window_start, window_end=window_end,
+        exclude_call_sign=vessel.call_sign,
     )
     conflicts = reservation_map.get(berth["berth_id"], [])
     status = OccupancyStatus.OCCUPIED if conflicts else OccupancyStatus.AVAILABLE
@@ -427,6 +429,20 @@ async def resolve_berth_assignment(
     substitutes = _sort_substitutes_by_distance(candidate, substitutes)
 
     for sub in substitutes:
+        # 수심을 모르는 선석은 대체 후보에서 뺀다.
+        #
+        # 1순위 탐색(find_eligible_berths)은 depth_m IS NULL 을 이미 제외하는데
+        # ("모르면 추천하지 않는다") 이 대체 경로에만 그 게이트가 없었다. 그래서
+        # 수심 미상 선석이 후보로 내려오면 아래 draught_margin_m 계산에서
+        # None - float 로 터졌다 — 오케스트레이터 전체가 500 이 되어 종합 판정
+        # 자체를 못 했다(2026-08-21 실측: 수심 미상 5개 선석, 그것을 가리키는
+        # 대체 관계 9건 — SK5부두 하나가 SK 계열 6개 부두의 대체 후보였다).
+        #
+        # 안전 판단이 불가능한 선석을 추천하지 않는 것이 원래 원칙이므로,
+        # 조용히 0 으로 채우지 않고 사유를 남기고 건너뛴다.
+        if sub.get("depth_m") is None:
+            trace.append(f"대체 후보 '{sub['wharf_name']}' 탈락: 수심 자료 없음(판단 불가)")
+            continue
         if sub.get("to_depth_m") is not None and vessel.draught_m > sub["to_depth_m"]:
             trace.append(f"대체 후보 '{sub['wharf_name']}' 탈락: 흘수 {vessel.draught_m}m > 수심 {sub['to_depth_m']}m")
             continue
@@ -441,7 +457,8 @@ async def resolve_berth_assignment(
         # 점유 판정은 berth_assignment(우리 배정 기록)만 본다(2026-08-19,
         # find_berth_candidates와 동일 결정 — 위 주석 참고).
         res = await find_overlapping_reservations(
-            db, berth_ids=[sub["berth_id"]], window_start=window_start, window_end=window_end
+            db, berth_ids=[sub["berth_id"]], window_start=window_start,
+            window_end=window_end, exclude_call_sign=vessel.call_sign,
         )
         if res.get(sub["berth_id"]):
             trace.append(f"대체 후보 '{sub['wharf_name']}'도 점유 중 - 다음 대체 탐색")

@@ -52,11 +52,23 @@ _QUERY_OVERLAPPING_RESERVATIONS = text("""
     WHERE berth_id = ANY(CAST(:berth_ids AS text[]))
       AND status IN ('REQUESTED', 'APPROVED', 'SCHEDULED', 'BERTHED')
       AND planned_window && tstzrange(:window_start, :window_end, '[)')
+      -- 자기 자신이 잡아 둔 예약은 점유로 세지 않는다.
+      --
+      -- arrival_watcher 가 A 배에 B 선석을 추천해 REQUESTED 행을 만든 뒤,
+      -- 관제사가 콘솔에서 A 를 다시 판정하면 B 가 "점유 중(우리 시스템 배정
+      -- 기록 있음)"으로 나왔다. 자기 예약이 자기를 막은 것이라, 추천을 받은
+      -- 배는 승인 버튼이 뜨는 조건('승인가능')에 영원히 도달하지 못했다
+      -- (2026-08-21 실측 — 승인 대기 37건 전부 승인 불가 상태였다).
+      AND (
+          CAST(:exclude_call_sign AS text) IS NULL
+          OR upper(btrim(call_sign)) <> upper(btrim(CAST(:exclude_call_sign AS text)))
+      )
 """)
 
 
 async def find_overlapping_reservations(
     db: AsyncSession, *, berth_ids: list[str], window_start: datetime, window_end: datetime,
+    exclude_call_sign: str | None = None,
 ) -> dict[str, list[dict]]:
     """우리 시스템이 이미 REQUESTED~BERTHED로 잡아 둔 예약(berth_assignment) 중
     요청 시간대와 겹치는 것 — 점유 판정의 유일한 근거(모듈 docstring 참고).
@@ -68,7 +80,10 @@ async def find_overlapping_reservations(
     rows = (
         await db.execute(
             _QUERY_OVERLAPPING_RESERVATIONS,
-            {"berth_ids": berth_ids, "window_start": window_start, "window_end": window_end},
+            {
+                "berth_ids": berth_ids, "window_start": window_start,
+                "window_end": window_end, "exclude_call_sign": exclude_call_sign,
+            },
         )
     ).mappings().all()
     grouped: dict[str, list[dict]] = {}
