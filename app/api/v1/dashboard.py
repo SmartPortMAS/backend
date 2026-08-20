@@ -521,6 +521,28 @@ async def get_safety_index(db: AsyncSession = Depends(get_session)) -> dict:
 #
 # 빈 슬롯도 slot_no 1..max_concurrent_vessels 전부 채워서 내려준다 — 프론트가
 # "몇 개 슬롯 중 몇 개가 찼는지"를 계산 없이 바로 그릴 수 있게.
+#
+# [2026-08-21] 온산 MVP 스코프(15개 선석)로 범위를 좁혔다 — 스케줄링 에이전트가
+# onsan_scope 하드 필터로 이 선석에만 배정하도록 바뀌었고(graph_queries.py
+# _CYPHER_FIND_ELIGIBLE_BERTHS), 이 화면과 같은 지도를 쓰는 PortMap.jsx도 이미
+# 이 범위만 그린다 — 이 화면만 다른 범위를 보여주면 "지도에 없던 선석이
+# 배정현황엔 있다"는 불일치가 생긴다.
+#
+# WHERE b.port_name = '온산항'이 아니라 명시적 wharf_name 목록을 쓰는 이유
+# (2026-08-21 실DB 확인) — port_name='온산항'은 실제로 20개 시설을 반환하는데,
+# 그중 5개(정일컨부두·온산1~4부두)는 컨테이너/광석/시멘트를 취급하는 비-액체화물
+# 부두라 스케줄링 에이전트가 절대 배정하지 않는다(Neo4j onsan_scope=false).
+# 그 5개까지 지도에 넣으면 "이 부두는 왜 항상 비어 있나"는 새로운 불일치가
+# 생기므로, ONSAN_SCOPE_WHARF_NAMES(data-pipeline/berth_neo4j_loader.py)와
+# 정확히 같은 15개 이름을 여기 그대로 옮긴다. 이 쿼리는 Postgres만 조회해서
+# Neo4j의 onsan_scope 속성을 직접 쓸 수 없어 목록이 두 곳에 중복된다 — 온산
+# 스코프를 바꿀 때는 반드시 두 곳(이 목록과 ONSAN_SCOPE_WHARF_NAMES)을 함께
+# 고친다.
+_ONSAN_SCOPE_WHARF_NAMES = (
+    "OTK1부두", "OTK2부두", "정일1부두", "정일2부두", "UTK부두", "대한유화부두",
+    "효성부두", "달포부두", "S-Oil 1부두", "S-Oil 2부두", "S-Oil 3부두", "S-Oil 4부두",
+    "S-Oil부이", "S-Oil&오일허브 부이", "석유공사부이",
+)
 # --------------------------------------------------------------------------
 
 _QUERY_BERTH_ASSIGNMENTS = text("""
@@ -605,6 +627,7 @@ _QUERY_BERTH_ASSIGNMENTS = text("""
         ORDER BY pc2.arrival_at_utc DESC
         LIMIT 1
     ) pc ON true
+    WHERE b.wharf_name = ANY(CAST(:onsan_wharf_names AS text[]))
     ORDER BY b.wharf_name, ba.slot_no
 """)
 
@@ -619,7 +642,11 @@ async def get_berth_assignments(db: AsyncSession = Depends(get_session)) -> list
     없어짐 — 이전에는 berth 테이블에 같은 wharf_name 중복 행이 생겨 지도에 원이
     여러 개 겹쳐 찍히는 문제가 있었다).
     """
-    rows = (await db.execute(_QUERY_BERTH_ASSIGNMENTS)).mappings().all()
+    rows = (
+        await db.execute(
+            _QUERY_BERTH_ASSIGNMENTS, {"onsan_wharf_names": list(_ONSAN_SCOPE_WHARF_NAMES)}
+        )
+    ).mappings().all()
 
     berths: dict[str, dict] = {}
     occupied_slot_nos: dict[str, set[int]] = {}
