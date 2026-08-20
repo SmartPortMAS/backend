@@ -21,15 +21,16 @@ REPRESENTATIVE_CHEM_BY_CATEGORY: dict[str, str] = {
     "원유": "000751",     # 석유(PETROLEUM)
     "유류": "000973",     # 디젤 연료
     "액체화학": "001008",  # 벤젠
-    # ("가스" 카테고리는 만들지 않는다 — 2026-08-19 실측 확인, 아래 이유)
-    # cargo_category_loader.py의 CARGO_CATEGORIES는 Neo4j Berth의 HANDLES 관계와
-    # 이름이 정확히 일치해야 하는데, 그 관계의 유일한 소스인
-    # upa_berth_facility.handling_cargo_name에는 "원유"/"유류"/"액체화학" 3개
-    # 토큰만 존재한다(라이브 DB 직접 조회로 확인). "가스" 카테고리를 만들면
-    # 그 카테고리로 분류된 화학물질은 HANDLES 관계가 있는 선석이 하나도 없어
-    # 전부 "적합 선석 없음"이 된다. 가스부두의 handling_cargo_name도 "유류"이므로,
-    # 가스류 화학물질(수소·암모니아 등)은 cargo_category_loader.py에서 이미
-    # "유류"로 분류돼 있다 — 이 표에 "가스" 키를 추가할 필요가 없다.
+    # (2026-08-20 복원 — 한 번 "가스 카테고리는 만들지 않는다"로 뺐었는데 잘못된
+    # 판단이었다. upa_berth_facility.handling_cargo_name 원본에는 "가스"라는
+    # 값이 없는 게 맞지만(라이브 DB 재조회로 재확인), data-pipeline의
+    # berth_neo4j_loader.py::HANDLING_CARGO_OVERRIDES가 SK가스㈜ 운영 3개
+    # 선석(가스부두·SK1부두·SK2부두)을 로더 단계에서 "가스"로 큐레이션
+    # 오버라이드해 HANDLES 관계를 만든다 — 그래서 "가스" 카테고리는 정확히
+    # 그 3개 가스 전용 터미널과 매칭된다(적합 선석 0건 아님). 이 표에서 빼면
+    # 인접 선석이 가스부두일 때 폴백 근사 화물이 비어, 혼재 검사가 그 선석만
+    # 조용히 건너뛴다 — 그 원래 문제가 다시 살아난다.)
+    "가스": "015420",     # 프로페인
 }
 
 
