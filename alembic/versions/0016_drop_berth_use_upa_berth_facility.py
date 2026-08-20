@@ -40,12 +40,19 @@ def upgrade() -> None:
     # TRUNCATE 자체를 거부함) — DELETE는 그 FK 액션을 행 단위로 정상 적용한다.
     op.execute("DELETE FROM berth_assignment")
     op.drop_constraint("berth_assignment_berth_id_fkey", "berth_assignment", type_="foreignkey")
-    op.create_foreign_key(
-        "berth_assignment_berth_id_fkey",
-        "berth_assignment", "upa_berth_facility",
-        ["berth_id"], ["wharf_name"],
-        ondelete="RESTRICT",
-    )
+    # 여기서 upa_berth_facility(wharf_name) 로 FK 를 다시 걸려 했으나 걸 수 없다.
+    #
+    # 이 테이블의 유니크 키는 record_uid 하나이고 wharf_name 에는 유니크 인덱스가
+    # 없다. 그리고 만들 수도 없다 — 'SK2부두' 가 서로 다른 실제 부두 두 곳이기
+    # 때문이다(2026-08-20 실측):
+    #     SK2부두 · SK가스㈜   · 수심 7.5m · 길이 150m  (LPG 터미널)
+    #     SK2부두 · SK에너지㈜ · 수심 8.0m · 길이 430m  (석유제품 부두)
+    # 원천이 실제로 같은 이름을 쓰는 것이라 동기화 드리프트가 아니다. 우리가
+    # 가스 카테고리 보정을 (선석명, 운영사) 키로 잡은 것도 같은 이유다.
+    #
+    # 이름은 이 도메인에서 키가 아니다(표기 흔들림 때문에 mart.facility_alias 라는
+    # 대조 계층을 따로 두고 있다). 그래서 berth_id 는 FK 없는 문자열로 두고,
+    # 참조 정합성은 배정 시점에 애플리케이션이 확인한다.
     op.drop_table("berth")
 
 

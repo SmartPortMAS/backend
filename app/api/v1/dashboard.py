@@ -527,7 +527,11 @@ _QUERY_BERTH_ASSIGNMENTS = text("""
     SELECT b.wharf_name, b.latitude, b.longitude,
            COALESCE(b.berth_vessel_count, 1)::int AS max_concurrent_vessels,
            b.port_name, b.length_m, b.depth_m, b.berth_capacity AS max_dwt,
-           b.port_operator_name AS operator, b.handling_cargo_name, b.wharf_se_name,
+           b.port_operator_name AS operator,
+           -- 원천 대분류가 아니라 보정된 취급화물(mart_views.sql 12절).
+           -- 원천 값을 쓰면 스케줄링 에이전트(그래프)와 이 화면이 어긋난다 —
+           -- 가스부두가 판정은 '가스', 화면 표시는 '유류' 로 나왔다.
+           bhc.handling_cargo_name, b.wharf_se_name,
            ba.id AS assignment_id,
            ba.slot_no, ba.status, ba.call_sign, ba.vessel_name,
            ba.cargo_chem_id, mc.name_ko AS cargo_name,
@@ -545,6 +549,7 @@ _QUERY_BERTH_ASSIGNMENTS = text("""
            pm.departure_sched_utc AS departure_scheduled_utc,
            ba.assignment_reason, ba.approved_by, ba.rejected_candidates AS decision_detail
     FROM upa_berth_facility b
+    JOIN mart.berth_handling_cargo bhc ON bhc.record_uid = b.record_uid
     LEFT JOIN berth_assignment ba
       ON ba.berth_id = b.wharf_name
      AND ba.status IN ('REQUESTED', 'APPROVED', 'SCHEDULED', 'BERTHED')

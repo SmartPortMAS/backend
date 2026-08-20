@@ -39,7 +39,10 @@ from app.neo4j_client import neo4j_client
 
 logger = logging.getLogger("arrival_watcher")
 
-DEFAULT_WINDOW_HOURS = 24  # 실제 ETD 소스가 없어 쓰는 기본 접안 예상 기간(추정치)
+DEFAULT_WINDOW_HOURS = 24  # 재항 이력 표본이 없는 선석에 쓰는 기본 접안 예상 기간(추정치)
+# 아직 출항하지 않은 배의 계획기간이 과거로 끝나지 않도록 두는 최소 여유.
+# 이 값보다 짧게 잡으면 추천이 만들어진 직후 만료돼 화면에서 사라진다.
+MIN_FORWARD_HOURS = 12
 
 # §5.1 — 07 문서 §4.3의 NOT EXISTS 조건을 CANCELLED 뿐 아니라 REJECTED도 제외하도록
 # 고쳤다(발견 경위는 설계문서 §5.1 참고) — 그래야 반려당한 선박이 다음 주기에
@@ -52,7 +55,16 @@ _QUERY_PENDING_ARRIVALS = text("""
             SELECT cm.chem_id FROM mart.cargo_msds cm
             WHERE cm.callsgn = dc.callsgn AND cm.chem_id IS NOT NULL
             LIMIT 1
-        ) AS chem_id
+        ) AS chem_id,
+        -- 이 배가 붙어 있는 시설의 실측 재항 중앙값(없으면 NULL → 기본값 사용).
+        -- 계획기간의 끝을 정하는 데 쓴다.
+        (
+            SELECT bds.median_hours
+            FROM mart.facility_alias fa
+            JOIN mart.berth_dwell_stats bds ON bds.wharf_name = fa.wharf_name
+            WHERE fa.source_name = dc.facility_name AND fa.facility_type = 'BERTH'
+            LIMIT 1
+        ) AS median_dwell_hours
     FROM mart.dashboard_current dc
     WHERE dc.is_liquid_cargo_vessel
       AND dc.arrival_at_utc IS NOT NULL
@@ -193,8 +205,26 @@ async def watch_arrivals() -> None:
         if row["imo_no"] is not None:
             row["imo_no"] = str(row["imo_no"])
 
-        window_start = row["arrival_at_utc"] or datetime.now(timezone.utc)
-        window_end = window_start + timedelta(hours=DEFAULT_WINDOW_HOURS)
+        # 계획기간(planned_window) — 여기가 틀리면 추천이 만들어지자마자 만료된다.
+        #
+        # 예전에는 [입항시각, 입항시각+24h] 였다. 그런데 이 쿼리가 뽑는 배는 전부
+        # "아직 출항하지 않은" 배다(departure_at_utc IS NULL). 즉 5일 전에 들어와
+        # 지금도 항내에 있는 배가 섞이는데, 그런 배는 창이 나흘 전에 끝나 버린다.
+        # 그 결과 추천 123건 중 화면 필터(upper(planned_window) > now())를 통과하는
+        # 것이 3건뿐이었고, 선석 배정현황이 늘 "0건"으로 보였다(2026-08-20 실측).
+        #
+        # 창의 끝은 "이 배가 언제 자리를 비우는가"다. 출항 예정 시각(ETD)이 원천에
+        # 없으므로 그 선석의 실제 재항 이력 중앙값(mart.berth_dwell_stats, 실측
+        # 29,607건)으로 잡는다. 다만 아직 항내에 있는 배는 그 중앙값을 이미 넘겼을
+        # 수 있으므로, 최소한 지금부터 한 주기(MIN_FORWARD_HOURS)는 살아 있게 한다 —
+        # "지금 자리를 쓰고 있다"는 사실 자체가 창이 아직 안 닫혔다는 뜻이다.
+        now = datetime.now(timezone.utc)
+        window_start = row["arrival_at_utc"] or now
+        dwell_h = row.get("median_dwell_hours") or DEFAULT_WINDOW_HOURS
+        window_end = max(
+            window_start + timedelta(hours=float(dwell_h)),
+            now + timedelta(hours=MIN_FORWARD_HOURS),
+        )
 
         request = OrchestratorRequest(
             vessel=VesselSpec(draught_m=row["draught_m"], dwt_t=None, name_hint=row["vessel_name"]),
