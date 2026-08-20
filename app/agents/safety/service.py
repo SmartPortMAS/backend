@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.llm.base import LLMClient
 from app.models import MsdsChemical
 
-from .graph_queries import find_imdg_segregation_conflicts, find_incompatible_conflicts
+from .graph_queries import find_imdg_classes, find_imdg_segregation_conflicts, find_incompatible_conflicts
 from .msds_context import resolve_cargo, summarize_hazard_sections
 from .prompt import SYSTEM_PROMPT, build_user_prompt
 from .rule_engine import (
@@ -59,6 +59,14 @@ async def assess_safety(
         neo4j_driver,
         target_chem_id=target_row.chem_id,
         adjacent_chem_ids=adjacent_chem_ids,
+    )
+    # 충돌 여부와 무관하게 대상·인접 화물 각자의 Class 자체를 별도로 조회한다 —
+    # find_imdg_segregation_conflicts는 SEGREGATE 관계(=충돌)가 있을 때만 Class 값을
+    # 같이 주므로, 통과한 화물쌍은 이 조회 없이는 Class조차 알 수 없었다(service.py
+    # 상단 docstring에 이유 설명 없음 — graph_queries.find_imdg_classes 참고).
+    imdg_classes = await find_imdg_classes(
+        neo4j_driver,
+        chem_ids=[target_row.chem_id, *adjacent_chem_ids],
     )
     # rule_engine.compute_imdg_floor가 거리 기준으로 등급을 완화할 수 있게
     # chem_id -> 최단거리를 붙여준다(2026-08-16). 같은 화학물질이 여러 인접
@@ -141,4 +149,5 @@ async def assess_safety(
         packaging_violations=packaging_violations,
         rule_engine_floor=rule_engine_floor,
         msds_sections_used=list(hazard_summary.keys()),
+        imdg_classes=imdg_classes,
     )

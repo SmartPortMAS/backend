@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.safety.schemas import RiskLevel, SafetyAssessmentRequest, SafetyAssessmentResult
 from app.agents.safety.service import assess_safety
-from app.agents.scheduling.schemas import BerthCandidate, SchedulingRequest
+from app.agents.scheduling.schemas import BerthCandidate, SchedulingRequest, VesselSpec
 from app.agents.scheduling.service import (
     build_candidate_for_wharf_name,
     find_berth_candidates,
@@ -50,19 +50,22 @@ async def _llm_summary(
     safety: SafetyAssessmentResult | None,
     weather: WeatherAssessmentResult,
     rejected: list[RejectedCandidate],
+    vessel: VesselSpec | None = None,
+    assignment_trace: list[str] | None = None,
     is_global_fallback_weather: bool = False,
-) -> str:
+) -> LLMSummary:
     user_prompt = build_user_prompt(
         selected_berth=selected_berth,
         safety=safety,
         weather=weather,
         rejected_candidates=rejected,
+        vessel=vessel,
+        assignment_trace=assignment_trace,
         is_global_fallback_weather=is_global_fallback_weather,
     )
-    result: LLMSummary = await llm_client.generate_structured(
+    return await llm_client.generate_structured(
         system_prompt=SYSTEM_PROMPT, user_prompt=user_prompt, schema=LLMSummary
     )
-    return result.summary
 
 
 def _no_berth_summary(cargo_category: str) -> str:
@@ -207,12 +210,14 @@ async def orchestrate(
         )
 
         if safety_result.risk_level != RiskLevel.BLOCKED:
-            summary = await _llm_summary(
+            llm_result = await _llm_summary(
                 llm_client,
                 selected_berth=resolved_berth,
                 safety=safety_result,
                 weather=berth_weather,
                 rejected=rejected,
+                vessel=request.vessel,
+                assignment_trace=resolution.trace,
             )
             return OrchestratorResult(
                 overall_decision=OverallDecision.APPROVED,
@@ -228,7 +233,8 @@ async def orchestrate(
                 # 있다(예: 'SK2부두 01' 입력 -> 'SK2부두' 정규화, 같은 선석인데
                 # 문자열은 다름).
                 assignment_changed=(request.assigned_wharf_name is not None and resolution.path == "대체"),
-                summary=summary,
+                summary=llm_result.summary,
+                berth_match_summary=llm_result.berth_match_summary,
             )
 
         rejected.append(
@@ -237,12 +243,13 @@ async def orchestrate(
             )
         )
 
-    summary = await _llm_summary(
+    llm_result = await _llm_summary(
         llm_client,
         selected_berth=None,
         safety=None,
         weather=weather_result,
         rejected=rejected,
+        vessel=request.vessel,
         # weather_result는 상단에서 미리 구해둔 전역 폴백값이다 — 각 후보가 실제로
         # 기상 판정까지 도달했는지와 무관하게 항상 채워진다(예: 점유/DWT 사유로
         # 기상 판정 전에 배정불가 처리된 후보뿐이면, 요약문이 "현재 하역중단
@@ -254,5 +261,7 @@ async def orchestrate(
         overall_decision=OverallDecision.ALL_CANDIDATES_UNSAFE,
         weather_assessment=weather_result,
         rejected_candidates=rejected,
-        summary=summary,
+        summary=llm_result.summary,
+        # berth_match_summary는 안 담는다 — 선택된 선석이 없어 "매칭"을 말할 대상
+        # 자체가 없다.
     )

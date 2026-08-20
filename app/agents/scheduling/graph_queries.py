@@ -29,11 +29,30 @@ RETURN c.cargo_category AS category
 # service.py의 정렬 우선순위로 처리하기 때문이다. 하드로 거르면 온산에 적합
 # 선석이 3개 미만인 화물(원유는 온산 부이 2기뿐)에서 후보가 줄거나 0이 된다.
 # 속성이 없는 그래프(로더 재적재 전)에서는 NULL이 오므로 호출부가 falsy로 다룬다.
+#
+# 08_스케줄링_전면재설계_자동배정_설계문서.md §4.1.3-A is_eligible 3·4번 게이트를
+# 여기 통합했다(2026-08-19):
+#   게이트 3(일반 DWT 상한) — vessel/berth 어느 한쪽이라도 DWT를 모르면 막지 않는다
+#     (VesselSpec.dwt_t는 선택 필드; berth.berth_capacity는 여전히 69개 중 다수가
+#     결측 — berth_neo4j_loader.py가 ONSAN_BERTH_CAPACITY_DWT로 보정한 뒤에도
+#     온산 밖 다수 선석은 결측으로 남는다).
+#   게이트 4(부이 VLCC 전용) — b.length_m이 NULL이면 부이 계열(안벽이 없는 해상
+#     계류점, 2026-08-19 staging 실측 확인). dwt_t가 NULL이면 이 게이트는
+#     탈락한다(3번과 반대 방향 — "부이는 확실할 때만 배정"이라는 의도적 비대칭,
+#     설계문서에 명시된 대로). 임계값은 이 파일 하단에 이미 정의된 VLCC_BUOY_DWT
+#     (정박지 선택 로직과 동일 상수, 150_000)를 그대로 재사용한다 — 새로 만들지
+#     않는다(모듈 로드 후 호출되므로 정의 순서와 무관하게 참조 가능).
+
 _CYPHER_FIND_ELIGIBLE_BERTHS = """
 MATCH (b:Berth)-[:HANDLES]->(:CargoCategory {name: $category})
 WHERE b.depth_m IS NOT NULL AND b.depth_m >= $min_depth
+  AND ($dwt_t IS NULL OR b.berth_capacity IS NULL OR $dwt_t <= b.berth_capacity)
+  AND (b.length_m IS NOT NULL OR $dwt_t >= $vlcc_buoy_dwt_threshold)
 RETURN b.id AS berth_id, b.wharf_name AS wharf_name, b.port_name AS port_name,
        b.depth_m AS depth_m, b.berth_group AS berth_group,
+       b.length_m AS length_m, b.berth_capacity AS max_dwt,
+       b.unload_capacity AS unload_capacity,
+       b.latitude AS latitude, b.longitude AS longitude,
        coalesce(b.onsan_scope, false) AS onsan_scope
 ORDER BY b.depth_m DESC
 """
@@ -45,6 +64,7 @@ _CYPHER_FIND_SUBSTITUTABLE_BERTHS = """
 MATCH (b:Berth {id: $berth_id})-[r:SUBSTITUTABLE_WITH]->(target:Berth)
 RETURN target.id AS berth_id, target.wharf_name AS wharf_name, target.port_name AS port_name,
        target.depth_m AS depth_m, target.berth_group AS berth_group,
+       target.latitude AS latitude, target.longitude AS longitude,
        coalesce(target.onsan_scope, false) AS onsan_scope,
        r.shared_products AS shared_products, r.to_max_dwt AS to_max_dwt, r.to_depth_m AS to_depth_m
 """
@@ -59,6 +79,11 @@ WHERE a.anchorage_type IN ['POLYGON', 'CIRCLE']
 RETURN a.id AS anchorage_id, a.name AS name, a.tonnage_rule AS tonnage_rule,
        a.tonnage_lower AS tonnage_lower, a.tonnage_upper AS tonnage_upper,
        a.latitude AS latitude, a.longitude AS longitude
+"""
+
+_CYPHER_GET_BERTH_CATEGORIES = """
+MATCH (b:Berth {id: $berth_id})-[:HANDLES]->(cat:CargoCategory)
+RETURN collect(cat.name) AS categories
 """
 
 _CYPHER_GET_BERTH_BY_WHARF_NAME = """
@@ -94,11 +119,17 @@ async def find_eligible_berths(
     *,
     category: str,
     min_depth: float,
+    dwt_t: float | None = None,
 ) -> list[dict]:
     """화물 카테고리를 취급하고 수심 조건(min_depth 이상)을 만족하는 선석 목록.
 
     depth_m이 NULL인 선석은 안전 판단이 불가능하므로 결과에서 제외한다
     (모르면 추천하지 않는다).
+
+    dwt_t(선박 DWT, 선택)가 주어지면 일반 DWT 상한 게이트와 부이(VLCC 전용)
+    게이트를 함께 적용한다(08_스케줄링_전면재설계_자동배정_설계문서.md
+    §4.1.3-A) — 두 게이트의 "모르면 어떻게 하는가"가 서로 반대이므로 Cypher
+    쿼리 주석을 참고할 것.
     """
     async with driver.session() as session:
 
@@ -107,8 +138,28 @@ async def find_eligible_berths(
                 _CYPHER_FIND_ELIGIBLE_BERTHS,
                 category=category,
                 min_depth=min_depth,
+                dwt_t=dwt_t,
+                vlcc_buoy_dwt_threshold=VLCC_BUOY_DWT,
             )
             return [record.data() async for record in result]
+
+        return await session.execute_read(_tx)
+
+
+async def get_berth_categories(driver: AsyncDriver, *, berth_id: str) -> list[str]:
+    """이 선석이 HANDLES로 취급하는 카테고리 목록(§4.1.2, 3-tier: 원유/유류/액체화학 등).
+
+    anchorage_promoter(§5.4)가 정박지 대기열을 이 선석 카테고리로 먼저 걸러내는 데
+    쓴다 — build_candidate_for_wharf_name(검증모드)은 화물 카테고리를 확인하지
+    않으므로(주석 참고), 카테고리 부적합한 화물이 검증모드로 잘못 통과하지 않게
+    호출부에서 먼저 걸러야 한다.
+    """
+    async with driver.session() as session:
+
+        async def _tx(tx):
+            result = await tx.run(_CYPHER_GET_BERTH_CATEGORIES, berth_id=berth_id)
+            record = await result.single()
+            return record["categories"] if record else []
 
         return await session.execute_read(_tx)
 

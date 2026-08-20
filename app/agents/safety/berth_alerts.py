@@ -192,12 +192,60 @@ async def _draught_alerts(db: AsyncSession) -> list[dict]:
     return out
 
 
+_QUERY_SCHEDULING_EXCLUSIONS = text("""
+    SELECT call_sign, vessel_name, decision, reason, updated_at
+    FROM scheduling_exclusion
+    ORDER BY updated_at DESC
+""")
+
+# 자동 배정 흐름(arrival_watcher.py)에서 온 판정 사유는 그대로 옮겨 적는다 —
+# 여기서 새 판단을 만들지 않는다는 원칙(위 모듈 docstring 1번)은 이 경고에도
+# 똑같이 적용된다. WEATHER_BLOCKED/ALL_CANDIDATES_UNSAFE는 이미 안전·기상
+# 에이전트가 위험 판정을 내린 뒤라 DANGER, NO_ELIGIBLE_BERTH는 위험 판정과
+# 무관하게 "자리가 없다"는 운영 이슈라 WARNING으로 낮춘다.
+_EXCLUSION_LEVEL = {
+    "NO_ELIGIBLE_BERTH": "WARNING",
+    "ALL_CANDIDATES_UNSAFE": "DANGER",
+    "WEATHER_BLOCKED": "DANGER",
+}
+_EXCLUSION_LABEL = {
+    "NO_ELIGIBLE_BERTH": "적합 선석 없음",
+    "ALL_CANDIDATES_UNSAFE": "전 후보 배정 불가(안전)",
+    "WEATHER_BLOCKED": "기상 불가",
+}
+
+
+async def _scheduling_exclusion_alerts(db: AsyncSession) -> list[dict]:
+    """자동 배정(watch_arrivals)이 배정을 만들지 못한 건. 08_스케줄링_전면재설계_
+    자동배정_설계문서.md §5.3 3번 — 아무 조치 없이 조용히 대기 중인 배가 화면에
+    보이지 않으면 관제사가 그 존재 자체를 모른다."""
+    rows = (await db.execute(_QUERY_SCHEDULING_EXCLUSIONS)).mappings().all()
+    out = []
+    for row in rows:
+        label = _EXCLUSION_LABEL.get(row["decision"], row["decision"])
+        out.append({
+            "level": _EXCLUSION_LEVEL.get(row["decision"], "WARNING"),
+            "type": row["decision"],
+            "berth_name": None,
+            "message": f"{row['vessel_name'] or row['call_sign']}: 자동 배정 불가 — {label}"
+                       + (f" ({row['reason']})" if row["reason"] else ""),
+            "risk_level": None,
+            "basis": "scheduling_exclusion(arrival_watcher 자동 배정 판정)",
+            "callsgns": [row["call_sign"]] if row["call_sign"] else [],
+        })
+    return out
+
+
 async def build_berth_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dict]:
     """관제 경고 목록. 심각한 것부터 정렬해서 반환한다.
 
     경고가 0건인 것은 정상이다 — 없는 위험을 지어내지 않는다.
     """
-    alerts = await _segregation_alerts(db, driver) + await _draught_alerts(db)
+    alerts = (
+        await _segregation_alerts(db, driver)
+        + await _draught_alerts(db)
+        + await _scheduling_exclusion_alerts(db)
+    )
     order = {"DANGER": 0, "WARNING": 1, "INFO": 2}
     alerts.sort(key=lambda a: (order.get(a["level"], 9), a["type"]))
     return alerts

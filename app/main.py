@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRoute
 
+from app.api.v1.approvals import router as approvals_router
 from app.api.v1.chatbot import router as chatbot_router
 from app.api.v1.dashboard import router as dashboard_router
 from app.api.v1.health import router as health_router
@@ -17,6 +18,7 @@ from app.api.v1.weather import router as weather_router
 from app.config import get_settings
 from app.core.logging import configure_logging
 from app.neo4j_client import neo4j_client
+from app.scheduler import create_scheduler
 
 settings = get_settings()
 configure_logging(settings.log_level)
@@ -25,7 +27,13 @@ configure_logging(settings.log_level)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await neo4j_client.driver.verify_connectivity()
+    # 08_스케줄링_전면재설계_자동배정_설계문서.md §5.1·§5.5 — 입항 자동추천·출항
+    # 자동해제 백그라운드 잡. 둘 다 실패해도 API 자체는 계속 떠 있어야 하므로
+    # 앱 시작을 막지 않는다(스케줄러 자체 등록 실패만 여기서 전파됨).
+    scheduler = create_scheduler()
+    scheduler.start()
     yield
+    scheduler.shutdown(wait=False)
     await neo4j_client.close()
 
 
@@ -58,6 +66,7 @@ _TAGS_METADATA = [
     {"name": "weather", "description": "기상 기반 하역 가능 여부 판정. LLM 미사용."},
     {"name": "safety", "description": "화물 혼재 위험 판정."},
     {"name": "dashboard", "description": "모니터링 현황 조회. 판정 로직 없음."},
+    {"name": "approvals", "description": "관제사 사전승인. 시스템 자동추천(REQUESTED)을 승인/반려해야 실제 배정이 확정된다."},
     {"name": "chatbot", "description": "챗봇 화면용 목록 조회. 질의응답은 `rag`."},
     {"name": "msds", "description": "MSDS 원문 조회."},
     {"name": "health", "description": "서비스 상태 확인."},
@@ -100,6 +109,7 @@ app.include_router(orchestrator_router, prefix="/api/v1")
 app.include_router(dashboard_router, prefix="/api/v1")
 app.include_router(chatbot_router, prefix="/api/v1")
 app.include_router(rag_router, prefix="/api/v1")
+app.include_router(approvals_router, prefix="/api/v1")
 
 
 @app.get("/health", summary="서비스 상태 확인")

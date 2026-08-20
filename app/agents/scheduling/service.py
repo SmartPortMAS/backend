@@ -15,6 +15,7 @@ LLM을 쓰지 않는다 — 계획서상 스케줄링 에이전트는 Neo4j Cyph
 1순위)가 점유 중일 때 호출하는 보조 경로다.
 """
 
+import math
 from datetime import datetime
 
 from neo4j import AsyncDriver
@@ -37,7 +38,7 @@ from .graph_queries import (
     get_chemical_category,
     select_anchorage_for_dwt,
 )
-from .occupancy import find_overlapping_port_calls
+from .occupancy import find_overlapping_reservations
 from .schemas import (
     AnchorageAssignment,
     BerthCandidate,
@@ -157,7 +158,9 @@ async def find_berth_candidates(
         raise CargoCategoryUnknownError(target_row.chem_id)
 
     min_depth = request.vessel.draught_m + request.draught_margin_m
-    eligible = await find_eligible_berths(neo4j_driver, category=category, min_depth=min_depth)
+    eligible = await find_eligible_berths(
+        neo4j_driver, category=category, min_depth=min_depth, dwt_t=request.vessel.dwt_t,
+    )
 
     if not eligible:
         return SchedulingResult(
@@ -168,13 +171,16 @@ async def find_berth_candidates(
         )
 
     berth_ids = [row["berth_id"] for row in eligible]
-    wharf_names = [row["wharf_name"] for row in eligible]
 
-    occupancy_map = await find_overlapping_port_calls(
-        db,
-        wharf_names=wharf_names,
-        window_start=request.window_start,
-        window_end=request.window_end,
+    # 점유 판정은 우리 시스템 자신의 배정 기록(berth_assignment)만 본다 — VTS
+    # 실측(upa_port_call)은 안 쓴다(2026-08-19 결정). 이 스케줄링 에이전트가 선석을
+    # 직접 배정하는 주체이므로, 점유 여부도 그 배정 기록 스스로가 기준이어야
+    # 한다는 설계 의도다. VTS 관측을 섞으면 "우리가 배정한 게 아닌데도 점유"라는
+    # 모순이 생기고(실측: 출항 미기록 유령 재항 3,910건, 최고 8개월분 — VTS 데이터
+    # 자체의 신뢰도가 이 판단에 못 미쳤다), 애초에 스케줄링 에이전트를 두는 이유
+    # (우리 기준으로 직접 배정)와도 맞지 않는다.
+    reservation_map = await find_overlapping_reservations(
+        db, berth_ids=berth_ids, window_start=request.window_start, window_end=request.window_end,
     )
     adjacency_map = await find_adjacent_categories(neo4j_driver, berth_ids=berth_ids)
     adjacent_wharf_names = list({
@@ -187,7 +193,7 @@ async def find_berth_candidates(
 
     candidates: list[BerthCandidate] = []
     for row in eligible:
-        conflicts = occupancy_map.get(row["wharf_name"], [])
+        conflicts = reservation_map.get(row["berth_id"], [])
         status = OccupancyStatus.OCCUPIED if conflicts else OccupancyStatus.AVAILABLE
         candidates.append(
             BerthCandidate(
@@ -200,6 +206,9 @@ async def find_berth_candidates(
                 onsan_scope=bool(row.get("onsan_scope")),
                 draught_margin_m=row["depth_m"] - request.vessel.draught_m,
                 occupancy_status=status,
+                latitude=row.get("latitude"),
+                longitude=row.get("longitude"),
+                unload_capacity=row.get("unload_capacity"),
                 conflicting_port_calls=[
                     ConflictingPortCall(
                         vessel_name=c["vessel_name"],
@@ -214,32 +223,30 @@ async def find_berth_candidates(
             )
         )
 
-    # 온산 스코프 우선 → 여유 선석 우선 → 수심 여유가 큰 순(안전 마진이 큰 순).
+    # 여유 선석 우선 → 수심 여유가 작은(딱 맞는) 순 → unload_capacity 소프트 타이브레이크.
+    # (08_스케줄링_전면재설계_자동배정_설계문서.md §4.1.3-A, 2026-08-19)
     #
-    # 온산을 첫 키로 둔 것은 팀원 P1의 "스케줄링 후보풀 온산 제한" 요구사항을 하드
-    # 필터 대신 정렬로 구현한 것이다. 필터로 거르면 온산에 적합 선석이 MAX_CANDIDATES
-    # 미만인 화물에서 후보가 줄거나 사라진다 — 원유는 온산 부이 2기가 전부라
-    # 3순위 자리를 채울 수 없다. 정렬이면 온산이 채울 수 있는 만큼 앞을 차지하고,
-    # 모자란 자리만 스코프 밖(울산본항/신항)이 이어받는다.
+    # "온산 스코프 우선"을 정렬 1순위로 두던 것은 이번 설계에서 뺐다 — 이 함수는
+    # 이제 울산항 전체 69개 선석을 대상으로 하는 통합 게이트라, 특정 항역을
+    # 구조적으로 우선시키는 기준을 남기면 카테고리·부이 게이트와 뒤섞여 "왜 이
+    # 선석이 저 선석보다 위인지" 설명이 복잡해진다(onsan_scope 값 자체는
+    # BerthCandidate에 참고용으로 계속 실어 보낸다).
     #
-    # 온산 후보가 3개 이상이면 하드 필터와 결과가 완전히 같다 — 상위 3개가 잘리기
-    # 전에 온산이 다 차지하기 때문이다(2026-08-02 실측: 액체화학·유류 시나리오에서
-    # 하드/소프트 결과 동일, 원유에서만 3순위 폴백 유무가 갈림).
-    # 마지막 키는 "여유가 큰 순"이 아니라 "잘 맞는 순"이다(best fit).
+    # 두 번째 키는 "여유가 큰 순"이 아니라 "잘 맞는 순"이다(best fit) — 예전엔
+    # -draught_margin_m이라 여유가 가장 큰 선석이 1순위였는데, 그 결과 흘수 6m짜리
+    # 제품유 운반선에게 수심 27m 원유부이가 1순위로 나왔다(2026-08-18 실측). 안전
+    # 하한은 이미 위 필터(depth >= draught + margin)가 보장하므로, 남은 여유는
+    # 작을수록 좋다 — 깊은 선석은 깊은 배를 위해 비워 둔다.
     #
-    # 예전엔 -draught_margin_m 이라 여유가 가장 큰 선석이 1순위였다. 그 결과
-    # 흘수 6 m 짜리 제품유 운반선에게 수심 27 m 원유부이가 1순위로 나왔다
-    # (2026-08-18 실측). 깊은 선석일수록 무조건 앞에 오니, 작은 배가 큰 배용
-    # 선석을 차지하는 방향으로 정렬이 굴러간 것이다.
-    #
-    # 실제 배정은 반대로 한다 — 조건을 만족하는 선석 중 가장 작은(딱 맞는) 곳에
-    # 대고, 깊은 선석은 깊은 배를 위해 비워 둔다. 안전 하한은 이미 위 필터
-    # (depth >= draught + margin)가 보장하므로, 남은 여유는 작을수록 좋다.
+    # 세 번째 키(unload_capacity)는 §5.2.1-B 소프트 가중치 — 값이 있는 쪽을 약하게
+    # 우선하고, 값이 있으면 큰 쪽을 우선한다. 결측(다수)은 "부적합"이 아니라
+    # "정보 없음"으로 취급해 순위에서만 밀리고 후보에서 빠지지 않는다.
     candidates.sort(
         key=lambda c: (
-            not c.onsan_scope,
             c.occupancy_status is OccupancyStatus.OCCUPIED,
             c.draught_margin_m,
+            c.unload_capacity is None,
+            -(c.unload_capacity or 0),
         )
     )
 
@@ -310,13 +317,12 @@ async def build_candidate_for_wharf_name(
             f"(선박 흘수 {vessel.draught_m}m)."
         )
 
-    occupancy_map = await find_overlapping_port_calls(
-        db,
-        wharf_names=[canonical_wharf_name],
-        window_start=window_start,
-        window_end=window_end,
+    # 점유 판정은 berth_assignment(우리 배정 기록)만 본다 — find_berth_candidates와
+    # 동일 결정(2026-08-19, 위 주석 참고).
+    reservation_map = await find_overlapping_reservations(
+        db, berth_ids=[berth["berth_id"]], window_start=window_start, window_end=window_end,
     )
-    conflicts = occupancy_map.get(canonical_wharf_name, [])
+    conflicts = reservation_map.get(berth["berth_id"], [])
     status = OccupancyStatus.OCCUPIED if conflicts else OccupancyStatus.AVAILABLE
 
     adjacency_map = await find_adjacent_categories(neo4j_driver, berth_ids=[berth["berth_id"]])
@@ -352,6 +358,35 @@ async def build_candidate_for_wharf_name(
     return candidate, None
 
 
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """두 좌표 사이 거리(m), WGS84 하버사인. data-pipeline berth_neo4j_loader.py의
+    haversine_m과 동일 공식 — 서비스가 분리돼 있어 import 대신 같은 공식을 복제한다."""
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _sort_substitutes_by_distance(candidate: BerthCandidate, substitutes: list[dict]) -> list[dict]:
+    """대체 후보를 candidate(1순위 선석) 좌표 기준 거리 오름차순으로 정렬한다
+    (§5.2.1-C, 2026-08-19). candidate나 개별 substitute에 좌표가 없으면(부이 계열
+    등, MISSING_COORDINATE) 그 항목은 거리를 알 수 없으므로 목록 뒤쪽으로 보내되
+    배정 자체를 막지는 않는다 — "거리 우선순위"만 모를 뿐 적합성은 그대로 유효.
+    """
+    if candidate.latitude is None or candidate.longitude is None:
+        return substitutes  # 기준점 자체가 없음 — 원래 순서(Neo4j 반환 순) 그대로 폴백
+
+    def _distance(sub: dict) -> float:
+        lat, lon = sub.get("latitude"), sub.get("longitude")
+        if lat is None or lon is None:
+            return float("inf")
+        return _haversine_m(candidate.latitude, candidate.longitude, lat, lon)
+
+    return sorted(substitutes, key=_distance)
+
+
 async def resolve_berth_assignment(
     db: AsyncSession,
     neo4j_driver: AsyncDriver,
@@ -373,14 +408,23 @@ async def resolve_berth_assignment(
     함수는 "점유 중일 때만" 재탐색이 의미가 있다.
     """
     if candidate.occupancy_status is not OccupancyStatus.OCCUPIED:
+        # 점유 중일 때(아래 대체/정박지 분기)는 흘수·수심 숫자를 근거로 보여주는데
+        # 이 "그대로 확정" 분기만 "사용 가능" 한 줄뿐이었다 — 관제사가 왜 이
+        # 선석이 맞는지 확인할 근거가 없었다(2026-08-20 지적).
         return BerthResolution(
             path="전용",
             berth=candidate,
-            trace=[f"전용 선석 '{candidate.wharf_name}' 사용 가능"],
+            trace=[
+                f"전용 선석 '{candidate.wharf_name}' 사용 가능 "
+                f"(수심 {candidate.depth_m}m, 흘수 {vessel.draught_m}m, 여유 {candidate.draught_margin_m:.1f}m)"
+            ],
         )
 
-    trace = [f"전용 선석 '{candidate.wharf_name}' 점유 중 (현재 접안 중인 선박 있음)"]
+    trace = [f"전용 선석 '{candidate.wharf_name}' 점유 중 (우리 시스템 배정 기록 있음)"]
     substitutes = await find_substitutable_berths(neo4j_driver, berth_id=candidate.berth_id)
+    # §5.2.1-C: "미리 정해둔 정렬표의 다음 줄"이 아니라 "1순위 선석과 가장 가까운
+    # 적합 후보"를 먼저 시도한다 — 정렬만 바꾸고 아래 게이트 로직은 그대로 둔다.
+    substitutes = _sort_substitutes_by_distance(candidate, substitutes)
 
     for sub in substitutes:
         if sub.get("to_depth_m") is not None and vessel.draught_m > sub["to_depth_m"]:
@@ -394,10 +438,12 @@ async def resolve_berth_assignment(
             trace.append(f"대체 후보 '{sub['wharf_name']}' 탈락: DWT {vessel.dwt_t} > 최대 {sub['to_max_dwt']}")
             continue
 
-        occ = await find_overlapping_port_calls(
-            db, wharf_names=[sub["wharf_name"]], window_start=window_start, window_end=window_end
+        # 점유 판정은 berth_assignment(우리 배정 기록)만 본다(2026-08-19,
+        # find_berth_candidates와 동일 결정 — 위 주석 참고).
+        res = await find_overlapping_reservations(
+            db, berth_ids=[sub["berth_id"]], window_start=window_start, window_end=window_end
         )
-        if occ.get(sub["wharf_name"]):
+        if res.get(sub["berth_id"]):
             trace.append(f"대체 후보 '{sub['wharf_name']}'도 점유 중 - 다음 대체 탐색")
             continue
 
@@ -413,6 +459,8 @@ async def resolve_berth_assignment(
             draught_margin_m=sub["depth_m"] - vessel.draught_m,
             occupancy_status=OccupancyStatus.AVAILABLE,
             adjacent_cargos=candidate.adjacent_cargos,
+            latitude=sub.get("latitude"),
+            longitude=sub.get("longitude"),
         )
         return BerthResolution(path="대체", berth=substitute_candidate, trace=trace)
 

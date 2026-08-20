@@ -92,3 +92,40 @@ async def find_imdg_segregation_conflicts(
             return [record.data() async for record in result]
 
         return await session.execute_read(_tx)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 화물 자신의 IMDG Class 단독 조회 — find_imdg_segregation_conflicts는 SEGREGATE
+# 관계(=충돌)가 있을 때만 두 화물의 Class 값을 같이 돌려주는 구조라, 충돌이 없는
+# 화물쌍은 각자 무슨 Class인지조차 호출부가 알 방법이 없었다. 그 결과 "SEGREGATE
+# 관계 없음"이 "공인 규정상 X(격리 불필요)"인지 "이 Class 조합 자체가 그래프에
+# 안 실림"인지 화면에서 구분이 안 됐다(로더가 9x9 전체가 아니라 실제 등재된
+# 화물의 Class만 SEGREGATE 엣지로 적재하기 때문 — imdg_segregation_loader.py 참고).
+# 이 조회는 그 구분을 위한 최소 정보(화물별 Class 자체)만 별도로 준다.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CYPHER_FIND_IMDG_CLASSES = """
+MATCH (c:Chemical)-[:HAS_IMDG_CLASS]->(cls:ImdgClass)
+WHERE c.id IN $chem_ids
+RETURN c.id AS chem_id, cls.code AS class_code
+"""
+
+
+async def find_imdg_classes(
+    driver: AsyncDriver,
+    *,
+    chem_ids: list[str],
+) -> dict[str, str]:
+    """화물 id -> IMDG Class 코드. HAS_IMDG_CLASS 관계가 없는 화물은 결과에서 빠진다
+    (그래프에 Class 자체가 안 실려 있다는 뜻 — 호출부가 '모름'으로 구분해야 한다)."""
+    if not chem_ids:
+        return {}
+
+    async with driver.session() as session:
+
+        async def _tx(tx):
+            result = await tx.run(_CYPHER_FIND_IMDG_CLASSES, chem_ids=chem_ids)
+            return [record.data() async for record in result]
+
+        rows = await session.execute_read(_tx)
+    return {row["chem_id"]: row["class_code"] for row in rows}

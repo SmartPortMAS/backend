@@ -67,8 +67,8 @@ class BerthCandidate(BaseModel):
     onsan_scope: bool = Field(
         default=False,
         description="온산 MVP 대상 선석인지(berth_neo4j_loader.ONSAN_SCOPE_WHARF_NAMES 14개). "
-        "후보 정렬에서 True가 먼저 온다. 하드 필터가 아니라 우선순위라, 온산 후보가 "
-        "부족하면 스코프 밖 선석이 뒤이어 채워진다.",
+        "08_스케줄링_전면재설계_자동배정_설계문서.md §4.1.3-A(2026-08-19)부터 후보 정렬 "
+        "기준에서는 빠졌다 — 값 자체는 참고용으로 계속 내려준다.",
     )
     draught_margin_m: float = Field(description="depth_m - 요청 흘수(m). 클수록 여유")
     occupancy_status: OccupancyStatus
@@ -76,6 +76,17 @@ class BerthCandidate(BaseModel):
     adjacent_cargos: list[AdjacentCargo] = Field(
         default_factory=list,
         description="인접 선석의 취급 화물. safety 에이전트 요청 바디로 그대로 전달 가능.",
+    )
+    latitude: float | None = Field(
+        default=None, description="선석 대표 좌표 위도 — 점유 시 최근접 대체 탐색용(§5.2.1-C)"
+    )
+    longitude: float | None = Field(
+        default=None, description="선석 대표 좌표 경도 — 점유 시 최근접 대체 탐색용(§5.2.1-C)"
+    )
+    unload_capacity: float | None = Field(
+        default=None,
+        description="선석 하역능력(upa_berth_facility.unload_capacity). 단위·산출기준 미확인이라 "
+        "소프트 타이브레이커로만 쓴다(§5.2.1-B) — 결측이면 순위에서만 불리하고 후보에서 제외되지 않는다.",
     )
 
 
