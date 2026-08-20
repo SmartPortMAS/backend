@@ -72,9 +72,11 @@ class BerthCandidate(BaseModel):
     )
     onsan_scope: bool = Field(
         default=False,
-        description="온산 MVP 대상 선석인지(berth_neo4j_loader.ONSAN_SCOPE_WHARF_NAMES 14개). "
-        "08_스케줄링_전면재설계_자동배정_설계문서.md §4.1.3-A(2026-08-19)부터 후보 정렬 "
-        "기준에서는 빠졌다 — 값 자체는 참고용으로 계속 내려준다.",
+        description="온산 MVP 대상 선석인지(berth_neo4j_loader.ONSAN_SCOPE_WHARF_NAMES 15개, "
+        "달포부두 포함 2026-08-21). [2026-08-21] find_eligible_berths가 이 값을 "
+        "WHERE 하드 필터로 쓰므로 여기 도달하는 후보는 전부 true다 — 정렬 기준으로는 "
+        "여전히 변별력이 없어(08_스케줄링_전면재설계_자동배정_설계문서.md §4.1.3-A) "
+        "쓰지 않고, 값 자체는 참고용으로 계속 내려준다.",
     )
     draught_margin_m: float = Field(description="depth_m - 요청 흘수(m). 클수록 여유")
     occupancy_status: OccupancyStatus
