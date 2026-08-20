@@ -571,7 +571,17 @@ _QUERY_BERTH_ASSIGNMENTS = text("""
            pm.departure_sched_utc AS departure_scheduled_utc,
            ba.assignment_reason, ba.approved_by, ba.rejected_candidates AS decision_detail
     FROM upa_berth_facility b
-    JOIN mart.berth_handling_cargo bhc ON bhc.record_uid = b.record_uid
+    -- record_uid로 조인했더니 늘 빈 배열이었다(2026-08-21 실측) — record_uid는
+    -- common_pg_loader.add_record_uid()가 unique_cols==["record_uid"]인 표에만
+    -- 채우는데, upa_berth_facility는 진작 wharf_name 자연키로 전환돼 있어(upa_
+    -- loader.py TABLE_MAP) record_uid가 이 표에서는 항상 NULL이다 — NULL=NULL은
+    -- SQL에서 거짓이라 한 행도 안 붙었다. mart.berth_handling_cargo는 이 표에서
+    -- 그대로 SELECT한 뷰(집계 없음)라 (wharf_name, port_operator_name)이 그대로
+    -- 유일키다(SK2부두처럼 이름이 겹치는 곳도 운영사가 다르다 — 실측 0건 중복
+    -- 확인) — 위 berth_assignment 조인의 SK2부두 대응과 같은 원리.
+    JOIN mart.berth_handling_cargo bhc
+      ON bhc.wharf_name = b.wharf_name
+     AND bhc.port_operator_name IS NOT DISTINCT FROM b.port_operator_name
     LEFT JOIN berth_assignment ba
       -- berth_id 는 부두명이거나, 이름이 겹칠 때는 "부두명(수역구분)" 이다.
       --
