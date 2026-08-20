@@ -1,29 +1,12 @@
-"""PostgreSQL upa_port_call 기반 선석 점유 여부 조회.
+"""선석 점유 여부 조회 — berth_assignment(우리 시스템 배정 기록) 기준.
 
-upa_port_call은 data-pipeline UPA 로더(함현우 담당)가 auto_create로 만든 테이블이라
-backend Alembic이 소유하지 않는다 (schema ownership 원칙: 여러 곳이 쓰는 테이블만
-backend가 소유, UPA 6종은 기존 방식 유지). 그래서 ORM 모델 없이 raw SQL로 읽기만
-한다.
-
-한 접안 이벤트(port_call_id)가 입항/접안/출항/이선 등 여러 행으로 중복 기록되므로
-DISTINCT ON (port_call_id)으로 대표 행 하나만 남긴다. departure_at_utc가 NULL인
-경우(아직 출항 미기록) 요청 구간과 항상 겹치는 것으로 보수적으로 판단한다.
-
-[선석 이름은 반드시 mart.facility_alias 를 거친다]
-upa_port_call.facility_name 은 VTS 운항관제 원문 표기이고, 호출측이 넘기는
-wharf_names 는 Neo4j Berth 의 마스터 표기다. 두 어휘가 서로 다르다 —
-    VTS 원문 : 'S-OIL1부두' · 'SK1부두 11' · 'OTK부두'
-    마스터   : 'S-Oil 1부두' · 'SK1부두'    · 'OTK1부두'
-예전에는 이 둘을 문자열 완전일치로 비교해서 액체화물 전용부두가 통째로 안 붙었다.
-실측(2026-08-15): 완전일치는 행 기준 706/12,280 = 5.7%.
-
-증상이 조용해서 더 나빴다 — 겹치는 기록이 0건이면 호출측(service.py)이
-OccupancyStatus.AVAILABLE 로 판단하므로, **배가 11척 붙어 있는 OTK1부두가
-'여유'로 1순위 추천**됐다. 게다가 OCCUPIED 가 아니면 resolve_berth_assignment()
-가 대체 선석·정박지 탐색을 건너뛰어 온산 MVP 3단계 배정이 발동하지 않았다.
-
-같은 저장소의 다른 소비자(dashboard.py, safety_index.py, scheduling/service.py)는
-전부 이 사전을 거치고 있었고 여기만 빠져 있었다.
+(2026-08-19 결정) 점유 판정은 upa_port_call(VTS 실측)이 아니라 berth_assignment만
+본다. 이 스케줄링 에이전트가 선석을 직접 배정하는 주체이므로, 점유 여부도 그
+배정 기록 스스로가 기준이어야 한다 — VTS 데이터를 섞으면 "우리가 배정한 게
+아닌데도 점유"라는 모순이 생기고, 애초에 스케줄링 에이전트를 두는 이유(우리
+기준으로 직접 배정)와도 맞지 않는다. 예전에 VTS(upa_port_call) 기반 점유 조회를
+같이 썼던 적이 있는데, 실측해보니 출항 미기록 상태로 방치된 "유령 재항" 기록이
+3,910건(최고 8개월분)이나 있어 데이터 신뢰도 자체가 이 판단에 못 미쳤다.
 """
 
 from datetime import datetime
@@ -31,54 +14,101 @@ from datetime import datetime
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-_QUERY_OVERLAPPING_PORT_CALLS = text("""
-    SELECT DISTINCT ON (pc.port_call_id)
-        pc.port_call_id, fa.wharf_name, pc.facility_name AS source_facility_name,
-        pc.vessel_name, pc.arrival_at_utc, pc.departure_at_utc
-    FROM upa_port_call pc
-    JOIN mart.facility_alias fa
-      ON fa.source_name = pc.facility_name AND fa.facility_type = 'BERTH'
-    WHERE fa.wharf_name = ANY(CAST(:wharf_names AS text[]))
-      AND pc.arrival_at_utc IS NOT NULL
-      AND pc.arrival_at_utc < :window_end
-      AND (pc.departure_at_utc IS NULL OR pc.departure_at_utc > :window_start)
-    ORDER BY pc.port_call_id, pc.arrival_at_utc
+# ---------------------------------------------------------------------------
+# 슬롯 단위 점유 확인 (2026-08-19,
+# 08_스케줄링_전면재설계_자동배정_설계문서.md §4.2, §5.2 6번 게이트)
+#
+# 07 문서 §5.1이 이미 SQL을 설계해 뒀지만 실제 구현이 없었다(2026-08-19 확인 —
+# 이 파일 전체에 slot_no를 다루는 코드가 이거 추가 전까지 없었음). berth_assignment
+# EXCLUDE 제약이 (berth_id, slot_no, planned_window)로 걸려 있으므로, 새 추천을
+# INSERT하려면 어느 slot_no가 비어 있는지 먼저 알아야 한다 — 그렇지 않으면 슬롯
+# 2개 이상인 선석(69개 중 45%, 07 문서 §4.1.1)에서 실제로는 자리가 남았는데도
+# slot_no=1 하나만 쓰다가 EXCLUDE 위반으로 잘못 막히거나, 반대로 다른 배와 같은
+# slot_no를 노려 위반이 나는 것도 못 걸러낸다.
+# ---------------------------------------------------------------------------
+
+_QUERY_MAX_CONCURRENT_VESSELS = text("""
+    SELECT berth_vessel_count FROM upa_berth_facility WHERE wharf_name = :berth_id
+""")
+
+_QUERY_FIND_FREE_SLOT = text("""
+    SELECT gs.slot_no
+    FROM generate_series(1, :max_concurrent_vessels) AS gs(slot_no)
+    WHERE NOT EXISTS (
+        SELECT 1 FROM berth_assignment ba
+        WHERE ba.berth_id = :berth_id AND ba.slot_no = gs.slot_no
+          AND ba.status IN ('REQUESTED', 'APPROVED', 'SCHEDULED', 'BERTHED')
+          AND ba.planned_window && tstzrange(:window_start, :window_end, '[)')
+    )
+    ORDER BY gs.slot_no
+    LIMIT 1
 """)
 
 
-async def find_overlapping_port_calls(
-    db: AsyncSession,
-    *,
-    wharf_names: list[str],
-    window_start: datetime,
-    window_end: datetime,
+_QUERY_OVERLAPPING_RESERVATIONS = text("""
+    SELECT berth_id, call_sign AS vessel_name,
+           lower(planned_window) AS arrival_at_utc, upper(planned_window) AS departure_at_utc
+    FROM berth_assignment
+    WHERE berth_id = ANY(CAST(:berth_ids AS text[]))
+      AND status IN ('REQUESTED', 'APPROVED', 'SCHEDULED', 'BERTHED')
+      AND planned_window && tstzrange(:window_start, :window_end, '[)')
+""")
+
+
+async def find_overlapping_reservations(
+    db: AsyncSession, *, berth_ids: list[str], window_start: datetime, window_end: datetime,
 ) -> dict[str, list[dict]]:
-    """요청 시간대와 겹치는 입출항 기록을 wharf_name(마스터 표기) 기준으로 묶어 반환.
-
-    Returns:
-        { wharf_name: [{"vessel_name", "arrival_at_utc", "departure_at_utc"}, ...] }
-        겹치는 기록이 없는 wharf_name은 결과 딕셔너리에 아예 나타나지 않는다(= 여유).
-
-    키는 호출측이 넘긴 wharf_names 와 같은 어휘(마스터)다 — VTS 원문이 아니다.
-    호출측이 `grouped.get(berth.wharf_name)` 으로 바로 찾을 수 있어야 하기 때문이다.
+    """우리 시스템이 이미 REQUESTED~BERTHED로 잡아 둔 예약(berth_assignment) 중
+    요청 시간대와 겹치는 것 — 점유 판정의 유일한 근거(모듈 docstring 참고).
+    키는 berth_id다(wharf_name이 아니다 — berth_assignment.berth_id는
+    upa_berth_facility.wharf_name과 같은 값).
     """
-    if not wharf_names:
+    if not berth_ids:
         return {}
-
-    result = await db.execute(
-        _QUERY_OVERLAPPING_PORT_CALLS,
-        {"wharf_names": wharf_names, "window_start": window_start, "window_end": window_end},
-    )
-
+    rows = (
+        await db.execute(
+            _QUERY_OVERLAPPING_RESERVATIONS,
+            {"berth_ids": berth_ids, "window_start": window_start, "window_end": window_end},
+        )
+    ).mappings().all()
     grouped: dict[str, list[dict]] = {}
-    for row in result.mappings():
-        grouped.setdefault(row["wharf_name"], []).append(
+    for row in rows:
+        grouped.setdefault(row["berth_id"], []).append(
             {
                 "vessel_name": row["vessel_name"],
                 "arrival_at_utc": row["arrival_at_utc"],
                 "departure_at_utc": row["departure_at_utc"],
-                # 어느 VTS 표기에서 왔는지 남긴다 — 사전이 틀렸을 때 추적할 단서
-                "source_facility_name": row["source_facility_name"],
+                "source_facility_name": "(자동배정 예약)",
             }
         )
     return grouped
+
+
+async def find_free_slot(
+    db: AsyncSession, *, berth_id: str, window_start: datetime, window_end: datetime,
+) -> int | None:
+    """berth_id의 슬롯(1..max_concurrent_vessels) 중 요청 시간대와 안 겹치는 가장
+    작은 slot_no를 찾는다. 전부 찼으면(만석) None.
+
+    upa_berth_facility.berth_vessel_count가 없는 선석(결측 또는 미매칭)은 1로
+    간주한다 — 07 문서 §4.1.1의 기본값과 동일.
+    """
+    max_row = (
+        await db.execute(_QUERY_MAX_CONCURRENT_VESSELS, {"berth_id": berth_id})
+    ).first()
+    # berth_vessel_count는 double precision이라 generate_series(integer, ...)에 그대로
+    # 못 넘긴다(타입 불일치) — int로 캐스팅해서 넘긴다.
+    max_concurrent = int(max_row[0]) if max_row and max_row[0] else 1
+
+    row = (
+        await db.execute(
+            _QUERY_FIND_FREE_SLOT,
+            {
+                "berth_id": berth_id,
+                "max_concurrent_vessels": max_concurrent,
+                "window_start": window_start,
+                "window_end": window_end,
+            },
+        )
+    ).first()
+    return row[0] if row else None

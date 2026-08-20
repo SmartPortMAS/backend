@@ -154,11 +154,18 @@ def evaluate(
         reasons.append("풍속 관측치 없음 또는 기준 시각 대비 오래됨 - 판단 불가")
     elif wind_status is not WorkStatus.NORMAL:
         reasons.append(f"풍속 {wind_speed_ms}m/s >= {wind_hit}m/s -> {wind_status.value}")
+    elif threshold.stop_wind_ms is not None:
+        # 정상 판정도 실측값을 남긴다 — "모든 임계값 이내, 정상" 한 줄뿐이면
+        # 관제사가 실제 풍속을 알 수 없어 근거 없이 정상이라고만 우기는 것처럼
+        # 보인다(2026-08-20 지적). 초과 케이스와 같은 형식으로 값을 보여준다.
+        reasons.append(f"풍속 {wind_speed_ms}m/s < {threshold.stop_wind_ms}m/s(중단 임계) - 정상")
 
     if wave_status is WorkStatus.UNKNOWN:
         reasons.append("파고 관측치 없음 또는 기준 시각 대비 오래됨 - 판단 불가")
     elif wave_status is not WorkStatus.NORMAL:
         reasons.append(f"파고 {wave_height_m}m >= {wave_hit}m -> {wave_status.value}")
+    elif threshold.stop_wave_m is not None:
+        reasons.append(f"파고 {wave_height_m}m < {threshold.stop_wave_m}m(중단 임계) - 정상")
 
     if precip_mm is not None:
         precip_status, precip_hit = _level_for_metric(

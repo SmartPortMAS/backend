@@ -92,9 +92,56 @@ class OrchestratorResult(BaseModel):
         "뜻이라 관제사가 바로 알아야 한다. 탐색모드에서는 항상 False.",
     )
     summary: str = Field(description="관제사가 읽을 종합 의견 (1~2문단)")
+    berth_match_summary: str | None = Field(
+        default=None,
+        description="선석배정현황 팝업 전용 — 선석 스펙과 선박 매칭만 다루는 LLM 한 문장 "
+        "요약(화학물질·안전판정 내용 제외). summary와 같은 LLM 호출에서 함께 받는다"
+        "(호출 두 번 비용 방지). selected_berth가 없으면 None.",
+    )
+
+    def decision_detail(self) -> dict:
+        """관제사 화면(선석배정현황 팝업 등)에 보여줄 구조화된 배정 근거.
+
+        `summary`는 LLM이 쓴 자유문이라 특정 요인(흔히 흘수)만 강조하고 실제로
+        통과한 다른 조건(카테고리/전용-대체 경로/기상)은 생략할 수 있다 — 실제로
+        관제사가 "수심 얘기만 있고 다른 근거는 안 보인다"고 지적한 사례가 있었다
+        (2026-08-19). 이 메서드는 판정에 실제로 쓰인 구조화 값을 그대로 담아서,
+        요약문이 무엇을 강조했든 전체 근거를 화면에서 확인할 수 있게 한다.
+
+        안전판정(화학물질 위험성·혼재 등)은 일부러 안 담는다(2026-08-19 재수정) —
+        그건 안전관제 에이전트의 몫이고 이미 별도 화면(선박 상세·안전심사)에서
+        보여준다. 여기는 "선석 스펙과 선박이 어떻게 매칭됐는가"(수심·흘수·전용
+        /대체 경로)만 다뤄야 두 화면의 책임이 안 섞인다.
+        """
+        detail: dict = {"trace": self.assignment_trace}
+        if self.berth_match_summary:
+            detail["narrative"] = self.berth_match_summary
+        if self.selected_berth:
+            detail["berth"] = {
+                "rank": self.selected_berth.rank,
+                "berth_group": self.selected_berth.berth_group,
+                "depth_m": self.selected_berth.depth_m,
+                "draught_margin_m": self.selected_berth.draught_margin_m,
+                "occupancy_status": self.selected_berth.occupancy_status.value,
+            }
+        detail["weather"] = {
+            "status": self.weather_assessment.status.value,
+            "reasons": self.weather_assessment.reasons,
+        }
+        if self.rejected_candidates:
+            detail["rejected_candidates"] = [
+                {"berth_id": rc.berth_id, "rank": rc.rank, "reason": rc.reason}
+                for rc in self.rejected_candidates
+            ]
+        return detail
 
 
 class LLMSummary(BaseModel):
     """Gemini response_schema로 강제할 최종 종합 의견 구조화 출력."""
 
     summary: str = Field(description="관제사가 바로 읽을 수 있는 종합 의견, 1~2문단 한국어")
+    berth_match_summary: str = Field(
+        description="선석 스펙(수심·정원·전용/대체 여부)이 이 선박과 왜 맞는지만 다루는 "
+        "한 문장. 화학물질명·위험등급·유해성 등 안전판정 내용은 절대 넣지 말 것 — "
+        "선석 배정 근거 화면 전용이라 안전 얘기가 섞이면 안 된다.",
+    )

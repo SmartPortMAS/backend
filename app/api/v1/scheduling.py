@@ -21,8 +21,9 @@ _DESCRIPTION = """
 
 - **`berth_group`이 `null`인 것을 "온산 밖"으로 읽지 마세요.** 그 필드는 "기상 임계값
   자료가 있는가"입니다. 온산 여부는 **`onsan_scope`**로 판단하세요.
-- `occupancy_status`가 `점유`면 `conflicting_port_calls`에 겹치는 입출항 기록이 옵니다.
-  `departure_at_utc`가 `null`이면 출항 미기록이며 보수적으로 점유 처리합니다.
+- `occupancy_status`는 우리 시스템 배정 기록(berth_assignment)만 기준입니다(2026-08-19
+  결정 — VTS 실측 upa_port_call은 안 봄). `점유`면 `conflicting_port_calls`에 겹치는
+  배정 건이 옵니다.
 - **`adjacent_cargos`는 `POST /safety/assess` 요청 바디로 변환 없이 그대로 넘길 수
   있습니다.**
 - `total_eligible_count`는 조건을 만족한 전체 수입니다(반환은 상위 3개).

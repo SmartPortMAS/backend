@@ -138,3 +138,11 @@ class SafetyAssessmentResult(BaseModel):
     )
     rule_engine_floor: RiskLevel = Field(description="그래프 탐색 기반 결정적 하한 등급 (MSDS 텍스트 + IMDG 공인 규정 + 포장기준 중 가장 심각한 쪽)")
     msds_sections_used: list[str] = Field(description="프롬프트 근거로 사용된 MSDS detail 섹션 키 목록")
+    imdg_classes: dict[str, str] = Field(
+        default_factory=dict,
+        description="대상·인접 화물의 chem_id -> IMDG Class 코드. imdg_conflicts에 안 걸린 "
+        "화물쌍도 각자 Class 자체는 여기서 알 수 있다 — 화면이 'SEGREGATE 관계 없음'을 "
+        "'공인 규정상 X(격리 불필요, 두 Class 모두 알려짐)'와 '이 Class 조합이 그래프에 "
+        "안 실려서 모름'을 구분해 보여주는 데 쓴다. 값이 없는 chem_id는 HAS_IMDG_CLASS "
+        "관계 자체가 없다는 뜻이다.",
+    )

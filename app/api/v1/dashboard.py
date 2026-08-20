@@ -509,3 +509,159 @@ async def get_dashboard_alerts(db: AsyncSession = Depends(get_session)) -> list[
 async def get_safety_index(db: AsyncSession = Depends(get_session)) -> dict:
     """기상·흘수·혼재·화물식별·선석특정·신선도 6축 점수(0~100)와 근거."""
     return await build_safety_index(db, neo4j_client.driver)
+
+
+# --------------------------------------------------------------------------
+# 선석 배정현황 — berth + berth_assignment 조인, 슬롯 단위.
+#
+# 08_스케줄링_전면재설계_자동배정_설계문서.md §7 — 위 /berths(upa_port_call
+# VTS 관측 기준 "실제로 배가 있는가")와는 다른 질문에 답한다. 이건 "우리
+# 시스템이 이 선석에 무엇을 배정(추천/승인)했는가"를 보여준다 — 데이터
+# 출처가 다르므로 /berths를 확장하지 않고 새 엔드포인트로 분리했다(§7.1).
+#
+# 빈 슬롯도 slot_no 1..max_concurrent_vessels 전부 채워서 내려준다 — 프론트가
+# "몇 개 슬롯 중 몇 개가 찼는지"를 계산 없이 바로 그릴 수 있게.
+# --------------------------------------------------------------------------
+
+_QUERY_BERTH_ASSIGNMENTS = text("""
+    SELECT b.wharf_name, b.latitude, b.longitude,
+           COALESCE(b.berth_vessel_count, 1)::int AS max_concurrent_vessels,
+           b.port_name, b.length_m, b.depth_m, b.berth_capacity AS max_dwt,
+           b.port_operator_name AS operator, b.handling_cargo_name, b.wharf_se_name,
+           ba.id AS assignment_id,
+           ba.slot_no, ba.status, ba.call_sign, ba.vessel_name,
+           ba.cargo_chem_id, mc.name_ko AS cargo_name,
+           lower(ba.planned_window) AS window_start, upper(ba.planned_window) AS window_end,
+           -- 실제 입항은 ba.actual_berthing_at을 우선 쓴다(2026-08-20 — arrival_watcher가
+           -- 배정 생성 시점에 이미 VTS 확인 입항시각을 직접 채워 둔다, 이 배정 자신의
+           -- 값이라 재항 건 혼동이 없다). 그 다음은 portmis_vessel(공식 신고, 2026-08-20
+           -- details 파싱 복원 이후 사용 가능해짐) — VTS(upa_port_call)보다 신뢰도가
+           -- 높다. 아래 두 LATERAL 모두 없는 배정만 VTS로 마지막 보충한다.
+           COALESCE(ba.actual_berthing_at, pm.arrival_at_utc, pc.arrival_at_utc) AS actual_arrival_utc,
+           COALESCE(ba.actual_departure_at, pm.departure_at_utc, pc.departure_at_utc) AS actual_departure_utc,
+           -- PORT-MIS만 주는 값 — 입항 시점에 선사가 신고하는 출항 "예정" 시각.
+           -- 아직 출항 전이어도(actual_departure_utc가 null이어도) 언제쯤 비는지
+           -- 미리 보여줄 수 있다("출항시간 기준으로 자리를 비워야" 요청, 2026-08-20).
+           pm.departure_sched_utc AS departure_scheduled_utc,
+           ba.assignment_reason, ba.approved_by, ba.rejected_candidates AS decision_detail
+    FROM upa_berth_facility b
+    LEFT JOIN berth_assignment ba
+      ON ba.berth_id = b.wharf_name
+     AND ba.status IN ('REQUESTED', 'APPROVED', 'SCHEDULED', 'BERTHED')
+     -- 관제사가 승인/반려하지 않고 방치한 REQUESTED 추천은 계획기간(planned_window)이
+     -- 이미 끝나면 뺀다(2026-08-20, 실사용 중 발견 — SK5부두 슬롯 1에 8/11·8/18·8/20
+     -- 세 건이 동시에 "점유 중"으로 뜸. 셋 다 서로 겹치지 않는 시간대라 EXCLUDE
+     -- 제약은 정상 작동한 것이었고, 문제는 출항 확인 이벤트가 없어 release_
+     -- completed_berths가 못 닫는 낡은 REQUESTED가 계속 쌓이는 쪽이었다). APPROVED
+     -- 이후 상태는 관제사가 이미 확정한 실제 점유이므로 계획기간이 지나도(실제 출항
+     -- 지연 등) 계속 보여준다 — 여기서 거르는 건 "아무도 결정하지 않은 채 시효가
+     -- 지난 추천"뿐이다. DB 행 자체는 감사 기록으로 남고 지우지 않는다.
+     AND (ba.status != 'REQUESTED' OR ba.planned_window IS NULL OR upper(ba.planned_window) > now())
+    LEFT JOIN msds_chemical mc ON mc.chem_id = ba.cargo_chem_id
+    -- PORT-MIS(공식 신고) 실제 입출항 + 출항예정 — call_sign 기준으로 이 배의
+    -- 가장 최근 방문 하나만 붙인다(같은 배가 재항을 여러 번 했을 수 있어서).
+    -- 계획 구간과 겹치거나 가까운(2일 버퍼) 건만 인정해 다른 방문과 혼동을 막는다
+    -- (아래 VTS LATERAL과 동일 원칙 — 실측으로 재현했던 "지난달 기록이 붙는" 사고).
+    LEFT JOIN LATERAL (
+        SELECT pv.arrival_at_utc, pv.departure_at_utc, pv.departure_sched_utc
+        FROM portmis_vessel pv
+        WHERE ba.call_sign IS NOT NULL
+          AND upper(btrim(pv.callsgn)) = upper(btrim(ba.call_sign))
+          AND pv.arrival_at_utc IS NOT NULL
+          AND pv.arrival_at_utc > lower(ba.planned_window) - interval '2 days'
+          AND pv.arrival_at_utc < upper(ba.planned_window) + interval '2 days'
+        ORDER BY pv.arrival_at_utc DESC
+        LIMIT 1
+    ) pm ON true
+    -- VTS(upa_port_call) 실제 입출항 — PORT-MIS·ba 실측값이 전부 없을 때만 쓰는
+    -- 마지막 폴백(2026-08-19, "선박 정보에 입항/출항시간 있지 않냐"는 지적).
+    LEFT JOIN LATERAL (
+        SELECT pc2.arrival_at_utc, pc2.departure_at_utc
+        FROM upa_port_call pc2
+        WHERE ba.call_sign IS NOT NULL
+          AND upper(btrim(pc2.callsgn)) = upper(btrim(ba.call_sign))
+          AND pc2.arrival_at_utc IS NOT NULL
+          AND pc2.arrival_at_utc > lower(ba.planned_window) - interval '2 days'
+          AND pc2.arrival_at_utc < upper(ba.planned_window) + interval '2 days'
+        ORDER BY pc2.arrival_at_utc DESC
+        LIMIT 1
+    ) pc ON true
+    ORDER BY b.wharf_name, ba.slot_no
+""")
+
+
+@router.get("/berth-assignments", summary="선석 배정현황 조회 (슬롯 단위, §7.2)")
+async def get_berth_assignments(db: AsyncSession = Depends(get_session)) -> list[dict]:
+    """선석별 슬롯 배정 상태. REQUESTED(추천, 승인 대기)/APPROVED 이후(확정)를 구분해서
+    보여준다 — 승인 액션은 POST /approvals/{id}/decision.
+
+    upa_berth_facility.wharf_name은 UNIQUE라 선석당 행이 하나뿐이다(2026-08-19,
+    berth_assignment.berth_id FK를 여기로 옮기면서 중복 berth 마스터 행 문제 자체가
+    없어짐 — 이전에는 berth 테이블에 같은 wharf_name 중복 행이 생겨 지도에 원이
+    여러 개 겹쳐 찍히는 문제가 있었다).
+    """
+    rows = (await db.execute(_QUERY_BERTH_ASSIGNMENTS)).mappings().all()
+
+    berths: dict[str, dict] = {}
+    occupied_slot_nos: dict[str, set[int]] = {}
+    for row in rows:
+        name = row["wharf_name"]
+        entry = berths.setdefault(name, {
+            "wharf_name": name,
+            "latitude": row["latitude"],
+            "longitude": row["longitude"],
+            "max_concurrent_vessels": row["max_concurrent_vessels"],
+            # 선석 기본정보(upa_berth_facility) — 지도에서 선석 클릭 시 표시용
+            "port_name": row["port_name"],
+            "length_m": row["length_m"],
+            "depth_m": row["depth_m"],
+            "max_dwt": row["max_dwt"],
+            "operator": row["operator"],
+            "handling_cargo_name": row["handling_cargo_name"],
+            "wharf_se_name": row["wharf_se_name"],
+            "slots": [],
+        })
+        if row["slot_no"] is not None:
+            entry["slots"].append({
+                "slot_no": row["slot_no"],
+                # 읽기전용 표시용 — 실제 승인/반려는 이 페이지가 아니라 종합에이전트
+                # 콘솔(AgentConsole)이 GET /approvals/pending으로 같은 id를 조회해
+                # POST /approvals/{id}/decision을 부른다(2026-08-19, 이 페이지에 있던
+                # 승인 버튼이 이 id 자체가 응답에 없어 "undefined"로 호출되던 버그를
+                # 고치면서 승인 액션 자체를 여기서 뺐다 — 두 화면에 같은 액션이
+                # 따로 있으면 관제사가 어느 쪽이 진짜인지 헷갈린다).
+                "assignment_id": row["assignment_id"],
+                "status": row["status"],
+                "call_sign": row["call_sign"],
+                "vessel_name": row["vessel_name"],
+                "cargo_chem_id": row["cargo_chem_id"],
+                "cargo_name": row["cargo_name"],
+                "window_start": row["window_start"],
+                "window_end": row["window_end"],
+                # 실제 입출항 시각(portmis_vessel 우선, 없으면 upa_port_call) — window_*는
+                # 배정 시점의 "계획값"이고 이건 "진짜 언제 들어오고 나갔나"다.
+                # 아직 출항 전이면 actual_departure_utc는 null.
+                "actual_arrival_utc": row["actual_arrival_utc"],
+                "actual_departure_utc": row["actual_departure_utc"],
+                # PORT-MIS가 입항 시점에 신고받은 출항 "예정" 시각 — 아직 출항 전인
+                # 배정도 "언제쯤 이 자리가 빌지" 미리 보여줄 수 있다. PORT-MIS만 주는
+                # 값이라 없으면 그냥 null(다른 소스로 대체하지 않음 — 추측 금지).
+                "departure_scheduled_utc": row["departure_scheduled_utc"],
+                "assignment_reason": row["assignment_reason"],
+                "approved_by": row["approved_by"],
+                # 구조화된 배정 근거(선정 경로/흘수여유/안전판정/기상판정/탈락후보) —
+                # assignment_reason(LLM 자유문)이 특정 요인만 강조해도 전체 근거를
+                # 여기서 확인할 수 있다(OrchestratorResult.decision_detail() 참고).
+                "decision_detail": row["decision_detail"],
+            })
+            occupied_slot_nos.setdefault(name, set()).add(row["slot_no"])
+
+    # 빈 슬롯 채우기(status=null) — 실제 배정이 걸린 slot_no와 안 겹치게 채운다
+    for name, entry in berths.items():
+        occupied = occupied_slot_nos.get(name, set())
+        for slot_no in range(1, entry["max_concurrent_vessels"] + 1):
+            if slot_no not in occupied:
+                entry["slots"].append({"slot_no": slot_no, "status": None})
+        entry["slots"].sort(key=lambda s: s["slot_no"])
+
+    return list(berths.values())
