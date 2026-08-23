@@ -1,9 +1,11 @@
+import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRoute
+from sqlalchemy import text
 
 from app.api.v1.approvals import router as approvals_router
 from app.api.v1.chatbot import router as chatbot_router
@@ -17,6 +19,7 @@ from app.api.v1.scheduling import router as scheduling_router
 from app.api.v1.weather import router as weather_router
 from app.config import get_settings
 from app.core.logging import configure_logging
+from app.database import AsyncSessionFactory
 from app.neo4j_client import neo4j_client
 from app.scheduler import create_scheduler
 
@@ -24,9 +27,27 @@ settings = get_settings()
 configure_logging(settings.log_level)
 
 
+async def _warm_up_postgres() -> None:
+    """PostgreSQL 커넥션 풀을 미리 하나 채워 둔다 (2026-08-22 성능 측정).
+
+    asyncpg 풀은 지연 생성이라 첫 요청이 커넥션 수립 비용을 혼자 문다 —
+    기상분석 에이전트 실측에서 1회차만 2,102ms, 2회차부터 21.5ms였다(약 100배).
+    관제사가 화면을 처음 열었을 때가 정확히 그 1회차라, 기동 시점으로 옮긴다.
+
+    실패해도 앱을 막지 않는다. 이건 최적화지 기능 요건이 아니고, DB가 잠깐
+    늦게 뜨는 개발 환경에서 API 전체가 안 뜨는 쪽이 훨씬 나쁘다.
+    """
+    try:
+        async with AsyncSessionFactory() as session:
+            await session.execute(text("SELECT 1"))
+    except Exception:  # noqa: BLE001 - 워밍업 실패는 기동을 막지 않는다
+        logging.getLogger(__name__).warning("PostgreSQL 워밍업 실패 — 첫 요청이 느릴 수 있습니다", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await neo4j_client.driver.verify_connectivity()
+    await _warm_up_postgres()
     # 08_스케줄링_전면재설계_자동배정_설계문서.md §5.1·§5.5 — 입항 자동추천·출항
     # 자동해제 백그라운드 잡. 둘 다 실패해도 API 자체는 계속 떠 있어야 하므로
     # 앱 시작을 막지 않는다(스케줄러 자체 등록 실패만 여기서 전파됨).

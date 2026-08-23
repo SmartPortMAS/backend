@@ -16,6 +16,7 @@ IMDG 격리코드→위험등급 환산, LLM 하향 판정 방지 보정이 이�
 대시보드가 같은 질문에 다른 답을 내면 안 되기 때문이다.
 """
 
+import asyncio
 import logging
 
 from neo4j import AsyncDriver
@@ -27,9 +28,11 @@ from app.agents.safety.schemas import (
     CargoRef,
     SafetyAssessmentRequest,
     SafetyAssessmentResult,
+    risk_level_rank,
 )
 from app.agents.safety.service import assess_safety
 from app.core.exceptions import AppError
+from app.database import AsyncSessionFactory
 from app.llm.base import LLMClient
 from app.llm.embeddings import EmbeddingClient
 from app.models import MsdsChemical
@@ -87,7 +90,7 @@ async def answer_question(
             chemicals=[hinted.query_name],
             reasoning="cargo_hint로 화물이 이미 특정되어 플래너를 생략함",
         )
-        resolved, unresolved = [hinted], []
+        resolved, unresolved, near_misses = [hinted], [], {}
         logger.info("chatbot: cargo_hint=%s 로 플래너 생략", hinted.chem_id)
     else:
         plan = await llm_client.generate_structured(
@@ -102,14 +105,31 @@ async def answer_question(
                 answer=OUT_OF_SCOPE_ANSWER, intent=plan.intent, confidence=Confidence.HIGH
             )
 
-        resolved, unresolved = await resolve_chemical_names(db, embedding_client, plan.chemicals)
+        resolved, unresolved, near_misses = await resolve_chemical_names(
+            db, embedding_client, plan.chemicals
+        )
 
     # 물질을 지목했는데 하나도 해석되지 않았다면 그래프/MSDS를 뒤질 대상이 없다.
     # 이 경우에도 LLM을 부르는 건 환각의 지름길이라 바로 정형 응답으로 끝낸다.
     if plan.intent is not Intent.SAFETY_GENERAL and not resolved:
-        return _unresolved_response(plan, unresolved)
+        return _unresolved_response(plan, unresolved, near_misses)
 
     intent = _adjust_intent(plan.intent, resolved)
+
+    # [2026-08-23] "쌍 판정을 요청했는데 일부 물질이 미해석"인 상태를 표시해 둔다.
+    #
+    # 실측 재현: "밴젠(오타)과 가솔린을 같이 놔둘수 있어?" -> 가솔린만 해석되고
+    # 밴젠은 미등재. _adjust_intent가 INCOMPATIBLE_LIST로 강등해 안전 에이전트를
+    # 부르지도 않았는데(assessment=None), LLM은 "밴젠과 가솔린을 같이 두는 것은
+    # 권장되지 않습니다"라고 **판정한 것처럼** 답했다. 가솔린의 혼재금지
+    # 카테고리(가연성물질)를 보고 "밴젠=벤젠이니 인화성이겠지"라고 자기 지식으로
+    # 메꾼 것이다.
+    #
+    # 프롬프트에는 이미 "일반 화학 지식으로 보충하지 마세요"(1번 규칙)와
+    # [해석 실패한 물질명] 블록이 둘 다 있었지만 지켜지지 않았다. 그래서 결론
+    # 문장 자체를 코드가 확정해 앞에 붙인다 — 프롬프트로 부탁하지 않고 못 박는다.
+    incomplete_pairwise = plan.intent is Intent.INCOMPATIBILITY_CHECK and bool(unresolved)
+
     profiles = await _build_profiles(db, neo4j_driver, resolved)
 
     assessment: SafetyAssessmentResult | None = None
@@ -131,12 +151,15 @@ async def answer_question(
             assessment=assessment,
             chunks=chunks,
             unresolved=unresolved,
+            incomplete_pairwise=incomplete_pairwise,
         ),
         schema=LLMAnswer,
     )
 
     return ChatResponse(
-        answer=llm_answer.answer,
+        answer=_prepend_unjudged_notice(
+            llm_answer.answer, unresolved, incomplete_pairwise, near_misses
+        ),
         intent=intent,
         confidence=_compute_confidence(
             resolved=resolved,
@@ -169,12 +192,65 @@ def _adjust_intent(intent: Intent, resolved: list[ChemicalMatch]) -> Intent:
     return intent
 
 
-def _unresolved_response(plan: QueryPlan, unresolved: list[str]) -> ChatResponse:
+def _suggestion_line(
+    unresolved: list[str], near_misses: dict[str, tuple[str, float]]
+) -> str:
+    """관제사에게 되물을 "혹시 ○○을 찾으셨나요?" 한 줄. 후보가 없으면 빈 문자열.
+
+    자동으로 바꿔치기하지 않고 되묻기만 하는 이유: 오타와 "실재하지만 이 시스템에
+    없는 물질"의 유사도 구간이 완전히 겹친다(실측 0.56~0.70). 자동 교정을 켜면
+    '염산'을 황산으로, '과산화수소'를 수소로 바꿔 안전 판정을 내리게 된다.
+    """
+    hits = [(raw, near_misses[raw][0]) for raw in unresolved if raw in near_misses]
+    if not hits:
+        return ""
+    parts = ", ".join(f"'{raw}' → **{name}**" for raw, name in hits)
+    return f"혹시 {parts}을(를) 찾으셨나요? 맞다면 그 이름으로 다시 물어봐 주세요."
+
+
+def _prepend_unjudged_notice(
+    answer: str,
+    unresolved: list[str],
+    incomplete_pairwise: bool,
+    near_misses: dict[str, tuple[str, float]] | None = None,
+) -> str:
+    """쌍 판정을 못 한 경우, 그 사실을 코드가 확정한 문장으로 답변 맨 앞에 붙인다.
+
+    LLM이 결론을 잘 쓰기를 기대하지 않는다 — 이 문장은 근거(unresolved 목록)에서
+    기계적으로 나오므로 틀릴 수가 없고, 첫 줄에 있어 관제사가 먼저 읽는다.
+    뒤따르는 LLM 문장은 등재된 화물에 대한 참고 정보로 남는다.
+    """
+    if not incomplete_pairwise or not unresolved:
+        return answer
+    names = ", ".join(f"'{n}'" for n in unresolved)
+    suggestion = _suggestion_line(unresolved, near_misses or {})
+    # 이 문장은 관제사가 읽는다 — "DB"·"미등재"·"레코드" 같은 시스템 용어 대신
+    # 무엇이 문제이고 무엇을 확인하면 되는지를 쓴다.
+    return (
+        f"{names}은(는) 이 시스템이 다루는 울산항 화물 목록에 없어 "
+        f"**혼재 가능 여부를 판정하지 못했습니다.**\n"
+        + (f"{suggestion}\n" if suggestion else
+           "화물명 표기를 다시 확인해 주세요 — 표기가 조금 다르거나 아직 등록되지 않은 "
+           "화물일 수 있습니다. 화면 왼쪽 화물 목록에서 취급 가능한 화물을 보실 수 있습니다.\n")
+        + "\n아래는 판정 결과가 아니라, 확인된 화물에 대한 참고 정보입니다.\n\n"
+        + answer
+    )
+
+
+def _unresolved_response(
+    plan: QueryPlan,
+    unresolved: list[str],
+    near_misses: dict[str, tuple[str, float]] | None = None,
+) -> ChatResponse:
     names = ", ".join(unresolved) if unresolved else "질문에서 언급된 물질"
+    tail = _suggestion_line(unresolved, near_misses or {}) or (
+        "화물명 표기를 다시 확인해 주세요 — 화면 왼쪽 화물 목록에서 "
+        "취급 가능한 화물을 보실 수 있습니다."
+    )
     return ChatResponse(
         answer=(
-            f"{names}은(는) 현재 DB에 등록되어 있지 않아 답변할 수 없습니다. "
-            "울산항 등재 화물 목록은 사이드바(또는 GET /api/v1/chatbot/chemicals)에서 확인할 수 있습니다."
+            f"{names}은(는) 이 시스템이 다루는 울산항 화물 목록에 없어 답변드릴 수 없습니다. "
+            f"{tail}"
         ),
         intent=plan.intent,
         confidence=Confidence.LOW,
@@ -252,8 +328,20 @@ async def _build_profiles(
 async def build_incompatible_groups(
     neo4j_driver: AsyncDriver, chem_id: str
 ) -> list[IncompatibleCategoryGroup]:
-    """혼재금지 카테고리 조회 결과를 응답 스키마로 변환한다. API에서도 직접 쓴다."""
+    """혼재금지 카테고리 조회 결과를 응답 스키마로 변환한다. API에서도 직접 쓴다.
+
+    MSDS 텍스트 마이닝(INCOMPATIBLE_WITH/IS_CLASSIFIED_AS) · IMDG 공인 격리표
+    · 벌크 액체화학물질 호환성그룹 참고축, 세 근거를 모두 모은다 — 하나만 조회
+    하면 그 축이 놓치는 조합을 "물어봤는데 안 나왔다"가 "정말 안전하다"로
+    오독할 수 있다(safety 에이전트의 pairwise 판정은 이미 세 축 모두 쓰는데
+    이 목록형 조회만 뒤처져 있었다 — 2026-08-21 감사에서 발견). category
+    라벨로 세 근거의 출처를 구분해 표시한다. IMDG "미확정"(모름) 신호는
+    여기 넣지 않는다 — 목록형 답변에 "아마도" 항목을 섞으면 확정 사실처럼
+    오독되기 쉽다(pairwise 판정에서는 주의 등급으로만 노출).
+    """
     raw_groups = await graph_queries.fetch_incompatible_groups(neo4j_driver, chem_id)
+    raw_groups = raw_groups + await graph_queries.fetch_imdg_segregation_groups(neo4j_driver, chem_id)
+    raw_groups = raw_groups + await graph_queries.fetch_bulk_compatibility_groups(neo4j_driver, chem_id)
     return [
         IncompatibleCategoryGroup(
             category=group["category"],
@@ -279,26 +367,86 @@ async def _delegate_to_safety_agent(
     llm_client: LLMClient,
     resolved: list[ChemicalMatch],
 ) -> SafetyAssessmentResult | None:
-    """첫 번째 물질을 대상 화물, 나머지를 인접 화물로 두고 안전관제 에이전트를 호출한다.
+    """화물 목록을 안전관제 에이전트로 판정한다.
+
+    2개 화물 질문은 첫 번째를 대상, 나머지 하나를 인접 화물로 두고 한 번만
+    호출한다. 3개 이상이면 그것만으로는 부족하다 — "첫 번째 vs 나머지"만
+    보면 첫 번째가 관여하지 않는 조합(예: 벤젠·가솔린·황산을 물었을 때
+    가솔린-황산 조합)은 어떤 호출에서도 검사되지 않는다(2026-08-21 감사에서
+    발견). 그래서 3개 이상이면 각 화물을 한 번씩 대상으로 돌려 모든 조합이
+    최소 한 번은 검사되게 하고, 그중 가장 심각한 등급을 채택 + 발견된 충돌을
+    전부 합쳐서 보여준다.
 
     실패해도 챗봇 전체를 실패시키지 않는다 — 그래프 프로필과 MSDS 발췌만으로도
     "판정은 못 했지만 이런 위험성이 있다"는 답변은 가능하기 때문이다.
+
+    3개 이상일 때의 N회 판정은 **동시에** 돌린다(2026-08-22 성능 측정). 각 호출이
+    서로의 결과를 보지 않는 독립 판정이고 시간의 대부분이 LLM 응답 대기라,
+    순차로 돌리면 화물 수에 비례해 그대로 늘어난다(3물질 질문 실측 약 13초).
+    결과 병합(_merge_safety_results)은 순서에 의존하지 않으므로 판정 결과는
+    순차 실행과 동일하다.
+
+    ★ 병렬 분기마다 **자기 세션**을 연다. AsyncSession은 동시 사용이 불가능해
+    (asyncpg "another operation is in progress"), 호출부의 세션 하나를 여러
+    태스크가 같이 쓰면 판정이 아니라 DB 계층에서 먼저 깨진다. 판정은 읽기
+    전용이라 세션이 갈려도 결과가 달라지지 않는다.
     """
+    try:
+        if len(resolved) <= 2:
+            return await _assess_pair(db, neo4j_driver, llm_client, target=resolved[0], others=resolved[1:])
+
+        async def _assess_in_own_session(index: int) -> SafetyAssessmentResult:
+            async with AsyncSessionFactory() as task_db:
+                return await _assess_pair(
+                    task_db, neo4j_driver, llm_client,
+                    target=resolved[index], others=resolved[:index] + resolved[index + 1:],
+                )
+
+        results = await asyncio.gather(
+            *(_assess_in_own_session(i) for i in range(len(resolved)))
+        )
+        return _merge_safety_results(list(results))
+    except AppError:
+        logger.exception("안전관제 에이전트 위임 실패 — 그래프 근거만으로 답변합니다")
+        return None
+
+
+async def _assess_pair(
+    db: AsyncSession,
+    neo4j_driver: AsyncDriver,
+    llm_client: LLMClient,
+    *,
+    target: ChemicalMatch,
+    others: list[ChemicalMatch],
+) -> SafetyAssessmentResult:
     request = SafetyAssessmentRequest(
-        target_cargo=CargoRef(chem_id=resolved[0].chem_id, name_hint=resolved[0].name_ko),
+        target_cargo=CargoRef(chem_id=target.chem_id, name_hint=target.name_ko),
         adjacent_cargos=[
             AdjacentCargo(
                 berth_name=_VIRTUAL_BERTH,
                 cargo=CargoRef(chem_id=match.chem_id, name_hint=match.name_ko),
             )
-            for match in resolved[1:]
+            for match in others
         ],
     )
-    try:
-        return await assess_safety(db, neo4j_driver, llm_client, request)
-    except AppError:
-        logger.exception("안전관제 에이전트 위임 실패 — 그래프 근거만으로 답변합니다")
-        return None
+    return await assess_safety(db, neo4j_driver, llm_client, request)
+
+
+def _merge_safety_results(results: list[SafetyAssessmentResult]) -> SafetyAssessmentResult:
+    """여러 대상 기준으로 나온 판정을 하나로 합친다.
+
+    서술(reasoning/checklist/key_hazards)은 가장 심각한 등급이 나온 결과의
+    것을 대표로 쓰고(그 화물 조합이 가장 중요한 근거이므로), 근거 목록
+    (conflicts/imdg_conflicts/bulk_compatibility_conflicts/
+    imdg_unconfirmed_pairs)은 전부 합쳐서 어느 조합에서 왔든 빠짐없이 보여준다.
+    """
+    worst = max(results, key=lambda r: risk_level_rank(r.risk_level))
+    return worst.model_copy(update={
+        "conflicts": [c for r in results for c in r.conflicts],
+        "imdg_conflicts": [c for r in results for c in r.imdg_conflicts],
+        "imdg_unconfirmed_pairs": [c for r in results for c in r.imdg_unconfirmed_pairs],
+        "bulk_compatibility_conflicts": [c for r in results for c in r.bulk_compatibility_conflicts],
+    })
 
 
 async def _retrieve_context(

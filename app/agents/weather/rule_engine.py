@@ -94,7 +94,17 @@ def _level_for_metric(
 
     임계값 자체가 None(해당 부두그룹에 그 지표 기준이 없음)이면 그 단계는 건너뛴다
     (팀원 원본과 동일 — 예: S-Oil 그룹은 파고 기준이 아예 없음).
+
+    2026-08-21 수정 — "이 지표 기준 자체가 없는 부두"에서는 관측 결측·오래됨이
+    UNKNOWN으로 격상시키지 않는다. 예전 코드는 value가 None/stale이면 임계값
+    유무와 무관하게 무조건 UNKNOWN을 반환해, 파고 기준이 아예 없는 S-Oil
+    부두군이 "풍속은 명백히 정상인데 파고 관측이 없다"는 이유만으로 전체
+    판정이 판단불가로 격상되는 결함이 있었다(실제 재현 확인). "모르면 진행
+    하지 않는다" 원칙은 "이 지표가 적용되는데 모를 때"에만 맞는 얘기고, 애초에
+    적용되지 않는 지표의 결측은 판정과 무관해야 한다.
     """
+    if stop is None and unberth is None and disconnect is None:
+        return WorkStatus.NORMAL, None
     if value is None or is_stale:
         return WorkStatus.UNKNOWN, None
     if disconnect is not None and value >= disconnect:
