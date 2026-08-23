@@ -64,7 +64,9 @@ ANSWER_SYSTEM_PROMPT = """\
 1. 아래 [근거] 블록에 실제로 적힌 내용만으로 답변하세요. 일반 화학 지식이나 추측으로
    보충하지 마세요. 당신이 알고 있는 값이라도 근거에 없으면 쓰지 마세요.
 2. 질문에 답할 근거가 없으면 없다고 말하고 data_insufficient를 true로 두세요.
-   그럴듯한 답을 지어내는 것보다 "DB에 등록되어 있지 않습니다"가 항상 낫습니다.
+   그럴듯한 답을 지어내는 것보다 "확인된 자료가 없습니다"가 항상 낫습니다.
+   답변은 관제사가 읽습니다 — "DB", "미등재", "레코드" 같은 시스템 용어 대신
+   "울산항 화물 목록에 없습니다", "확인된 자료가 없습니다"처럼 쓰세요.
 3. "그래프 미등재"로 표시된 화물은 혼재금지 관계를 판정할 수 없는 상태입니다.
    이를 "혼재금지 관계가 없다" 또는 "안전하다"로 절대 해석하지 마세요.
    반드시 "지식그래프에 관계 정보가 없어 판정할 수 없다"고 명시하세요.
@@ -79,8 +81,8 @@ ANSWER_SYSTEM_PROMPT = """\
 - 그다음 근거를 구체적으로 인용하세요. 어느 화물의 어떤 정보인지 밝히세요.
 - 혼재금지 물질 목록을 답할 때는 반드시 카테고리별로 묶어서 제시하세요
   ("강산류: 황산" 형태). 물질명만 한 줄로 나열하면 관제사가 왜 위험한지 알 수 없습니다.
-  소속 화물이 없는 카테고리도 "이 카테고리와 혼재금지이나 DB 등재 화물은 없음"으로
-  함께 밝히세요.
+  소속 화물이 없는 카테고리도 "이 카테고리와는 혼재금지이나, 울산항 취급 화물 중
+  해당하는 것은 없음"으로 함께 밝히세요.
 - 마크다운을 쓸 수 있지만 3~4문단을 넘기지 마세요. 관제 현장에서 빠르게 읽습니다.
 - safety_actions에는 근거에 적힌 문구에 기반한 실행 가능한 조치만 담으세요.
   근거에 없으면 빈 배열로 두세요.
@@ -155,7 +157,7 @@ def _format_graph_evidence(evidence: GraphEvidence) -> str:
         blocks.append("\n".join(_format_profile(p) for p in evidence.profiles))
 
     if evidence.incompatible_groups:
-        lines = ["■ 혼재금지 카테고리별 DB 등재 화물"]
+        lines = ["■ 혼재금지 카테고리별 울산항 취급 화물"]
         for group in evidence.incompatible_groups:
             if group.chemicals:
                 names = ", ".join(
@@ -163,7 +165,7 @@ def _format_graph_evidence(evidence: GraphEvidence) -> str:
                     for c in group.chemicals
                 )
             else:
-                names = "(DB 34종 중 이 카테고리로 분류된 화물 없음)"
+                names = "(울산항 취급 화물 중 이 카테고리로 분류된 것 없음)"
             lines.append(f"  - {group.category}: {names}")
         blocks.append("\n".join(lines))
 
@@ -216,6 +218,7 @@ def build_answer_prompt(
     assessment: SafetyAssessmentResult | None,
     chunks: list[RetrievedChunk],
     unresolved: list[str],
+    incomplete_pairwise: bool = False,
 ) -> str:
     sections = [f"[사용자 질문]\n{question}"]
 
@@ -223,8 +226,27 @@ def build_answer_prompt(
         sections.append(
             "[해석 실패한 물질명]\n"
             + "\n".join(f"  - {name}" for name in unresolved)
-            + "\n※ 이 물질들은 DB(울산항 등재 화물)에 없습니다. 해당 물질에 대해서는 "
+            + "\n※ 이 물질들은 울산항 취급 화물 목록에 없습니다. 해당 물질에 대해서는 "
             "정보가 없다고 명확히 답하고, 추측하지 마세요."
+        )
+
+    # [2026-08-23] 쌍 판정이 불가능한 상태를 명시한다. 실측(밴젠 오타 사례)에서
+    # LLM이 미해석 물질에 대해 "같이 두는 것은 권장되지 않습니다"라고 판정한 것처럼
+    # 답했다 — 해석된 화물의 혼재금지 카테고리를 보고 자기 지식으로 메꾼 것이다.
+    # 결론 문장 자체는 코드가 앞에 붙이지만(service._prepend_unjudged_notice),
+    # 뒤따르는 LLM 문장이 그와 모순되면 관제사가 무엇을 믿을지 알 수 없으므로
+    # 여기서도 같은 제약을 건다.
+    if incomplete_pairwise:
+        sections.append(
+            "[★ 이 질문은 화물 A와 B의 혼재 가부를 묻는 쌍 판정입니다 — 그런데 위 "
+            "'해석 실패한 물질명'이 있어 판정을 수행하지 못했습니다]\n"
+            "  - 두 화물을 같이 둬도 되는지에 대한 결론을 절대 쓰지 마세요. "
+            "'권장되지 않습니다' · '함께 보관해서는 안 됩니다' · '혼재금지입니다' 같은 "
+            "문장을 쓰면 안 됩니다. 판정을 한 적이 없기 때문입니다.\n"
+            "  - 미해석 물질이 어떤 성질일지 추측하지 마세요. 이름이 아는 물질과 "
+            "비슷해 보여도 마찬가지입니다.\n"
+            "  - 대신 등재된 화물에 대해 근거에 있는 사실만 설명하고, 미해석 물질은 "
+            "확인이 필요하다고만 쓰세요."
         )
 
     if assessment is not None:
