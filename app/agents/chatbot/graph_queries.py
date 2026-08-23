@@ -57,6 +57,50 @@ RETURN category,
          AS chemicals
 """
 
+# 벌크 액체화학물질 호환성그룹 참고축(data-pipeline/loaders/bulk_compatibility_neo4j_loader.py
+# 가 적재) — INCOMPATIBLE_WITH/IS_CLASSIFIED_AS(MSDS 텍스트 마이닝)와는 근거가
+# 다른 별도 신호라 같은 카테고리로 섞지 않고, service.py에서 category 라벨로
+# 출처를 구분해 합친다. 그룹 경유(일반 규칙)와 화물쌍 직접 예외
+# (BULK_COMPAT_BLOCKED_EXCEPTION) 두 가지를 모두 조회해야 한다 — 예외는
+# 그룹 관계로는 안 잡히는 조합이기 때문(bulk_compatibility.py 참고).
+_CYPHER_BULK_GROUP_INCOMPATIBLE = """
+MATCH (c:Chemical {id: $chem_id})-[:IN_COMPATIBILITY_GROUP]->(g:CompatibilityGroup)
+MATCH (g)-[:INCOMPATIBLE_WITH_GROUP]->(og:CompatibilityGroup)
+MATCH (o:Chemical)-[:IN_COMPATIBILITY_GROUP]->(og)
+WHERE o.id <> $chem_id
+WITH g.group_no AS my_group, g.name AS my_group_name,
+     og.group_no AS other_group, og.name AS other_group_name,
+     collect(DISTINCT o) AS others
+RETURN my_group, my_group_name, other_group, other_group_name,
+       [o IN others | {chem_id: o.id, name_ko: o.name_ko, name_en: o.name_en, cas_no: o.cas_no}]
+         AS chemicals
+"""
+
+_CYPHER_BULK_BLOCKED_EXCEPTION = """
+MATCH (c:Chemical {id: $chem_id})-[:BULK_COMPAT_BLOCKED_EXCEPTION]->(o:Chemical)
+RETURN o.id AS chem_id, o.name_ko AS name_ko, o.name_en AS name_en, o.cas_no AS cas_no
+"""
+
+# IMDG 공인 일반 격리표(imdg_segregation_loader.py) 기반 — INCOMPATIBLE_WITH/
+# IS_CLASSIFIED_AS(MSDS 텍스트 마이닝)와는 별도 신호. safety 에이전트의 pairwise
+# 판정(assess_safety, INCOMPATIBILITY_CHECK 의도가 위임하는 경로)에는 이미
+# 반영돼 있었지만, 이 목록형 조회(INCOMPATIBLE_LIST 의도)에는 지금까지 빠져
+# 있었다 — "이 물질과 안 맞는 게 뭐야" 질문이 IMDG 근거로만 걸리는 조합을
+# 놓칠 수 있었다(2026-08-21 발견, bulk축 추가 때 지적받은 것과 같은 종류의
+# 공백). "확정 규정 없음(X)"으로 판정 불가능한 조합은 여기 넣지 않는다 —
+# 목록형 질문에 "아마 위험할 수도" 항목을 섞으면 확정 사실처럼 오독되기 쉽다.
+_CYPHER_IMDG_SEGREGATION_LIST = """
+MATCH (c:Chemical {id: $chem_id})-[:HAS_IMDG_CLASS]->(ca:ImdgClass)
+MATCH (ca)-[s:SEGREGATE]->(cb:ImdgClass)
+MATCH (o:Chemical)-[:HAS_IMDG_CLASS]->(cb)
+WHERE o.id <> $chem_id
+WITH ca.code AS my_class, cb.code AS other_class, s.code AS segregation_code,
+     collect(DISTINCT o) AS others
+RETURN my_class, other_class, segregation_code,
+       [o IN others | {chem_id: o.id, name_ko: o.name_ko, name_en: o.name_en, cas_no: o.cas_no}]
+         AS chemicals
+"""
+
 _CYPHER_ALL_CHEMICALS = """
 MATCH (c:Chemical)
 RETURN c.id AS chem_id, c.name_ko AS name_ko, c.name_en AS name_en,
@@ -105,6 +149,53 @@ async def fetch_incompatible_groups(driver: AsyncDriver, chem_id: str) -> list[d
     return [
         {"category": category, "chemicals": sorted(chems.values(), key=lambda c: c["chem_id"])}
         for category, chems in sorted(merged.items())
+    ]
+
+
+async def fetch_bulk_compatibility_groups(driver: AsyncDriver, chem_id: str) -> list[dict]:
+    """벌크 호환성그룹 참고축 기준으로 대상 화물과 불호환인 화물 목록을
+    그룹 단위로 묶어 반환한다. fetch_incompatible_groups와 같은 모양
+    ([{"category": str, "chemicals": [...]}])이라 service.py에서 그대로
+    IncompatibleCategoryGroup 리스트에 이어붙일 수 있다.
+
+    category 라벨에 "(참고축)"을 명시해 MSDS/IMDG 근거와 구분한다 — 근거의
+    성격이 다르다는 것을 프롬프트·화면 양쪽에서 알 수 있어야 한다.
+    """
+    group_rows = await _read(driver, _CYPHER_BULK_GROUP_INCOMPATIBLE, chem_id=chem_id)
+    exception_rows = await _read(driver, _CYPHER_BULK_BLOCKED_EXCEPTION, chem_id=chem_id)
+
+    groups: list[dict] = [
+        {
+            "category": (
+                f"벌크호환성그룹(참고축) {row['my_group_name']}(그룹{row['my_group']}) "
+                f"↔ {row['other_group_name']}(그룹{row['other_group']})"
+            ),
+            "chemicals": row["chemicals"],
+        }
+        for row in group_rows
+    ]
+    if exception_rows:
+        groups.append({
+            "category": "벌크호환성그룹(참고축) 개별 예외 규정 — 일반 그룹 규칙과 무관하게 강제 격리",
+            "chemicals": [dict(row) for row in exception_rows],
+        })
+    return groups
+
+
+async def fetch_imdg_segregation_groups(driver: AsyncDriver, chem_id: str) -> list[dict]:
+    """IMDG 공인 일반 격리표 기준으로 대상 화물과 격리가 필요한 화물 목록을
+    Class 조합 단위로 묶어 반환한다. fetch_incompatible_groups/
+    fetch_bulk_compatibility_groups와 같은 모양([{"category","chemicals"}])."""
+    rows = await _read(driver, _CYPHER_IMDG_SEGREGATION_LIST, chem_id=chem_id)
+    return [
+        {
+            "category": (
+                f"IMDG 공인 격리표 Class {row['my_class']}↔{row['other_class']} "
+                f"(격리코드 {row['segregation_code']})"
+            ),
+            "chemicals": row["chemicals"],
+        }
+        for row in rows
     ]
 
 
