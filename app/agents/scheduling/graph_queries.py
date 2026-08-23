@@ -65,8 +65,15 @@ ORDER BY b.depth_m DESC
 # 온산 MVP(feature/onsan-mvp) 이식: 전용 선석이 점유 중일 때 같은 운영사/파이프라인
 # 안에서 대체 가능한 선석을 찾는다(build_substitutability.py의 SUBSTITUTABLE_WITH
 # 관계). ADJACENT_TO(물리적 인접 = 혼재위험)와는 완전히 별도 관계다.
+#
+# [2026-08-21] onsan_scope 하드 필터 추가 — _CYPHER_FIND_ELIGIBLE_BERTHS(1순위
+# 후보)에는 있었지만 이 대체 후보 쿼리에는 빠져 있었다. 그 결과 전용 선석이
+# 점유 중이면 SUBSTITUTABLE_WITH 그래프를 타고 온산 스코프 밖 선석(예: 잡화·목재
+# 취급 용연부두)까지 대체 후보로 나올 수 있었다 — 대시보드 지도는 온산항 범위만
+# 그리므로 "지도에 없는 선석이 배정됨" 불일치가 1순위 경로와 동일하게 재발한다.
 _CYPHER_FIND_SUBSTITUTABLE_BERTHS = """
 MATCH (b:Berth {id: $berth_id})-[r:SUBSTITUTABLE_WITH]->(target:Berth)
+WHERE coalesce(target.onsan_scope, false) = true
 RETURN target.id AS berth_id, target.wharf_name AS wharf_name, target.port_name AS port_name,
        target.depth_m AS depth_m, target.berth_group AS berth_group,
        target.latitude AS latitude, target.longitude AS longitude,

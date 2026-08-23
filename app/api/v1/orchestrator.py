@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.orchestrator.schemas import OrchestratorRequest, OrchestratorResult, OverallDecision
@@ -16,7 +16,12 @@ from app.core.exceptions import (
     MsdsUpstreamError,
 )
 from app.llm.base import LLMClient
-from app.models.berth_assignment import STATUS_APPROVED, STATUS_REJECTED, BerthAssignment
+from app.models.berth_assignment import (
+    ACTIVE_STATUSES,
+    STATUS_APPROVED,
+    STATUS_REJECTED,
+    BerthAssignment,
+)
 from app.neo4j_client import neo4j_client
 
 router = APIRouter(prefix="/orchestrator", tags=["orchestrator"])
@@ -166,6 +171,7 @@ async def assess_and_commit(
     slot_no = await find_free_slot(
         db, berth_id=result.selected_berth.berth_id,
         window_start=request.window_start, window_end=request.window_end,
+        exclude_call_sign=request.call_sign,
     )
     if slot_no is None:
         return AssessAndCommitResult(
@@ -179,6 +185,63 @@ async def assess_and_commit(
     ).mappings().first()
 
     now = datetime.now(timezone.utc)
+
+    # [2026-08-23] 재확정(같은 배 · 같은 선석 · 겹치는 시간대)이면 새 행을 만들지
+    # 않고 기존 행을 갱신한다.
+    #
+    # 왜 필요한가 — 2026-08-21에 find_free_slot에 exclude_call_sign을 추가해
+    # "자기 예약 때문에 만석으로 오판정되던" 문제를 고쳤는데, 그 결과 슬롯은
+    # 잡히지만 뒤이은 INSERT가 배제 제약에 걸려 **HTTP 500**이 났다(실측 재현:
+    # 같은 call_sign으로 assess-and-commit 2회 → ExclusionViolationError).
+    # 수정 전에는 "방금 만석이 됐습니다"라는 틀린 안내라도 나갔는데 수정 후엔
+    # 에러 화면이라, 관제사 입장에서는 오히려 나빠진 상태였다.
+    #
+    # 제약과 점유 판정 모두 활성 상태(REQUESTED/APPROVED/SCHEDULED/BERTHED)만
+    # 대상이므로, 갱신 대상도 같은 조건으로 찾는다 — 이미 REJECTED된 행은
+    # 자원을 점유하지 않으므로 건드리지 않고 새로 만든다.
+    existing = await db.scalar(
+        select(BerthAssignment)
+        .where(
+            BerthAssignment.berth_id == result.selected_berth.berth_id,
+            func.upper(func.btrim(BerthAssignment.call_sign))
+            == request.call_sign.strip().upper(),
+            BerthAssignment.status.in_(ACTIVE_STATUSES),
+            BerthAssignment.planned_window.op("&&")(
+                func.tstzrange(request.window_start, request.window_end, "[)")
+            ),
+        )
+        .order_by(BerthAssignment.created_at.desc())
+        .limit(1)
+    )
+
+    if existing is not None:
+        # planned_window·slot_no·berth_id는 건드리지 않는다 — 같은 배가 같은
+        # 시간대를 다시 확정하는 것이므로 점유 자원 자체는 바뀌지 않는다.
+        #
+        # status를 APPROVED로 올리는 이유: 이 엔드포인트의 동작 자체가 승인이다.
+        # arrival_watcher가 만든 REQUESTED 행을 관제사가 콘솔에서 확정하는 경로가
+        # 여기라, approved_by만 채우고 status를 REQUESTED로 두면 "누가 승인했는지는
+        # 적혀 있는데 승인되지 않은 행"이라는 모순 상태가 남는다.
+        #
+        # assignment_reason과 rejected_candidates는 둘 다 이번 판정(result)에서
+        # 나온 값이라 함께 갱신한다 — 한쪽만 바꾸면 요약문과 판정 근거가 서로
+        # 다른 시점을 가리킨다. actual_* 도 위에서 방금 조회한 VTS 확인값이므로
+        # 같이 반영한다(모델 주석: "계획이 아니라 사후 확인값").
+        existing.status = STATUS_APPROVED
+        existing.approved_by = request.approved_by
+        existing.assignment_reason = result.summary
+        existing.rejected_candidates = result.decision_detail()
+        if actual_times:
+            existing.actual_berthing_at = actual_times["arrival_at_utc"]
+            existing.actual_departure_at = actual_times["departure_at_utc"]
+        existing.updated_at = now
+        await db.commit()
+        await db.refresh(existing)
+        return AssessAndCommitResult(
+            result=result, committed=True, assignment_id=existing.id,
+            not_committed_reason=None,
+        )
+
     assignment = BerthAssignment(
         berth_id=result.selected_berth.berth_id,
         slot_no=slot_no,
@@ -239,6 +302,63 @@ class RejectResult(BaseModel):
 )
 async def reject(request: RejectRequest, db: AsyncSession = Depends(get_session)) -> RejectResult:
     now = datetime.now(timezone.utc)
+
+    # [2026-08-23] 재확정(같은 배 · 같은 선석 · 겹치는 시간대)이면 새 행을 만들지
+    # 않고 기존 행을 갱신한다.
+    #
+    # 왜 필요한가 — 2026-08-21에 find_free_slot에 exclude_call_sign을 추가해
+    # "자기 예약 때문에 만석으로 오판정되던" 문제를 고쳤는데, 그 결과 슬롯은
+    # 잡히지만 뒤이은 INSERT가 배제 제약에 걸려 **HTTP 500**이 났다(실측 재현:
+    # 같은 call_sign으로 assess-and-commit 2회 → ExclusionViolationError).
+    # 수정 전에는 "방금 만석이 됐습니다"라는 틀린 안내라도 나갔는데 수정 후엔
+    # 에러 화면이라, 관제사 입장에서는 오히려 나빠진 상태였다.
+    #
+    # 제약과 점유 판정 모두 활성 상태(REQUESTED/APPROVED/SCHEDULED/BERTHED)만
+    # 대상이므로, 갱신 대상도 같은 조건으로 찾는다 — 이미 REJECTED된 행은
+    # 자원을 점유하지 않으므로 건드리지 않고 새로 만든다.
+    existing = await db.scalar(
+        select(BerthAssignment)
+        .where(
+            BerthAssignment.berth_id == result.selected_berth.berth_id,
+            func.upper(func.btrim(BerthAssignment.call_sign))
+            == request.call_sign.strip().upper(),
+            BerthAssignment.status.in_(STATUS_ACTIVE),
+            BerthAssignment.planned_window.op("&&")(
+                func.tstzrange(request.window_start, request.window_end, "[)")
+            ),
+        )
+        .order_by(BerthAssignment.created_at.desc())
+        .limit(1)
+    )
+
+    if existing is not None:
+        # planned_window·slot_no·berth_id는 건드리지 않는다 — 같은 배가 같은
+        # 시간대를 다시 확정하는 것이므로 점유 자원 자체는 바뀌지 않는다.
+        #
+        # status를 APPROVED로 올리는 이유: 이 엔드포인트의 동작 자체가 승인이다.
+        # arrival_watcher가 만든 REQUESTED 행을 관제사가 콘솔에서 확정하는 경로가
+        # 여기라, approved_by만 채우고 status를 REQUESTED로 두면 "누가 승인했는지는
+        # 적혀 있는데 승인되지 않은 행"이라는 모순 상태가 남는다.
+        #
+        # assignment_reason과 rejected_candidates는 둘 다 이번 판정(result)에서
+        # 나온 값이라 함께 갱신한다 — 한쪽만 바꾸면 요약문과 판정 근거가 서로
+        # 다른 시점을 가리킨다. actual_* 도 위에서 방금 조회한 VTS 확인값이므로
+        # 같이 반영한다(모델 주석: "계획이 아니라 사후 확인값").
+        existing.status = STATUS_APPROVED
+        existing.approved_by = request.approved_by
+        existing.assignment_reason = result.summary
+        existing.rejected_candidates = result.decision_detail()
+        if actual_times:
+            existing.actual_berthing_at = actual_times["arrival_at_utc"]
+            existing.actual_departure_at = actual_times["departure_at_utc"]
+        existing.updated_at = now
+        await db.commit()
+        await db.refresh(existing)
+        return AssessAndCommitResult(
+            result=result, committed=True, assignment_id=existing.id,
+            not_committed_reason=None,
+        )
+
     assignment = BerthAssignment(
         call_sign=request.call_sign,
         imo_no=request.imo_no,

@@ -101,6 +101,12 @@ async def orchestrate(
         ),
     )
 
+    # 대체(SUBSTITUTABLE_WITH) 후보의 화물 적합성 게이트용(resolve_berth_assignment
+    # category 인자, 2026-08-21). 검증모드는 build_candidate_for_wharf_name이
+    # 카테고리를 계산하지 않으므로(이미 실제 배정된 선석을 확인만 하는 용도라
+    # 의도적으로 미필터) None으로 두고 게이트를 건너뛴다 — 탐색모드만 채운다.
+    cargo_category: str | None = None
+
     if request.assigned_wharf_name:
         # 검증모드 — top-3 재탐색 대신 이미 정해진 선석 하나만 확인한다.
         candidate, reason = await build_candidate_for_wharf_name(
@@ -139,6 +145,7 @@ async def orchestrate(
                 summary=_no_berth_summary(scheduling_result.cargo_category),
             )
         candidates_to_try = scheduling_result.candidates[:MAX_CANDIDATES_TO_TRY]
+        cargo_category = scheduling_result.cargo_category
 
     rejected: list[RejectedCandidate] = []
     for candidate in candidates_to_try:
@@ -149,6 +156,7 @@ async def orchestrate(
             vessel=request.vessel,
             window_start=request.window_start,
             window_end=request.window_end,
+            category=cargo_category,
         )
 
         if resolution.path == "정박지대기":

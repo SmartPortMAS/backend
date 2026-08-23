@@ -39,6 +39,14 @@ _QUERY_FIND_FREE_SLOT = text("""
         WHERE ba.berth_id = :berth_id AND ba.slot_no = gs.slot_no
           AND ba.status IN ('REQUESTED', 'APPROVED', 'SCHEDULED', 'BERTHED')
           AND ba.planned_window && tstzrange(:window_start, :window_end, '[)')
+          -- find_overlapping_reservations와 동일한 이유로 자기 예약은 점유로
+          -- 세지 않는다(2026-08-21 실측 재현 — 1슬롯 선석에서 이미 자기 배가
+          -- 그 슬롯을 쓰고 있는 상태로 assess-and-commit을 다시 부르면
+          -- "만석"으로 오판정돼 재확정이 막혔다).
+          AND (
+              CAST(:exclude_call_sign AS text) IS NULL
+              OR upper(btrim(ba.call_sign)) <> upper(btrim(CAST(:exclude_call_sign AS text)))
+          )
     )
     ORDER BY gs.slot_no
     LIMIT 1
@@ -101,12 +109,17 @@ async def find_overlapping_reservations(
 
 async def find_free_slot(
     db: AsyncSession, *, berth_id: str, window_start: datetime, window_end: datetime,
+    exclude_call_sign: str | None = None,
 ) -> int | None:
     """berth_id의 슬롯(1..max_concurrent_vessels) 중 요청 시간대와 안 겹치는 가장
     작은 slot_no를 찾는다. 전부 찼으면(만석) None.
 
     upa_berth_facility.berth_vessel_count가 없는 선석(결측 또는 미매칭)은 1로
     간주한다 — 07 문서 §4.1.1의 기본값과 동일.
+
+    exclude_call_sign을 넘기면 그 배 자신의 기존 예약은 점유로 세지 않는다
+    (find_overlapping_reservations와 동일한 목적 — assess-and-commit이 이미
+    예약이 있는 배를 같은 시간대로 재확정할 때 자기 자신에게 막히지 않도록).
     """
     max_row = (
         await db.execute(_QUERY_MAX_CONCURRENT_VESSELS, {"berth_id": berth_id})
@@ -123,6 +136,7 @@ async def find_free_slot(
                 "max_concurrent_vessels": max_concurrent,
                 "window_start": window_start,
                 "window_end": window_end,
+                "exclude_call_sign": exclude_call_sign,
             },
         )
     ).first()
