@@ -113,8 +113,7 @@ async def build_safety_index(db: AsyncSession, driver: AsyncDriver) -> dict:
     if cargo_berths:
         axes.append(_axis(
             "혼재 안전", (1 - len(seg_berths) / cargo_berths) * 100,
-            f"화물 재항 {cargo_berths}개 선석 중 격리 위반 {len(seg_berths)}개 "
-            f"(safety 규칙엔진 판정)",
+            f"화물 재항 {cargo_berths}개 선석 중 격리 위반 {len(seg_berths)}개",
         ))
     else:
         axes.append(_axis("혼재 안전", None, "재항 화물 없음 — 판정 대상 없음"))
