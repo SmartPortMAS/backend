@@ -25,10 +25,14 @@ RETURN c.cargo_category AS category
 """
 
 # onsan_scope: 온산 MVP 대상 선석인지(berth_neo4j_loader.ONSAN_SCOPE_WHARF_NAMES).
-# WHERE로 거르지 않고 값만 실어 보낸다 — 후보풀 제한은 하드 필터가 아니라
-# service.py의 정렬 우선순위로 처리하기 때문이다. 하드로 거르면 온산에 적합
-# 선석이 3개 미만인 화물(원유는 온산 부이 2기뿐)에서 후보가 줄거나 0이 된다.
-# 속성이 없는 그래프(로더 재적재 전)에서는 NULL이 오므로 호출부가 falsy로 다룬다.
+#
+# [2026-08-21] WHERE 하드 필터로 승격했다 — 대시보드 지도(PortMap.jsx, 선석
+# 배정현황 지도 둘 다)가 온산항 범위만 보여주는데 스케줄링 에이전트는 울산항
+# 전체 69개 선석을 후보로 삼고 있어 "지도에는 없는 선석이 배정됐다"는 불일치가
+# 있었다. 이제 이 스코프 밖 화물(케미칼류/유류/원유 외 — 예: LPG·컨테이너·벌크
+# 전용 선석만 취급하는 화물)은 후보가 0개로 나온다 — 이는 의도된 동작이다
+# (현재 MVP 범위 자체가 온산 액체화물 선석으로 한정됐기 때문).
+# 속성이 없는 그래프(로더 재적재 전)에서는 NULL이 오므로 coalesce로 방어한다.
 #
 # 08_스케줄링_전면재설계_자동배정_설계문서.md §4.1.3-A is_eligible 3·4번 게이트를
 # 여기 통합했다(2026-08-19):
@@ -46,6 +50,7 @@ RETURN c.cargo_category AS category
 _CYPHER_FIND_ELIGIBLE_BERTHS = """
 MATCH (b:Berth)-[:HANDLES]->(:CargoCategory {name: $category})
 WHERE b.depth_m IS NOT NULL AND b.depth_m >= $min_depth
+  AND coalesce(b.onsan_scope, false) = true
   AND ($dwt_t IS NULL OR b.berth_capacity IS NULL OR $dwt_t <= b.berth_capacity)
   AND (b.length_m IS NOT NULL OR $dwt_t >= $vlcc_buoy_dwt_threshold)
 RETURN b.id AS berth_id, b.wharf_name AS wharf_name, b.port_name AS port_name,
@@ -60,8 +65,15 @@ ORDER BY b.depth_m DESC
 # 온산 MVP(feature/onsan-mvp) 이식: 전용 선석이 점유 중일 때 같은 운영사/파이프라인
 # 안에서 대체 가능한 선석을 찾는다(build_substitutability.py의 SUBSTITUTABLE_WITH
 # 관계). ADJACENT_TO(물리적 인접 = 혼재위험)와는 완전히 별도 관계다.
+#
+# [2026-08-21] onsan_scope 하드 필터 추가 — _CYPHER_FIND_ELIGIBLE_BERTHS(1순위
+# 후보)에는 있었지만 이 대체 후보 쿼리에는 빠져 있었다. 그 결과 전용 선석이
+# 점유 중이면 SUBSTITUTABLE_WITH 그래프를 타고 온산 스코프 밖 선석(예: 잡화·목재
+# 취급 용연부두)까지 대체 후보로 나올 수 있었다 — 대시보드 지도는 온산항 범위만
+# 그리므로 "지도에 없는 선석이 배정됨" 불일치가 1순위 경로와 동일하게 재발한다.
 _CYPHER_FIND_SUBSTITUTABLE_BERTHS = """
 MATCH (b:Berth {id: $berth_id})-[r:SUBSTITUTABLE_WITH]->(target:Berth)
+WHERE coalesce(target.onsan_scope, false) = true
 RETURN target.id AS berth_id, target.wharf_name AS wharf_name, target.port_name AS port_name,
        target.depth_m AS depth_m, target.berth_group AS berth_group,
        target.latitude AS latitude, target.longitude AS longitude,

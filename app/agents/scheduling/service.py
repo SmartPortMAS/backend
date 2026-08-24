@@ -227,11 +227,11 @@ async def find_berth_candidates(
     # 여유 선석 우선 → 수심 여유가 작은(딱 맞는) 순 → unload_capacity 소프트 타이브레이크.
     # (08_스케줄링_전면재설계_자동배정_설계문서.md §4.1.3-A, 2026-08-19)
     #
-    # "온산 스코프 우선"을 정렬 1순위로 두던 것은 이번 설계에서 뺐다 — 이 함수는
-    # 이제 울산항 전체 69개 선석을 대상으로 하는 통합 게이트라, 특정 항역을
-    # 구조적으로 우선시키는 기준을 남기면 카테고리·부이 게이트와 뒤섞여 "왜 이
-    # 선석이 저 선석보다 위인지" 설명이 복잡해진다(onsan_scope 값 자체는
-    # BerthCandidate에 참고용으로 계속 실어 보낸다).
+    # "온산 스코프 우선"을 정렬 키로 두지 않는다 — [2026-08-21] find_eligible_berths가
+    # graph_queries._CYPHER_FIND_ELIGIBLE_BERTHS에서 onsan_scope를 이미 하드 필터로
+    # 적용하므로(대시보드 지도와 배정 범위를 온산항으로 일치시키기 위함) 여기 도달하는
+    # 후보는 전부 onsan_scope=true다 — 정렬 기준으로 삼을 변별력이 없다. 값 자체는
+    # BerthCandidate에 참고용으로 계속 실어 보낸다.
     #
     # 두 번째 키는 "여유가 큰 순"이 아니라 "잘 맞는 순"이다(best fit) — 예전엔
     # -draught_margin_m이라 여유가 가장 큰 선석이 1순위였는데, 그 결과 흘수 6m짜리
@@ -397,8 +397,23 @@ async def resolve_berth_assignment(
     vessel: VesselSpec,
     window_start: datetime,
     window_end: datetime,
+    category: str | None = None,
 ) -> BerthResolution:
     """전용 선석(candidate)이 점유 중일 때 대체 -> 정박지 3단계로 재배정을 시도한다.
+
+    category(선택): 탐색모드(find_berth_candidates)에서 확정된 화물 카테고리.
+    주어지면 대체 후보의 SUBSTITUTABLE_WITH.shared_products에 이 카테고리가
+    포함된 경우만 배정한다 — 없으면(검증모드, build_candidate_for_wharf_name은
+    카테고리를 계산하지 않는다) 이 게이트를 건너뛴다(기존 동작 유지).
+    [2026-08-21] 대체 후보는 depth_m/DWT/점유만 확인하고 화물 적합성은 확인하지
+    않았다 — SUBSTITUTABLE_WITH 자체가 "같은 운영사 + 카테고리 겹침"으로 미리
+    계산되긴 하지만(berth_neo4j_loader.compute_substitutability_pairs) 그건
+    두 선석의 전체 취급화물 교집합일 뿐, 지금 배정하려는 화물이 그 교집합
+    안에 있다는 보장이 아니다(실측: 유류 전용 달포부두가 점유 중이라 잡화·목재
+    부두 용연부두로 디젤이 대체 배정됨 — shared_products="잡화"였는데 그걸
+    검증 없이 그대로 받아들였다). onsan_scope 하드필터(위 쿼리 수정)로 이
+    특정 사례는 막히지만, 카테고리 자체를 확인하지 않는 구조적 gap은 남아있어
+    별도로 막는다.
 
     온산 MVP(feature/onsan-mvp) 이식: 액체화물 부두는 파이프라인이 특정 탱크단지로
     고정 연결된 전용부두라, 대체는 같은 운영사(SUBSTITUTABLE_WITH) 안에서만 가능하고
@@ -453,6 +468,14 @@ async def resolve_berth_assignment(
         ):
             trace.append(f"대체 후보 '{sub['wharf_name']}' 탈락: DWT {vessel.dwt_t} > 최대 {sub['to_max_dwt']}")
             continue
+        if category is not None:
+            shared = (sub.get("shared_products") or "").split("/")
+            if category not in shared:
+                trace.append(
+                    f"대체 후보 '{sub['wharf_name']}' 탈락: 화물 카테고리 '{category}' 미취급 "
+                    f"(공유화물: {sub.get('shared_products') or '없음'})"
+                )
+                continue
 
         # 점유 판정은 berth_assignment(우리 배정 기록)만 본다(2026-08-19,
         # find_berth_candidates와 동일 결정 — 위 주석 참고).
@@ -465,6 +488,23 @@ async def resolve_berth_assignment(
             continue
 
         trace.append(f"'{sub['wharf_name']}'(으)로 대체 배정 (공유화물: {sub.get('shared_products')})")
+
+        # 2026-08-21 수정 — 대체 선석은 원래(점유 중이라 탈락한) 선석과 물리적으로
+        # 다른 위치인데, 이전 코드는 candidate.adjacent_cargos(원래 선석의 인접
+        # 화물)를 그대로 복사해 썼다. 실측 확인(달포부두 대체 -> 북신항 에너지부두):
+        # 원래 선석의 이웃(정일컨부두·효성부두·온산1부두·온산2부두)과 대체 선석의
+        # 실제 이웃(신항북방파제 에너지부두)이 완전히 다르다 — 안전관제가 엉뚱한
+        # 화물을 검사하고 진짜 이웃은 아예 확인을 안 하는 결함이었다.
+        # find_berth_candidates/build_candidate_for_wharf_name과 동일하게 대체
+        # 선석 자신의 인접 화물을 새로 조회한다.
+        adjacency_map = await find_adjacent_categories(neo4j_driver, berth_ids=[sub["berth_id"]])
+        adjacent_wharf_names = list({
+            entry["adjacent_wharf_name"]
+            for entry in adjacency_map.get(sub["berth_id"], [])
+            if entry.get("adjacent_wharf_name")
+        })
+        real_cargo_by_wharf = await _real_adjacent_cargo_by_wharf(db, adjacent_wharf_names)
+
         substitute_candidate = BerthCandidate(
             rank=candidate.rank,
             berth_id=sub["berth_id"],
@@ -475,7 +515,9 @@ async def resolve_berth_assignment(
             onsan_scope=bool(sub.get("onsan_scope")),
             draught_margin_m=sub["depth_m"] - vessel.draught_m,
             occupancy_status=OccupancyStatus.AVAILABLE,
-            adjacent_cargos=candidate.adjacent_cargos,
+            adjacent_cargos=_adjacent_cargos_for(
+                adjacency_map.get(sub["berth_id"], []), real_cargo_by_wharf
+            ),
             latitude=sub.get("latitude"),
             longitude=sub.get("longitude"),
         )

@@ -21,8 +21,21 @@ from neo4j import AsyncDriver
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .graph_queries import find_imdg_segregation_conflicts, find_incompatible_conflicts
-from .rule_engine import compute_imdg_floor, compute_risk_floor
+from .bulk_compatibility import build_bulk_conflicts
+from .graph_queries import (
+    find_bulk_exceptions,
+    find_bulk_group_conflicts,
+    find_bulk_groups,
+    find_imdg_no_segregation_required,
+    find_imdg_segregation_conflicts,
+    find_incompatible_conflicts,
+)
+from .rule_engine import (
+    compute_bulk_compatibility_floor,
+    compute_imdg_costowage_floor,
+    compute_imdg_unconfirmed_floor,
+    compute_risk_floor,
+)
 from .schemas import RiskLevel, max_risk_level, risk_level_rank
 
 # 같은 선석에 함께 재항 중인 화물 목록. chem_id 가 있는 것만 판정에 쓰지만,
@@ -93,17 +106,70 @@ async def _segregation_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dic
             raw_imdg = await find_imdg_segregation_conflicts(
                 driver, target_chem_id=target["chem_id"], adjacent_chem_ids=other_ids
             )
-            if not raw_conflicts and not raw_imdg:
+
+            # 대상·인접 화물의 IMDG Class가 둘 다 알려져 있는데 위 조회에 안 걸린
+            # 쌍 — SEGREGATE 관계가 없다는 게 "공인 규정상 X(개별 확인 필요)"인지
+            # "이 Class 조합이 그래프 커버리지 밖"인지 구분이 안 되므로, 여기서
+            # "충돌 없음 = 안전"으로 조용히 넘기지 않는다(safety.rule_engine.
+            # compute_imdg_unconfirmed_floor와 동일한 원칙 — 판정 로직은 그쪽이
+            # 유일한 권위이므로 등급 계산은 반드시 그 함수를 그대로 호출한다).
+            confirmed_imdg_ids = {r["chem_id"] for r in raw_imdg}
+            # NO_SEGREGATION_REQUIRED로 확정된 조합(같은 Class끼리 등)은 미확인
+            # 대상에서 뺀다 — service.assess_safety와 동일한 이유(2026-08-21 발견,
+            # 벤젠-가솔린처럼 같은 Class끼리마다 근거 없는 주의 경고가 나던 문제).
+            confirmed_no_segregation_ids = await find_imdg_no_segregation_required(
+                driver, target_chem_id=target["chem_id"], adjacent_chem_ids=other_ids
+            )
+            unconfirmed_imdg = [
+                {
+                    "chem_id": o["chem_id"],
+                    "name_ko": o["cargo_name"],
+                    "segregation_code": "X(개별확인필요)",
+                }
+                for o in others
+                if o["imdg_class"]
+                and target["imdg_class"]
+                and o["chem_id"] not in confirmed_imdg_ids
+                and o["chem_id"] not in confirmed_no_segregation_ids
+            ]
+
+            # 벌크 액체화학물질 호환성 그룹 참고축(bulk_compatibility.py) — MSDS
+            # 텍스트 마이닝·IMDG 공인 격리표와 근거가 다른 제3의 신호. 2026-08-21부터
+            # Neo4j 그래프 조회로 판정한다(chem_id 기준 — service.assess_safety와
+            # 동일한 그래프·동일한 판정 함수를 그대로 재사용해, 이 화면과 개별 심사
+            # API·챗봇이 같은 질문에 다른 답을 내지 않게 한다).
+            bulk_group_rows = await find_bulk_group_conflicts(
+                driver, target_chem_id=target["chem_id"], adjacent_chem_ids=other_ids
+            )
+            bulk_groups = await find_bulk_groups(driver, chem_ids=[target["chem_id"], *other_ids])
+            bulk_safe_ids, bulk_blocked_ids = await find_bulk_exceptions(
+                driver, target_chem_id=target["chem_id"], adjacent_chem_ids=other_ids
+            )
+            raw_bulk = build_bulk_conflicts(
+                target_chem_id=target["chem_id"],
+                adjacent_chem_ids=other_ids,
+                adjacent_names={o["chem_id"]: (o["cargo_name"] or o["chem_id"]) for o in others},
+                group_conflict_ids={row["chem_id"] for row in bulk_group_rows},
+                groups_by_chem_id=bulk_groups,
+                safe_exception_ids=bulk_safe_ids,
+                blocked_exception_ids=bulk_blocked_ids,
+            )
+
+            if not raw_conflicts and not raw_imdg and not unconfirmed_imdg and not raw_bulk:
                 continue
 
             floor = max_risk_level(
-                compute_risk_floor(raw_conflicts), compute_imdg_floor(raw_imdg)
+                max_risk_level(
+                    max_risk_level(compute_risk_floor(raw_conflicts), compute_imdg_costowage_floor(raw_imdg)),
+                    compute_imdg_unconfirmed_floor(bool(unconfirmed_imdg)),
+                ),
+                compute_bulk_compatibility_floor(raw_bulk),
             )
             if risk_level_rank(floor) < risk_level_rank(RiskLevel.CAUTION):
                 continue
 
             name_of = {c["chem_id"]: (c["cargo_name"] or c["chem_id"]) for c in identified}
-            for raw in raw_conflicts + raw_imdg:
+            for raw in raw_conflicts + raw_imdg + unconfirmed_imdg + raw_bulk:
                 other_id = raw["chem_id"]
                 # (A,B)와 (B,A)는 같은 사건이라 한 번만 올린다
                 pair = tuple(sorted((target["chem_id"], other_id)))
@@ -115,6 +181,8 @@ async def _segregation_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dic
                 other_name = raw.get("name_ko") or name_of.get(other_id, other_id)
                 if "segregation_code" in raw:
                     why = f"IMDG 격리코드 {raw['segregation_code']}"
+                elif "reason" in raw:
+                    why = f"벌크호환성그룹(참고) — {raw['reason']}"
                 else:
                     why = f"혼재금지({raw.get('category', '분류 미상')})"
 
@@ -159,7 +227,7 @@ async def _segregation_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dic
             "berth_name": berth,
             "message": f"{berth}: {worst['text']} → {worst['risk_level'].value}{suffix}",
             "risk_level": worst["risk_level"].value,
-            "basis": "safety 규칙엔진(Neo4j 혼재금지 + IMDG 격리표)",
+            "basis": "safety 규칙엔진(Neo4j 혼재금지 + IMDG 격리표 + 벌크호환성그룹 참고축)",
             "pair_count": len(pairs),
             "details": [p["text"] for p in pairs],
             # 화면이 경고 → 선박 상세로 갈 수 있게 하는 유일한 키.

@@ -83,7 +83,7 @@ async def main(verbose: bool) -> None:
             s = stat[layer]
             s["n"] += 1
 
-            matches, unresolved = await resolve_chemical_names(db, client, [name])
+            matches, unresolved, _ = await resolve_chemical_names(db, client, [name])
 
             # ── none: 미등재 물질은 해석되지 않아야 한다 ─────────────────────
             if layer == "none":
