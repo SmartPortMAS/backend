@@ -8,6 +8,7 @@ from fastapi.routing import APIRoute
 from sqlalchemy import text
 
 from app.api.v1.approvals import router as approvals_router
+from app.api.v1.arrivals import router as arrivals_router
 from app.api.v1.chatbot import router as chatbot_router
 from app.api.v1.dashboard import router as dashboard_router
 from app.api.v1.health import router as health_router
@@ -131,6 +132,7 @@ app.include_router(dashboard_router, prefix="/api/v1")
 app.include_router(chatbot_router, prefix="/api/v1")
 app.include_router(rag_router, prefix="/api/v1")
 app.include_router(approvals_router, prefix="/api/v1")
+app.include_router(arrivals_router, prefix="/api/v1")
 
 
 @app.get("/health", summary="서비스 상태 확인")
