@@ -227,7 +227,7 @@ async def _segregation_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dic
             "berth_name": berth,
             "message": f"{berth}: {worst['text']} → {worst['risk_level'].value}{suffix}",
             "risk_level": worst["risk_level"].value,
-            "basis": "safety 규칙엔진(Neo4j 혼재금지 + IMDG 격리표 + 벌크호환성그룹 참고축)",
+            "basis": "혼재금지 · IMDG 격리 · 벌크 호환성 기준",
             "pair_count": len(pairs),
             "details": [p["text"] for p in pairs],
             # 화면이 경고 → 선박 상세로 갈 수 있게 하는 유일한 키.
