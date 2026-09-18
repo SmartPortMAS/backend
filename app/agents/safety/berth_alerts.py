@@ -49,9 +49,9 @@ _QUERY_BERTH_CARGO = text("""
 
 # 흘수 판정은 뷰가 이미 결론을 내려뒀다 — 여기서는 옮겨 적기만 한다.
 _QUERY_DRAUGHT_ALERTS = text("""
-    SELECT callsgn, facility_name, ukc_m, ukc_required_m, draught_verdict
+    SELECT callsgn, facility_name, ukc_m, ukc_required_m, draught_verdict, chart_depth_max_m
     FROM mart.berth_draught_check
-    WHERE draught_verdict IN ('NOT_ALLOWED', 'MARGINAL')
+    WHERE draught_verdict IN ('NOT_ALLOWED', 'MARGINAL', 'CHECK')
     ORDER BY ukc_m NULLS LAST
 """)
 
@@ -244,14 +244,24 @@ async def _draught_alerts(db: AsyncSession) -> list[dict]:
     rows = (await db.execute(_QUERY_DRAUGHT_ALERTS)).mappings().all()
     out = []
     for row in rows:
-        not_allowed = row["draught_verdict"] == "NOT_ALLOWED"
+        verdict = row["draught_verdict"]
+        not_allowed = verdict == "NOT_ALLOWED"
         ukc = f"UKC {row['ukc_m']:.2f} m" if row["ukc_m"] is not None else "UKC 산출 불가"
+        if verdict == "CHECK":
+            # 선석별 수심이 다른 부두(SK5 7~11m 등) — 가장 얕은 선석 기준으론 부족하지만
+            # 깊은 선석이면 된다. VTS 기록에 선석 번호가 없어 시스템은 어느 선석인지
+            # 모르므로 '불가'가 아니라 '확인 요청'이다(mart_views.sql 5-1절 berth_range).
+            message = (f"{row['facility_name'] or '부두 미상'}: {row['callsgn']} "
+                       f"접안 선석 확인 요청 — 가장 얕은 선석 기준 {ukc}, "
+                       f"가장 깊은 선석({row['chart_depth_max_m']} m)이면 여유 있음")
+        else:
+            message = (f"{row['facility_name'] or '부두 미상'}: {row['callsgn']} "
+                       f"흘수 여유 부족 ({ukc}, {verdict})")
         out.append({
-            "level": "DANGER" if not_allowed else "WARNING",
+            "level": "DANGER" if not_allowed else ("INFO" if verdict == "CHECK" else "WARNING"),
             "type": "DRAUGHT",
             "berth_name": row["facility_name"],
-            "message": f"{row['facility_name'] or '부두 미상'}: {row['callsgn']} "
-                       f"흘수 여유 부족 ({ukc}, {row['draught_verdict']})",
+            "message": message,
             "risk_level": None,
             "basis": "mart.berth_draught_check (조위 반영 가용수심)",
             # 흘수 경고는 배 한 척의 문제다 — 그 배로 바로 갈 수 있게 한다

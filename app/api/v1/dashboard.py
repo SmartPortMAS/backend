@@ -331,13 +331,15 @@ async def get_vessel_positions(db: AsyncSession = Depends(get_session)) -> list[
 _QUERY_DRAUGHT_CHECK = text("""
     SELECT callsgn, facility_name, chart_depth_m, tide_level_m, available_depth_m,
            vessel_draught_m, ukc_m, ukc_required_m, draught_verdict,
-           tide_observed_at_utc, draught_observed_at_utc, arrival_at_utc
+           tide_observed_at_utc, draught_observed_at_utc, arrival_at_utc,
+           chart_depth_max_m
     FROM mart.berth_draught_check
     ORDER BY CASE draught_verdict
                  WHEN 'NOT_ALLOWED' THEN 0
                  WHEN 'MARGINAL' THEN 1
-                 WHEN 'UNKNOWN' THEN 2
-                 ELSE 3
+                 WHEN 'CHECK' THEN 2      -- 선석별 수심 다름 → 접안 선석 확인 요청
+                 WHEN 'UNKNOWN' THEN 3
+                 ELSE 4
              END, arrival_at_utc DESC
 """)
 
