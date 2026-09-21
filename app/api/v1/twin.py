@@ -29,6 +29,7 @@
   변동은 예측할 수 없다 — 화면은 "예보 기준 전망"으로 표기한다.
 """
 
+import asyncio
 import math
 import statistics
 from datetime import datetime, timedelta, timezone
@@ -98,11 +99,16 @@ async def _tide_extremes_for(day_kst) -> list[tuple[datetime, float]]:
     hit = _tide_cache.get(ds)
     if hit and now - hit[0] < _TIDE_CACHE_TTL:
         return hit[1]
+    params = {"serviceKey": key, "type": "json", "obsCode": _TIDE_STATION,
+              "reqDate": ds, "numOfRows": 20, "pageNo": 1}
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(_TIDE_URL, params={
-            "serviceKey": key, "type": "json", "obsCode": _TIDE_STATION,
-            "reqDate": ds, "numOfRows": 20, "pageNo": 1,
-        })
+        # 포털 게이트웨이 504 는 일시적인 경우가 많다(2026-09-22 새벽 8일 중 5일이 504) —
+        # 서버 오류일 때만 한 번 더 묻는다. 실패는 캐시에 남기지 않아 다음 조회 때 다시 시도된다.
+        for attempt in range(2):
+            resp = await client.get(_TIDE_URL, params=params)
+            if resp.status_code < 500 or attempt == 1:
+                break
+            await asyncio.sleep(1.0)
     resp.raise_for_status()
     items = (((resp.json().get("body") or {}).get("items") or {}).get("item")) or []
     if isinstance(items, dict):
@@ -300,15 +306,24 @@ async def get_outlook(
         "tide_observed_at_utc": _iso(wx.get("tide_observed_at_utc")),
     }
 
-    # 조위 예측 — 오늘 앞뒤 며칠의 고·저조를 받아 잇고, 최근 72시간 실측과의 차이를 보정한다
-    tide_forecast, extremes, bias_cm = None, [], None
-    try:
-        today = now.astimezone(_KST).date()
-        for off in range(-3, 5):
-            extremes += await _tide_extremes_for(today + timedelta(days=off))
-        extremes.sort()
-    except Exception as e:   # noqa: BLE001 — 조위 예측이 없어도 기상 전망은 보여준다
-        extremes, tide_forecast = [], {"error": f"조석예보 조회 실패 — {e}"}
+    # 조위 예측 — 오늘 앞뒤 며칠의 고·저조를 받아 잇고, 최근 72시간 실측과의 차이를 보정한다.
+    # 날짜별로 따로 받는다: 공공데이터포털이 하루치에서 504 를 내는 일이 실제로 있었고
+    # (2026-09-22 00:45, 9/26 분), 그 한 번으로 나머지 날까지 버리면 안 된다.
+    # ★ 실패 사유에 예외 문구를 그대로 넣지 않는다 — httpx 예외 문구에는 요청 주소가 통째로
+    #   들어 있어 serviceKey 가 응답으로 새어 나갔다(9/22 발견). 상태 코드·예외 이름만 적는다.
+    tide_forecast, extremes, bias_cm, tide_failures = None, [], None, []
+    today = now.astimezone(_KST).date()
+    for off in range(-3, 5):
+        day = today + timedelta(days=off)
+        try:
+            extremes += await _tide_extremes_for(day)
+        except httpx.HTTPStatusError as e:
+            tide_failures.append(f"{day:%m-%d} HTTP {e.response.status_code}")
+        except Exception as e:   # noqa: BLE001 — 조위 예측이 없어도 기상 전망은 보여준다
+            tide_failures.append(f"{day:%m-%d} {type(e).__name__}")
+    extremes.sort()
+    if not extremes and tide_failures:
+        tide_forecast = {"error": "조석예보 조회 실패 — " + ", ".join(tide_failures)}
     if extremes:
         obs = (await db.execute(_Q_TIDE_OBS, {"start": now - timedelta(hours=72)})).mappings().all()
         resid = [o["tide_level_cm"] - p for o in obs
@@ -319,6 +334,8 @@ async def get_outlook(
             "bias_cm": bias_cm,
             "bias_basis": f"최근 72시간 실측 {len(resid)}점과 예보의 차이 중앙값",
             "note": "천문조만 예보 — 바람·기압에 의한 앞으로의 변동은 반영 못 함",
+            # 받지 못한 날 — 그 날에 걸린 시각은 조위 없이(기상만) 판정된다
+            "missing_days": tide_failures,
             "extremes": [{"at_utc": _iso(t), "tide_cm": h, "tide_m": round((h + (bias_cm or 0)) / 100, 2)}
                          for t, h in extremes if now <= t <= now + timedelta(hours=hours)],
         }
