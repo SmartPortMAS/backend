@@ -173,13 +173,17 @@ async def find_berth_candidates(
 
     berth_ids = [row["berth_id"] for row in eligible]
 
-    # 점유 판정은 우리 시스템 자신의 배정 기록(berth_assignment)만 본다 — VTS
-    # 실측(upa_port_call)은 안 쓴다(2026-08-19 결정). 이 스케줄링 에이전트가 선석을
-    # 직접 배정하는 주체이므로, 점유 여부도 그 배정 기록 스스로가 기준이어야
-    # 한다는 설계 의도다. VTS 관측을 섞으면 "우리가 배정한 게 아닌데도 점유"라는
-    # 모순이 생기고(실측: 출항 미기록 유령 재항 3,910건, 최고 8개월분 — VTS 데이터
-    # 자체의 신뢰도가 이 판단에 못 미쳤다), 애초에 스케줄링 에이전트를 두는 이유
-    # (우리 기준으로 직접 배정)와도 맞지 않는다.
+    # [2026-09-22] 이 주석은 "점유 판정은 우리 배정 기록(berth_assignment)만 본다 —
+    # 이 에이전트가 선석을 직접 배정하는 주체이므로"라고 적혀 있었다. 둘 다 더는
+    # 사실이 아니다. 우리는 배정하지 않고(방향 C), berth_assignment 표는 alembic
+    # 0027 이 지웠다.
+    #
+    # 지금 점유는 **실측 위치**로 본다(mart.vessel_presence, occupancy.py).
+    # VTS 사후 이력(upa_port_call)을 안 쓴다는 2026-08-19 결정은 그대로 유효하다 —
+    # 출항 미기록 유령 재항이 3,910건(최고 8개월분) 있었다. 그건 사후 이력의 문제고,
+    # 실시간 위치에는 그 문제가 구조적으로 없다.
+    #
+    # 점유는 탈락 사유가 아니라 표시 항목이다(백테스트 S2 — 정보로 강등).
     reservation_map = await find_overlapping_reservations(
         db, berth_ids=berth_ids, window_start=request.window_start,
         window_end=request.window_end, exclude_call_sign=request.vessel.call_sign,
@@ -369,9 +373,34 @@ async def build_candidate_for_wharf_name(
     # 같은 기준. 검증모드라고 더 느슨하게 볼 이유가 없다 — 같은 배가 같은
     # 안전여유 기준을 통과해야 한다.
     if actual_margin_m < draught_margin_m:
+        # [2026-09-22] '선석 확인 요청' 을 먼저 가린다 — mart.berth_draught_check 의
+        # CHECK 판정과 같은 규칙이다.
+        #
+        # 한 부두 안에서도 선석마다 수심이 다르다(실측: 4부두 9~11m · SK2부두 7.5~8m).
+        # 위 depth_m 은 그중 가장 얕은 값이고, 우리는 이 배가 몇 번 선석에 붙는지
+        # 모른다 — VTS·PORT-MIS 어느 쪽도 선석 번호를 주지 않는다. 가장 깊은
+        # 선석이면 기준을 넘는 경우, 시스템이 할 말은 "불가"가 아니라 "어느 선석인지
+        # 확인"이다. 항만은 수심이 맞는 선석에 배정하기 때문이다.
+        #
+        # 근거 부족(True)으로 돌려보내 '판정불가'가 되게 한다. 부적합으로 적으면
+        # 실제로는 붙어도 되는 배에 하역보류가 걸린다.
+        depth_max_m = berth.get("depth_max_m")
+        if depth_max_m is not None and depth_max_m > berth["depth_m"] \
+                and (depth_max_m + tide_m - vessel.draught_m) >= draught_margin_m:
+            return None, (
+                f"선석 '{canonical_wharf_name}'은 선석마다 수심이 달라"
+                f"(가장 얕은 곳 {berth['depth_m']}m · 가장 깊은 곳 {depth_max_m}m) "
+                f"어느 선석에 접안하는지 확인이 필요합니다 — 가장 깊은 선석이면 "
+                f"흘수 {vessel.draught_m}m 에 여유가 있습니다."
+            ), True
+        # 조위에 편차 보정이 들어갔으면 얼마를 더했는지 문장에 남긴다 — 관제사가
+        # 예보 원값과 다른 숫자를 보고 의아해하지 않게(services/tide.py 한계 ②).
+        bias_note = (
+            f", 실측 보정 {tide.bias_cm:+.1f}cm" if tide.bias_sample_n else ""
+        )
         return None, (
             f"선석 '{canonical_wharf_name}' 가용수심 {available_depth_m:.2f}m"
-            f"(해도 {berth['depth_m']}m + 체류 중 최저 조위 {tide_m:+.2f}m, "
+            f"(해도 {berth['depth_m']}m + 체류 중 최저 조위 {tide_m:+.2f}m{bias_note}, "
             f"{tide.at_utc:%m-%d %H:%M}Z) 대비 흘수여유가 {actual_margin_m:.2f}m로 "
             f"요구 기준({draught_margin_m}m)에 못 미칩니다(선박 흘수 {vessel.draught_m}m)."
         ), False
@@ -590,12 +619,12 @@ async def resolve_berth_assignment(
     anchorage_row = select_anchorage_for_dwt(vessel.dwt_t, anchorage_candidates)
     if anchorage_row is None:
         if vessel.dwt_t is None:
-            trace.append("선박 DWT 미상 -> 톤수별 정박지 매칭 불가 -> 배정불가")
+            trace.append("선박 DWT 미상 -> 톤수별 정박지 매칭 불가 -> 제안불가")
         elif vessel.dwt_t >= VLCC_BUOY_DWT:
-            trace.append(f"DWT {vessel.dwt_t} >= {VLCC_BUOY_DWT}(VLCC급) -> 정박지 대신 부이/외해 대기 필요 -> 배정불가")
+            trace.append(f"DWT {vessel.dwt_t} >= {VLCC_BUOY_DWT}(VLCC급) -> 정박지 대신 부이/외해 대기 필요 -> 제안불가")
         else:
-            trace.append(f"DWT {vessel.dwt_t}에 맞는 정박지 없음 -> 배정불가")
-        return BerthResolution(path="배정불가", trace=trace)
+            trace.append(f"DWT {vessel.dwt_t}에 맞는 정박지 없음 -> 제안불가")
+        return BerthResolution(path="제안불가", trace=trace)
 
     trace.append(f"정박지 '{anchorage_row['name']}' 대기 배정")
     return BerthResolution(
