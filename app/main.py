@@ -17,6 +17,7 @@ from app.api.v1.orchestrator import router as orchestrator_router
 from app.api.v1.rag import router as rag_router
 from app.api.v1.safety import router as safety_router
 from app.api.v1.scheduling import router as scheduling_router
+from app.api.v1.twin import router as twin_router
 from app.api.v1.weather import router as weather_router
 from app.config import get_settings
 from app.core.logging import configure_logging
@@ -131,6 +132,7 @@ app.include_router(orchestrator_router, prefix="/api/v1")
 app.include_router(dashboard_router, prefix="/api/v1")
 app.include_router(chatbot_router, prefix="/api/v1")
 app.include_router(rag_router, prefix="/api/v1")
+app.include_router(twin_router, prefix="/api/v1")
 app.include_router(approvals_router, prefix="/api/v1")
 app.include_router(arrivals_router, prefix="/api/v1")
 
