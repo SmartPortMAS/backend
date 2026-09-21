@@ -28,7 +28,20 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+def _has_column() -> bool:
+    return bool(op.get_bind().execute(sa.text(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = 'portmis_vessel' AND column_name = 'arrival_report_type'"
+    )).scalar())
+
+
 def upgrade() -> None:
+    # ★ 멱등 처리 — 한동안 이 마이그레이션이 다른 파일명·같은 리비전("0018")로도
+    #   존재했다. 그쪽을 적용한 DB 는 alembic_version 이 0018 을 가리키지만 실제로
+    #   적용된 내용이 달라, 재실행 시 컬럼이 이미 있는 채로 이 리비전을 다시 만난다.
+    #   그대로 두면 DuplicateColumn 으로 업그레이드 전체가 막힌다.
+    if _has_column():
+        return
     op.add_column(
         "portmis_vessel",
         sa.Column(
@@ -39,4 +52,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_column("portmis_vessel", "arrival_report_type")
+    if _has_column():
+        op.drop_column("portmis_vessel", "arrival_report_type")
