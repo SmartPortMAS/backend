@@ -242,7 +242,7 @@ class RagAssessment(BaseModel):
 
     risk_level: str = Field(
         description="최종 위험등급. 이 값을 결론으로 표시할 것(답변 문장이 아니라).",
-        examples=["안전", "주의", "위험", "하역불가"],
+        examples=["안전", "주의", "위험", "배정불가"],
     )
     rule_engine_floor: str = Field(
         description="규칙엔진이 보장한 하한. LLM은 이보다 낮출 수 없다.", examples=["주의"]
