@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     kosha_api_key: str | None = None
     port_mis_api_key: str | None = None
     mof_api_key: str | None = None
+    # 국립해양조사원 조석예보(고·저조) — 정밀 검토 "앞으로 72시간" 흘수 여유에 쓴다(api/v1/twin.py).
+    # 이 서비스는 공공데이터포털이 새 형식(64자리) 키로 발급해 기존 키와 다르다. 없으면
+    # 조위 예측 없이 기상 예보만으로 전망한다.
+    khoa_tide_fcst_key: str | None = None
     log_level: str = Field(default="INFO")
 
     model_config = SettingsConfigDict(
