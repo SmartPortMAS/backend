@@ -116,6 +116,40 @@ def _level_for_metric(
     return WorkStatus.NORMAL, None
 
 
+def wave_applies_to(wharf_name: str | None) -> bool:
+    """이 계선시설에 **외해 파고 관측**을 적용해도 되는가.
+
+    [2026-09-21, D2 ② — 9/17 회의 §6 "외해 부이 파고를 항내에 대입 13%p"]
+
+    우리가 가진 파고는 기상청 부이 22189 관측 하나다. **외해 값이다.** 방파제
+    안쪽 부두의 파고가 아니다. 그걸 항내 부두에 그대로 대입하면 방파제가 막아
+    주는 너울까지 부두에 친 것으로 계산된다.
+
+    실제로 그랬다. 2026-09-21 라이브 판정 26척 중 24척이 부적합이었고, 근거를
+    펼쳐 보니 전부 같은 모양이었다:
+
+        풍속 10.1m/s < 14.0m/s(중단 임계) - 정상
+        파고 2.0m >= 1.5m -> 하역중단          ← 외해 부이 값
+
+    SK6부두·4부두처럼 항내 깊숙한 부두까지 이 한 줄로 막혔다. 바람은 멀쩡한데
+    파고 하나로 항만 전체가 멈춘 셈이다.
+
+    부이 계류시설은 다르다 — 방파제 밖에 떠 있으므로 외해 파고가 곧 그 자리의
+    파고다. 그래서 이름에 '부이'가 들어간 시설에만 적용한다.
+
+    판별을 이름으로 하는 건 투박하지만 근거가 있다. 부이 계선시설은 마스터에서
+    전부 '…부이', 'S-Oil부이', 'SK부이 02' 처럼 표기되고, 부두는 '…부두'로
+    표기된다. 오경보 백테스트도 같은 규칙을 쓴다
+    (`backtest_false_alarm.py`: `is_buoy = "부이" in b["name"]`) — 두 곳이 같은
+    규칙을 써야 백테스트 숫자가 실제 판정의 숫자가 된다.
+
+    한계는 분명히 둔다. 이건 "항내 부두는 파고가 안전하다"는 뜻이 **아니다.**
+    "항내 부두의 파고를 우리가 모른다"는 뜻이다. 부두별 파고 관측이 생기면
+    그때 다시 축으로 넣어야 한다.
+    """
+    return "부이" in (wharf_name or "")
+
+
 def evaluate(
     *,
     wind_speed_ms: float | None,
@@ -125,6 +159,7 @@ def evaluate(
     threshold: BerthWeatherThresholdRow | None,
     extra_condition_active: bool = False,
     precip_mm: float | None = None,
+    wave_applies: bool = True,
 ) -> tuple[WorkStatus, list[str]]:
     """풍속/파고(+선택적으로 강수량)를 임계값과 비교해 심각도 최대 단계를 반환.
 
@@ -149,13 +184,19 @@ def evaluate(
         unberth=threshold.unberth_wind_ms,
         disconnect=threshold.disconnect_wind_ms,
     )
-    wave_status, wave_hit = _level_for_metric(
-        wave_height_m,
-        is_stale=wave_is_stale,
-        stop=threshold.stop_wave_m,
-        unberth=threshold.unberth_wave_m,
-        disconnect=threshold.disconnect_wave_m,
-    )
+    if wave_applies:
+        wave_status, wave_hit = _level_for_metric(
+            wave_height_m,
+            is_stale=wave_is_stale,
+            stop=threshold.stop_wave_m,
+            unberth=threshold.unberth_wave_m,
+            disconnect=threshold.disconnect_wave_m,
+        )
+    else:
+        # 적용 안 함 ≠ 판단불가. 이 구분이 핵심이다 — UNKNOWN 으로 두면
+        # '모르면 닫는다' 원칙에 걸려 항내 부두가 전부 잠긴다. 관측이 없는 게
+        # 아니라 **이 자리에 쓸 수 없는 관측**이라는 뜻이다(wave_applies_to 주석).
+        wave_status, wave_hit = WorkStatus.NORMAL, None
 
     status = _max_status(wind_status, wave_status)
     reasons: list[str] = []
@@ -170,7 +211,16 @@ def evaluate(
         # 보인다(2026-08-20 지적). 초과 케이스와 같은 형식으로 값을 보여준다.
         reasons.append(f"풍속 {wind_speed_ms}m/s < {threshold.stop_wind_ms}m/s(중단 임계) - 정상")
 
-    if wave_status is WorkStatus.UNKNOWN:
+    if not wave_applies:
+        # 값을 숨기지 않는다 — 관측치는 보여주되 판정에 안 썼다고 밝힌다.
+        # 관제사가 "그럼 파고는 본 거냐 안 본 거냐"를 묻지 않아도 되게.
+        reasons.append(
+            f"파고 {wave_height_m}m는 외해 부이(22189) 관측이라 이 항내 계선시설 판정에 "
+            "적용하지 않음 - 참고값"
+            if wave_height_m is not None
+            else "파고는 외해 부이 관측이라 이 항내 계선시설 판정에 적용하지 않음"
+        )
+    elif wave_status is WorkStatus.UNKNOWN:
         reasons.append("파고 관측치 없음 또는 기준 시각 대비 오래됨 - 판단 불가")
     elif wave_status is not WorkStatus.NORMAL:
         reasons.append(f"파고 {wave_height_m}m >= {wave_hit}m -> {wave_status.value}")
