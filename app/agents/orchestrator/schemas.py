@@ -91,6 +91,25 @@ class OrchestratorResult(BaseModel):
         "assigned_wharf_name과 다르면 True — 원래 있던 자리가 아니라 대체 선석으로 바뀌었다는 "
         "뜻이라 관제사가 바로 알아야 한다. 탐색모드에서는 항상 False.",
     )
+    suggested_alternatives: list[BerthCandidate] = Field(
+        default_factory=list,
+        description="배정된 시설이 부적합할 때 내놓는 **대체 선석 제안**(최대 3). "
+        "9/17 회의 §3 의 조치안 '대체선석'이다. **의견일 뿐 배정이 아니다** — 어떤 "
+        "자리도 잠그지 않고, 실제로 옮길지는 선석회의·VTS·터미널이 정한다. "
+        "적합 판정이면 비어 있다(옮길 이유가 없으므로).",
+    )
+    suggestion_note: str | None = Field(
+        default=None,
+        description="대체안을 못 찾았을 때 그 이유. 후보가 있으면 None. "
+        "'없음'과 '못 찾음'을 구분하려고 둔다.",
+    )
+    evidence_missing: bool = Field(
+        default=False,
+        description="결론이 '근거 부족'에서 나왔는가. True 면 판정 자체를 못 한 것이고"
+        "(계선시설 표기 미해소·조위 예보 없음 등), False 면 근거를 갖추고 내린 판정이다. "
+        "회의 §4 '근거 부족을 안전과 구분' — 이 값이 assessment_history.level 에서 "
+        "'판정불가'와 '부적합'을 가른다.",
+    )
     summary: str = Field(description="관제사가 읽을 종합 의견 (1~2문단)")
     berth_match_summary: str | None = Field(
         default=None,

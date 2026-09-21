@@ -52,7 +52,27 @@ MATCH (b:Berth)-[:HANDLES]->(:CargoCategory {name: $category})
 WHERE b.depth_m IS NOT NULL AND b.depth_m >= $min_depth
   AND coalesce(b.onsan_scope, false) = true
   AND ($dwt_t IS NULL OR b.berth_capacity IS NULL OR $dwt_t <= b.berth_capacity)
-  AND (b.length_m IS NOT NULL OR $dwt_t >= $vlcc_buoy_dwt_threshold)
+  // 게이트 4(부이 VLCC 전용) — 부이 판별을 **이름**으로 한다.
+  //
+  // [2026-09-21 수정] 예전 조건은 `b.length_m IS NOT NULL OR ...` 였다. 안벽 길이가
+  // 없으면 부이(해상 계류점)라고 본 것이다. 그 전제가 이 데이터에서 성립하지 않는다 —
+  // **온산 액체 선석 15석 중 14석에 length_m 이 없다**(2026-09-21 실측. 값이 있는 건
+  // 효성부두 240m 한 곳뿐). 부두들이 통째로 부이로 오분류됐고, dwt_t 가 NULL 이면
+  // (실시간 흐름은 항상 그렇다 — 어떤 소스도 DWT 를 주지 않는다) 이 조건이 NULL 로
+  // 평가돼 전부 탈락했다. 실제로 find_eligible_berths(category='유류') 가 수심 조건을
+  // 0 으로 낮춰도 **0건**을 돌려줬다 — 탐색·대체추천 경로가 통째로 죽어 있었다.
+  //
+  // 이름 판별은 근거가 있다. 부이 계선시설은 마스터에서 전부 '…부이'로 표기되고
+  // (S-Oil부이·석유공사부이·SK부이 02), 부두는 '…부두'다. 기상 판정의 파고 적용
+  // 범위도 같은 규칙을 쓴다(weather/rule_engine.wave_applies_to) — 한 시스템 안에서
+  // '부이'의 정의가 두 개이면 안 된다.
+  //
+  // 비대칭은 그대로 둔다: 부이는 dwt_t 를 확실히 알고 그 값이 VLCC 급일 때만 후보가
+  // 된다(설계문서 §4.1.3-A). 모르면 부이는 추천하지 않는다.
+  AND (
+        NOT b.wharf_name CONTAINS '부이'
+        OR ($dwt_t IS NOT NULL AND $dwt_t >= $vlcc_buoy_dwt_threshold)
+      )
 RETURN b.id AS berth_id, b.wharf_name AS wharf_name, b.port_name AS port_name,
        b.depth_m AS depth_m, b.berth_group AS berth_group,
        b.length_m AS length_m, b.berth_capacity AS max_dwt,

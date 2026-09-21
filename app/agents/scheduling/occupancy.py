@@ -1,12 +1,41 @@
-"""선석 점유 여부 조회 — berth_assignment(우리 시스템 배정 기록) 기준.
+"""선석 점유 조회 — **AIS 실측 접안** 기준.
 
-(2026-08-19 결정) 점유 판정은 upa_port_call(VTS 실측)이 아니라 berth_assignment만
-본다. 이 스케줄링 에이전트가 선석을 직접 배정하는 주체이므로, 점유 여부도 그
-배정 기록 스스로가 기준이어야 한다 — VTS 데이터를 섞으면 "우리가 배정한 게
-아닌데도 점유"라는 모순이 생기고, 애초에 스케줄링 에이전트를 두는 이유(우리
-기준으로 직접 배정)와도 맞지 않는다. 예전에 VTS(upa_port_call) 기반 점유 조회를
-같이 썼던 적이 있는데, 실측해보니 출항 미기록 상태로 방치된 "유령 재항" 기록이
-3,910건(최고 8개월분)이나 있어 데이터 신뢰도 자체가 이 판단에 못 미쳤다.
+[2026-09-21 전면 개편] 점유의 근거를 우리 표에서 현실로 옮겼다.
+
+이전 판은 `berth_assignment`(우리가 만든 예약)만 봤다. 그 전제는 "이 에이전트가
+선석을 직접 배정하는 주체이므로 점유도 그 배정 기록 스스로가 기준"이었다. 우리는
+배정 주체가 아니다(9/17 회의 §1, 방향 C). 그러면 남는 질문은 하나다 —
+
+    "지금 그 선석에 배가 실제로 붙어 있는가"
+
+그 답은 `mart.vessel_presence` 에 이미 있다. 뷰가 선박 위치로 선석·정박지를
+판정한다 — 신고 선석 1km 안이면 '신고+위치', 가장 가까운 선석 300m 안이면
+'위치', 좌표가 없는 부이 등은 '신고'(mart_views.sql 2-1절).
+
+[2026-09-22] `mart.berth_occupancy_live` 에서 옮겼다.
+  같은 질문에 뷰가 둘이라 답이 갈렸다. 실측(같은 스냅샷):
+      vessel_presence      접안 14척
+      berth_occupancy_live 접안  0척
+  후자는 now() 기준 30분 안의 위치만 PRESENT 로 봤는데, 그때 최신 위치가
+  6시간 33분 전이라 전부 NO_SIGNAL 로 떨어졌다 — 수집이 잠깐만 밀려도 점유가
+  통째로 0 이 되고, 그러면 이 에이전트는 "모든 선석이 비었다"고 답한다.
+
+[왜 upa_port_call(VTS 이력)이 아닌가]
+  2026-08-19 에 VTS 를 점유 근거에서 뺀 결정은 그대로 유효하다. 그건 **사후
+  이력**이고 출항 미기록 '유령 재항'이 3,910건(최고 8개월분) 있었다. 여기서
+  쓰는 건 사후 이력이 아니라 **실시간 위치**라 그 문제가 구조적으로 없다.
+
+[신선도]
+  판정은 최신 스냅샷 기준이라 수집이 밀려도 "마지막으로 본 상태"가 남는다.
+  낡은 정도는 `quality_flag`(OK/DEGRADED/STALE/NO_SIGNAL)와 `position_age_min`
+  으로 함께 돌려준다 — 호출부가 그 값을 보고 판단하게 두고, 여기서 조용히
+  버리지 않는다. 신호가 끊긴 배를 지우면 자리가 비었다고 잘못 말하게 된다.
+
+[이 값의 무게]
+  점유는 **판정 등급을 바꾸지 않는다.** 오경보 백테스트 S2 가 점유 초과를
+  정보로 강등했다 — PORT-MIS 출항 시각이 예정값이라 동시 계류를 과대 계산한다
+  (2026-09-21 실측 7/125 = 5.6%). 관제사에게 "지금 이 선석엔 이 배들이 붙어
+  있습니다"를 보여주는 **관측**이지, 부적합의 근거가 아니다.
 """
 
 from datetime import datetime
@@ -14,130 +43,85 @@ from datetime import datetime
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# ---------------------------------------------------------------------------
-# 슬롯 단위 점유 확인 (2026-08-19,
-# 08_스케줄링_전면재설계_자동배정_설계문서.md §4.2, §5.2 6번 게이트)
-#
-# 07 문서 §5.1이 이미 SQL을 설계해 뒀지만 실제 구현이 없었다(2026-08-19 확인 —
-# 이 파일 전체에 slot_no를 다루는 코드가 이거 추가 전까지 없었음). berth_assignment
-# EXCLUDE 제약이 (berth_id, slot_no, planned_window)로 걸려 있으므로, 새 추천을
-# INSERT하려면 어느 slot_no가 비어 있는지 먼저 알아야 한다 — 그렇지 않으면 슬롯
-# 2개 이상인 선석(69개 중 45%, 07 문서 §4.1.1)에서 실제로는 자리가 남았는데도
-# slot_no=1 하나만 쓰다가 EXCLUDE 위반으로 잘못 막히거나, 반대로 다른 배와 같은
-# slot_no를 노려 위반이 나는 것도 못 걸러낸다.
-# ---------------------------------------------------------------------------
-
 _QUERY_MAX_CONCURRENT_VESSELS = text("""
     SELECT berth_vessel_count FROM upa_berth_facility WHERE wharf_name = :berth_id
 """)
 
-_QUERY_FIND_FREE_SLOT = text("""
-    SELECT gs.slot_no
-    FROM generate_series(1, :max_concurrent_vessels) AS gs(slot_no)
-    WHERE NOT EXISTS (
-        SELECT 1 FROM berth_assignment ba
-        WHERE ba.berth_id = :berth_id AND ba.slot_no = gs.slot_no
-          AND ba.status IN ('REQUESTED', 'APPROVED', 'SCHEDULED', 'BERTHED')
-          AND ba.planned_window && tstzrange(:window_start, :window_end, '[)')
-          -- find_overlapping_reservations와 동일한 이유로 자기 예약은 점유로
-          -- 세지 않는다(2026-08-21 실측 재현 — 1슬롯 선석에서 이미 자기 배가
-          -- 그 슬롯을 쓰고 있는 상태로 assess-and-commit을 다시 부르면
-          -- "만석"으로 오판정돼 재확정이 막혔다).
-          AND (
-              CAST(:exclude_call_sign AS text) IS NULL
-              OR upper(btrim(ba.call_sign)) <> upper(btrim(CAST(:exclude_call_sign AS text)))
-          )
-    )
-    ORDER BY gs.slot_no
-    LIMIT 1
-""")
 
-
-_QUERY_OVERLAPPING_RESERVATIONS = text("""
-    SELECT berth_id, call_sign AS vessel_name,
-           lower(planned_window) AS arrival_at_utc, upper(planned_window) AS departure_at_utc
-    FROM berth_assignment
-    WHERE berth_id = ANY(CAST(:berth_ids AS text[]))
-      AND status IN ('REQUESTED', 'APPROVED', 'SCHEDULED', 'BERTHED')
-      AND planned_window && tstzrange(:window_start, :window_end, '[)')
-      -- 자기 자신이 잡아 둔 예약은 점유로 세지 않는다.
-      --
-      -- arrival_watcher 가 A 배에 B 선석을 추천해 REQUESTED 행을 만든 뒤,
-      -- 관제사가 콘솔에서 A 를 다시 판정하면 B 가 "점유 중(우리 시스템 배정
-      -- 기록 있음)"으로 나왔다. 자기 예약이 자기를 막은 것이라, 추천을 받은
-      -- 배는 승인 버튼이 뜨는 조건('승인가능')에 영원히 도달하지 못했다
-      -- (2026-08-21 실측 — 승인 대기 37건 전부 승인 불가 상태였다).
+# vp.berth_name 은 이미 wharf 테이블의 정본 표기다(뷰가 wharf 를 직접 참조한다).
+# mart.facility_alias 를 거치면 안 된다 — 별칭 사전은 wharf_name 당 행이 여럿이라
+# 조인이 척수를 뻥튀기한다(실측 오류: 2부두 실제 3척 -> 별칭 조인 시 9척).
+#
+# 뷰는 배 1척을 **한 구역 하나**에만 귀속시킨다(presence_zone). 그래서 반경이
+# 이웃 부두와 겹쳐도(실측 최단 간격: 용잠1/2 0m, 3/4부두 150m, UTK신항/한진신항
+# 190m) 중복 계수되지 않는다.
+_QUERY_LIVE_OCCUPANTS = text("""
+    SELECT vp.berth_name AS wharf_name, vp.callsgn, vp.vessel_name,
+           vp.berth_dist_m AS distance_m, vp.berth_basis,
+           vp.received_at_utc, vp.quality_flag, vp.position_age_min
+    FROM mart.vessel_presence vp
+    WHERE vp.presence_zone = 'BERTH'
+      AND vp.berth_name = ANY(CAST(:berth_ids AS text[]))
       AND (
           CAST(:exclude_call_sign AS text) IS NULL
-          OR upper(btrim(call_sign)) <> upper(btrim(CAST(:exclude_call_sign AS text)))
+          OR upper(btrim(vp.callsgn)) <> upper(btrim(CAST(:exclude_call_sign AS text)))
       )
+    ORDER BY vp.berth_name, vp.berth_dist_m NULLS LAST
 """)
+
+
+def _basis_label(row) -> str:
+    """점유 판정 근거 한 줄. 거리·신선도는 있을 때만 붙인다."""
+    parts = [f"위치 판정 {row['berth_basis'] or '근거 미상'}"]
+    if row["distance_m"] is not None:
+        parts.append(f"{int(row['distance_m'])}m")
+    if row["quality_flag"] and row["quality_flag"] != "OK":
+        parts.append(f"{row['quality_flag']} {row['position_age_min']}분 전")
+    return "(" + ", ".join(parts) + ")"
 
 
 async def find_overlapping_reservations(
     db: AsyncSession, *, berth_ids: list[str], window_start: datetime, window_end: datetime,
     exclude_call_sign: str | None = None,
 ) -> dict[str, list[dict]]:
-    """우리 시스템이 이미 REQUESTED~BERTHED로 잡아 둔 예약(berth_assignment) 중
-    요청 시간대와 겹치는 것 — 점유 판정의 유일한 근거(모듈 docstring 참고).
-    키는 berth_id다(wharf_name이 아니다 — berth_assignment.berth_id는
-    upa_berth_facility.wharf_name과 같은 값).
+    """지금 그 선석에 **실제로 붙어 있는 배**. 키는 wharf_name.
+
+    이름에 'reservations'가 남아 있지만 예약이 아니라 관측이다 — 호출부
+    (scheduling/service.py 3곳)를 건드리지 않으려고 시그니처를 유지했다.
+
+    `window_start`·`window_end` 는 쓰지 않는다. 실시간 접안은 '지금'의 사실이라
+    시간 구간이 없다. 미래 구간의 자리 상황을 알려면 예약이 있어야 하는데,
+    예약을 만드는 주체가 우리가 아니다 — 그래서 우리가 아는 건 현재뿐이다.
+    이 한계는 판정에 영향을 주지 않는다(모듈 docstring '이 값의 무게' 참고).
     """
     if not berth_ids:
         return {}
     rows = (
         await db.execute(
-            _QUERY_OVERLAPPING_RESERVATIONS,
-            {
-                "berth_ids": berth_ids, "window_start": window_start,
-                "window_end": window_end, "exclude_call_sign": exclude_call_sign,
-            },
+            _QUERY_LIVE_OCCUPANTS,
+            {"berth_ids": berth_ids, "exclude_call_sign": exclude_call_sign},
         )
     ).mappings().all()
+
     grouped: dict[str, list[dict]] = {}
     for row in rows:
-        grouped.setdefault(row["berth_id"], []).append(
+        grouped.setdefault(row["wharf_name"], []).append(
             {
-                "vessel_name": row["vessel_name"],
-                "arrival_at_utc": row["arrival_at_utc"],
-                "departure_at_utc": row["departure_at_utc"],
-                "source_facility_name": "(자동배정 예약)",
+                "vessel_name": row["vessel_name"] or row["callsgn"],
+                # 실시간 접안에는 계획 구간이 없다. 화면이 기대하는 키는 채우되
+                # 시작은 '관측 시각', 끝은 None(= 언제 뜰지 모른다)으로 둔다.
+                "arrival_at_utc": row["received_at_utc"],
+                "departure_at_utc": None,
+                # 판정 근거를 문장에 남긴다. 거리는 '신고'로만 잡힌 배(좌표 없는
+                # 부이 등)에는 없으므로 있을 때만 붙인다 — int(None) 으로 죽지 않게.
+                "source_facility_name": _basis_label(row),
             }
         )
     return grouped
 
 
-async def find_free_slot(
-    db: AsyncSession, *, berth_id: str, window_start: datetime, window_end: datetime,
-    exclude_call_sign: str | None = None,
-) -> int | None:
-    """berth_id의 슬롯(1..max_concurrent_vessels) 중 요청 시간대와 안 겹치는 가장
-    작은 slot_no를 찾는다. 전부 찼으면(만석) None.
-
-    upa_berth_facility.berth_vessel_count가 없는 선석(결측 또는 미매칭)은 1로
-    간주한다 — 07 문서 §4.1.1의 기본값과 동일.
-
-    exclude_call_sign을 넘기면 그 배 자신의 기존 예약은 점유로 세지 않는다
-    (find_overlapping_reservations와 동일한 목적 — assess-and-commit이 이미
-    예약이 있는 배를 같은 시간대로 재확정할 때 자기 자신에게 막히지 않도록).
-    """
-    max_row = (
-        await db.execute(_QUERY_MAX_CONCURRENT_VESSELS, {"berth_id": berth_id})
-    ).first()
-    # berth_vessel_count는 double precision이라 generate_series(integer, ...)에 그대로
-    # 못 넘긴다(타입 불일치) — int로 캐스팅해서 넘긴다.
-    max_concurrent = int(max_row[0]) if max_row and max_row[0] else 1
-
-    row = (
-        await db.execute(
-            _QUERY_FIND_FREE_SLOT,
-            {
-                "berth_id": berth_id,
-                "max_concurrent_vessels": max_concurrent,
-                "window_start": window_start,
-                "window_end": window_end,
-                "exclude_call_sign": exclude_call_sign,
-            },
-        )
-    ).first()
-    return row[0] if row else None
+async def berth_capacity(db: AsyncSession, *, berth_id: str) -> int:
+    """이 선석이 동시에 받을 수 있는 척수. 결측이면 1(07 문서 §4.1.1 기본값)."""
+    row = (await db.execute(_QUERY_MAX_CONCURRENT_VESSELS, {"berth_id": berth_id})).first()
+    # berth_vessel_count 는 double precision 이라 int 로 캐스팅해서 쓴다.
+    return int(row[0]) if row and row[0] else 1

@@ -27,11 +27,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.safety.schemas import RiskLevel, SafetyAssessmentRequest, SafetyAssessmentResult
 from app.agents.safety.service import assess_safety
-from app.agents.scheduling.schemas import BerthCandidate, SchedulingRequest, VesselSpec
+from app.agents.scheduling.schemas import (
+    BerthCandidate,
+    BerthResolution,
+    OccupancyStatus,
+    SchedulingRequest,
+    VesselSpec,
+)
 from app.agents.scheduling.service import (
     build_candidate_for_wharf_name,
     find_berth_candidates,
     resolve_berth_assignment,
+    suggest_alternative_berths,
 )
 from app.agents.weather.schemas import WeatherAssessmentRequest, WeatherAssessmentResult, WorkStatus
 from app.agents.weather.service import assess_weather
@@ -109,7 +116,7 @@ async def orchestrate(
 
     if request.assigned_wharf_name:
         # 검증모드 — top-3 재탐색 대신 이미 정해진 선석 하나만 확인한다.
-        candidate, reason = await build_candidate_for_wharf_name(
+        candidate, reason, evidence_missing = await build_candidate_for_wharf_name(
             db,
             neo4j_driver,
             wharf_name=request.assigned_wharf_name,
@@ -119,9 +126,26 @@ async def orchestrate(
             draught_margin_m=request.draught_margin_m,
         )
         if candidate is None:
+            # 배정된 시설이 **실제로** 안 맞는 경우에만 대체안을 찾는다(회의 §3 조치안).
+            # 근거 부족(표기 미해소·조위 예보 없음)이면 찾지 않는다 — 어디가
+            # 문제인지도 모르는 채로 다른 자리를 권하는 건 근거 없는 조언이다.
+            alternatives: list[BerthCandidate] = []
+            note = None
+            if not evidence_missing:
+                alternatives, note = await suggest_alternative_berths(
+                    db, neo4j_driver,
+                    cargo=request.cargo, vessel=request.vessel,
+                    window_start=request.window_start, window_end=request.window_end,
+                    exclude_wharf_name=request.assigned_wharf_name,
+                    draught_margin_m=request.draught_margin_m,
+                )
             return OrchestratorResult(
                 overall_decision=OverallDecision.NO_ELIGIBLE_BERTH,
                 weather_assessment=weather_result,
+                evidence_missing=evidence_missing,
+                assignment_trace=[reason] if reason else [],
+                suggested_alternatives=alternatives,
+                suggestion_note=note,
                 summary=_no_candidate_summary(reason or "사전배정 선석을 확인할 수 없습니다."),
             )
         candidates_to_try = [candidate]
@@ -149,15 +173,58 @@ async def orchestrate(
 
     rejected: list[RejectedCandidate] = []
     for candidate in candidates_to_try:
-        resolution = await resolve_berth_assignment(
-            db,
-            neo4j_driver,
-            candidate=candidate,
-            vessel=request.vessel,
-            window_start=request.window_start,
-            window_end=request.window_end,
-            category=cargo_category,
-        )
+        if request.assigned_wharf_name:
+            # ── 검증모드: 점유를 이유로 재탐색하지 않는다 ──────────────────────
+            #
+            # [2026-09-21, D2 S2 — 점유는 등급이 아니라 정보]
+            #
+            # resolve_berth_assignment 는 "전용 선석이 점유 중이면 대체 -> 정박지"
+            # 로 **다른 자리를 찾는** 함수다. 그건 배정 주체의 동작이라 검증모드에
+            # 들어오면 안 된다. 실제로 들어와서 사고가 났다 — UTT부두에 붙어 있는
+            # D7BX 의 판정이 이렇게 흘렀다(2026-09-21 실측):
+            #
+            #   전용 선석 'UTT부두' 점유 중 -> 대체 가능 선석 없음(단독선석)
+            #   -> 정박지 대기 탐색 -> 선박 DWT 미상 -> 톤수별 정박지 매칭 불가
+            #   -> 배정불가   ⇒ '부적합'
+            #
+            # 배는 이미 그 부두에 정상적으로 붙어 있는데, 우리가 그 자리를 새로
+            # 배정하려다 실패해서 부적합을 냈다. 질문 자체가 틀렸다. 검증모드의
+            # 질문은 "이 자리를 줄 수 있나"가 아니라 **"이 자리가 맞나"** 다.
+            #
+            # 점유를 무시해도 되는 근거는 둘이다.
+            #   ① 백테스트 S2 — 점유 초과는 정보로 강등한다. PORT-MIS 출항 시각이
+            #      예정값이라 동시 계류를 과대 계산한다(2026-09-21 실측 7/125=5.6%).
+            #   ② 지금 점유의 근거는 AIS 실측인데, 검증 대상 자신이 거기 붙어
+            #      있는 경우가 대부분이다. 자기 자신이 자기를 막는 구조다.
+            #
+            # 점유 사실 자체는 버리지 않는다 — trace 에 남겨 관제사가 "이 부두에
+            # 지금 몇 척이 있다"를 볼 수 있게 한다.
+            occ_note = (
+                f"참고: 이 시설에 다른 선박이 접안 중입니다(AIS 실측). "
+                f"판정 등급에는 반영하지 않습니다"
+                if candidate.occupancy_status is OccupancyStatus.OCCUPIED
+                else None
+            )
+            resolution = BerthResolution(
+                path="전용",
+                berth=candidate,
+                trace=[
+                    f"배정된 시설 '{candidate.wharf_name}' 확인 "
+                    f"(수심 {candidate.depth_m}m, 흘수 {request.vessel.draught_m}m, "
+                    f"여유 {candidate.draught_margin_m:.1f}m)",
+                    *( [occ_note] if occ_note else [] ),
+                ],
+            )
+        else:
+            resolution = await resolve_berth_assignment(
+                db,
+                neo4j_driver,
+                candidate=candidate,
+                vessel=request.vessel,
+                window_start=request.window_start,
+                window_end=request.window_end,
+                category=cargo_category,
+            )
 
         if resolution.path == "정박지대기":
             return OrchestratorResult(
@@ -186,16 +253,25 @@ async def orchestrate(
         # '하역중단'이어도 검사 자체를 건너뛰고 그대로 승인됐다(실측으로 발견,
         # 2026-08-17). berth_group 없는 후보라고 기상 검사를 면제할 이유가
         # 없다 — 오히려 전용 임계값이 없어 더 보수적으로 봐야 하는 쪽이다.
-        berth_weather = weather_result
-        if resolved_berth.berth_group:
-            berth_weather = await assess_weather(
-                db,
-                WeatherAssessmentRequest(
-                    berth_group=resolved_berth.berth_group,
-                    as_of=request.weather_as_of,
-                    expected_completion_at=request.window_end,
-                ),
-            )
+        # [2026-09-21, D2 ②] berth_group 유무와 상관없이 **항상 다시 판정한다.**
+        #
+        # 예전엔 berth_group 이 없으면 위에서 구해 둔 전역 폴백을 그대로 썼다.
+        # 그 폴백은 wharf_name 을 모르는 채로 계산된 것이라 **외해 부이 파고가
+        # 그대로 적용된다.** 그러면 임계값 자료가 없는 항내 부두(SK 계열 등)가
+        # 파고 하나로 통째로 막힌다 — 실제로 2026-09-21 라이브 26척 중 24척이
+        # 이 경로로 부적합이었다.
+        #
+        # berth_group=None 을 넘기면 임계값은 전역 기본을 쓰되 wharf_name 은
+        # 전달되므로, 파고 적용 여부만 이 선석 기준으로 옳게 결정된다.
+        berth_weather = await assess_weather(
+            db,
+            WeatherAssessmentRequest(
+                berth_group=resolved_berth.berth_group,
+                wharf_name=resolved_berth.wharf_name,
+                as_of=request.weather_as_of,
+                expected_completion_at=request.window_end,
+            ),
+        )
         if berth_weather.status is not WorkStatus.NORMAL:
             rejected.append(
                 RejectedCandidate(
@@ -265,10 +341,25 @@ async def orchestrate(
         # 확인, 2026-08-17). LLM에게 이 값이 개별 후보 판정이 아님을 알려준다.
         is_global_fallback_weather=True,
     )
+    # 기상·혼재로 부적합이 났다 — 이때가 대체안을 내야 하는 자리다(회의 §3).
+    # 검증모드에서만 찾는다. 탐색모드는 애초에 후보를 고르는 경로라 중복이다.
+    alternatives: list[BerthCandidate] = []
+    suggestion_note = None
+    if request.assigned_wharf_name:
+        alternatives, suggestion_note = await suggest_alternative_berths(
+            db, neo4j_driver,
+            cargo=request.cargo, vessel=request.vessel,
+            window_start=request.window_start, window_end=request.window_end,
+            exclude_wharf_name=request.assigned_wharf_name,
+            draught_margin_m=request.draught_margin_m,
+        )
+
     return OrchestratorResult(
         overall_decision=OverallDecision.ALL_CANDIDATES_UNSAFE,
         weather_assessment=weather_result,
         rejected_candidates=rejected,
+        suggested_alternatives=alternatives,
+        suggestion_note=suggestion_note,
         summary=llm_result.summary,
         # berth_match_summary는 안 담는다 — 선택된 선석이 없어 "매칭"을 말할 대상
         # 자체가 없다.
