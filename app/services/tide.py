@@ -24,8 +24,20 @@
   ② 예보는 **천문조**다. 기상에 의한 비조석 잔차(기압·바람·계절 해면)가 빠져
      있다. 2026-09-21 실측으로 울산 관측−예보 차이는 +0.8~34.8cm 였고 관측
      평균해면과 r=0.989 로 상관했다 — 즉 상수 보정이 아니라 계절·기상 성분이다.
-     지금은 보정하지 않는다. 보정 없이도 방향은 맞고(예보가 실측보다 낮게 나와
-     **보수적**이다), 보정하면 정밀해질 뿐이다.
+
+     [2026-09-22] 최근 72시간 실측과의 차이 **중앙값**으로 보정한다(상수 아님).
+     한동안 보정하지 않았는데, 그 근거("예보가 낮게 나오니 보정 없이도 보수적")가
+     두 가지를 놓치고 있었다.
+
+       · 안전여유를 숨긴다. 명시적 여유(`draught_margin_m`, 기본 1.0m)가 이미
+         있는데 조위에 편차를 남겨 두면 실제 여유가 1.0m + 편차가 되고 그 사실이
+         어디에도 안 적힌다. 물리량은 최선의 추정치를 쓰고 여유는 여유 자리에 둔다.
+       · 화면과 판정이 다른 조위를 말한다. `api/v1/twin.py` 의 72시간 전망은 같은
+         예보에 같은 방식으로 보정한다(실측 +25.0cm). 25cm 가 어긋나면 관제사가
+         "화면엔 여유가 있는데 왜 부적합인가"를 묻게 된다.
+
+     보정분은 `TideMinimum.bias_cm` 에 그대로 남긴다 — 얼마를 더했는지 숨기지 않는다.
+     겹치는 실측이 없으면 보정 0 이고 `bias_sample_n` 이 0 이다.
   ③ 관측소는 울산(DT_0020) 한 곳이다. 부두별 조위차는 반영하지 못한다.
   ④ 예보 구간을 벗어난 시각은 **모른다** — None 을 돌려주고, 호출부는 그것을
      '판정불가'로 다뤄야 한다. 없는 값을 0 으로 채우지 않는다.
@@ -33,7 +45,8 @@
 
 import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+import statistics
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -49,10 +62,15 @@ _ONE_DAY = timedelta(days=1)
 class TideMinimum:
     """체류 구간의 최저 조위와 그 시각."""
 
+    #: 편차 보정까지 적용한 값. 호출부는 이 값을 그대로 쓰면 된다.
     level_cm: float
     at_utc: datetime
     #: 구간 양 끝이 예보 범위 안에 완전히 들어왔는가. False 면 부분 구간만 본 것이다.
     fully_covered: bool
+    #: level_cm 에 이미 더해져 있는 보정분. 판정 근거 문장이 이 값을 밝힐 수 있게 남긴다.
+    bias_cm: float = 0.0
+    #: 보정에 쓴 실측 점 수. 0 이면 보정하지 못한 것이다(예보와 겹치는 실측이 없음).
+    bias_sample_n: int = 0
 
 
 _QUERY_EXTREMES = text("""
@@ -61,6 +79,19 @@ _QUERY_EXTREMES = text("""
     WHERE station_id = :station_id
       AND predicted_at_utc BETWEEN :from_utc AND :to_utc
     ORDER BY predicted_at_utc
+""")
+
+
+#: 편차 보정에 쓸 실측 구간. 짧으면 한 번의 기상 이벤트에 끌려가고, 길면 계절
+#: 변화를 못 따라간다. api/v1/twin.py 의 전망 보정과 같은 값을 쓴다 — 한 시스템에서
+#: 같은 예보에 다른 보정을 적용하면 화면과 판정이 다른 조위를 말하게 된다.
+_BIAS_WINDOW = timedelta(hours=72)
+
+_QUERY_RECENT_OBS = text("""
+    SELECT observed_at_utc, tide_level_cm
+    FROM tide_obs
+    WHERE observed_at_utc >= :from_utc AND tide_level_cm IS NOT NULL
+    ORDER BY observed_at_utc
 """)
 
 
@@ -97,12 +128,17 @@ async def min_tide_in_window(
 
     # 양 끝을 보간하려면 구간 밖의 이웃 극값이 필요하다. 반일주조 주기가 약
     # 12시간 25분이므로 앞뒤 1일이면 이웃을 반드시 포함한다.
+    #
+    # 뒤로는 편차 보정에 쓸 실측 구간(_BIAS_WINDOW)까지 더 받는다 — 보정은 그 구간의
+    # 실측과 같은 시각 예보를 견줘야 하므로, 예보가 거기까지 있어야 한다.
+    bias_from = datetime.now(timezone.utc) - _BIAS_WINDOW
+    fetch_from = min(window_start.replace(microsecond=0) - _ONE_DAY, bias_from - _ONE_DAY)
     rows = (
         await db.execute(
             _QUERY_EXTREMES,
             {
                 "station_id": station_id,
-                "from_utc": window_start.replace(microsecond=0) - _ONE_DAY,
+                "from_utc": fetch_from,
                 "to_utc": window_end.replace(microsecond=0) + _ONE_DAY,
             },
         )
@@ -145,4 +181,34 @@ async def min_tide_in_window(
         return None
 
     level_cm, at_utc = min(candidates, key=lambda c: c[0])
-    return TideMinimum(level_cm=level_cm, at_utc=at_utc, fully_covered=fully_covered)
+
+    # ── 편차 보정 ───────────────────────────────────────────────────────────
+    # [2026-09-22] 예전엔 보정하지 않았다. "예보가 실측보다 낮게 나오니 보정 없이도
+    # 보수적"이라는 이유였는데, 두 가지가 걸린다.
+    #
+    #  ① 안전여유를 숨기게 된다. 이 시스템에는 이미 명시적인 안전여유가 있다
+    #     (draught_margin_m, 기본 1.0m). 조위 값에 보정분을 안 넣으면 실제 여유가
+    #     1.0m 가 아니라 1.0m + 편차가 되는데, 그 사실이 어디에도 안 적힌다.
+    #     물리량은 최선의 추정치를 쓰고 여유는 여유 자리에 두는 편이 낫다.
+    #  ② 화면과 판정이 다른 조위를 말한다. api/v1/twin.py 의 72시간 전망은 같은
+    #     예보에 보정을 적용한다(실측 +25.0cm). 관제사가 화면에서 본 조위와 판정이
+    #     쓴 조위가 25cm 다르면 "여유가 있는데 왜 부적합이지"가 된다.
+    #
+    # 상수로 박지 않는다. 편차는 계절·기상 성분이라 고정값이 아니다(관측 평균해면과
+    # r=0.989). 최근 실측과 같은 시각 예보의 차이 **중앙값**을 쓴다 — 평균이 아니라
+    # 중앙값인 것은 결측·이상치 한두 점에 끌려가지 않기 위해서다.
+    obs = (await db.execute(_QUERY_RECENT_OBS, {"from_utc": bias_from})).mappings().all()
+    resid = [
+        float(o["tide_level_cm"]) - p
+        for o in obs
+        if (p := _at(o["observed_at_utc"])) is not None
+    ]
+    bias_cm = round(statistics.median(resid), 1) if resid else 0.0
+
+    return TideMinimum(
+        level_cm=level_cm + bias_cm,
+        at_utc=at_utc,
+        fully_covered=fully_covered,
+        bias_cm=bias_cm,
+        bias_sample_n=len(resid),
+    )
