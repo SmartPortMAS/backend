@@ -111,13 +111,17 @@ class AcknowledgeResult(BaseModel):
     note: str | None = None
 
 
+# 파라미터에 ::text 캐스트를 붙여 둔다. asyncpg 는 서버에 준비문을 만들면서 각
+# 파라미터의 타입을 추론하는데, `WHEN :note IS NULL` 처럼 타입 단서가 없는 자리에
+# 쓰이면 추론에 실패한다 — "could not determine data type of parameter $3" 로
+# 엔드포인트가 본문과 무관하게 500 이 됐다(실측 2026-09-22).
 _QUERY_ACK = text("""
     UPDATE assessment_history
     SET acknowledged_by = :acknowledged_by,
         acknowledged_at_utc = :now,
         reasons = CASE
-            WHEN :note IS NULL THEN reasons
-            ELSE reasons || ARRAY[:note_line]::text[]
+            WHEN CAST(:note AS text) IS NULL THEN reasons
+            ELSE reasons || ARRAY[CAST(:note_line AS text)]
         END
     WHERE id = :id AND acknowledged_at_utc IS NULL
     RETURNING id, acknowledged_by, acknowledged_at_utc
