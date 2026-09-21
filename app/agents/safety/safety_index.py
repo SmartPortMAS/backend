@@ -47,11 +47,50 @@ _Q_CARGO_ID = text("""
 
 _Q_PIPELINE = text("SELECT collect_age_min FROM mart.pipeline_health")
 
+# 선석 해소율 — "접안 신고 중 몇 %가 우리 선석 마스터로 해소되는가".
+#
+# [2026-09-22] 분모를 upa_port_call(이름 매칭) -> portmis_vessel(코드 매칭)으로
+# 옮기고, 정박지를 분모에서 뺐다. 세 가지를 실측으로 확인한 뒤 내린 결정이다.
+#
+# ① 왜 upa_port_call 이 아닌가
+#    그 표는 VTS **사후 이력**이라 분모가 30,205건(과거 전체)이다. 이 축이 답해야
+#    할 질문은 "지금 들어오는 배를 선석까지 특정하고 있나"이므로 모집단이 틀렸다.
+#    PORT-MIS 신고(현재·예정)가 맞는 모집단이고 240건이다.
+#
+# ② 왜 정박지를 빼는가
+#    이 축은 아래 주석대로 **인접 혼재를 따질 수 있나**를 재는 축이다. 혼재 판정의
+#    입력인 mart.berth_current_cargo 에 정박지 행은 0건이다(실측) — 묘박 중인 배는
+#    안벽 인접이라는 개념 자체가 없다. 그런데 정박지 신고(WAE·WAM)가 분모의 57%
+#    (312/552)를 차지해, 영원히 해소될 수 없는 건이 점수를 절반으로 눌렀다.
+#    모집단을 선석 신고로 좁히는 것이지, 실패를 숨기는 것이 아니다.
+#
+# ③ KNOWN_GAP 은 분모에 남긴다
+#    흘수 축이 UNKNOWN 을 빼는 것과 달리 여기서는 빼지 않는다. 저쪽은 위험도 축이라
+#    "모르는 것을 안전으로 세지 않기" 위해 빼지만, 이 축은 **커버리지** 축이다.
+#    해소 못 하는 것을 분모에서 빼면 "해소 가능한 것 중 몇 %를 해소하나"가 되어
+#    늘 ~98% 가 나온다(실측 175/179) — 축이 스스로를 증명하는 숫자가 된다.
+#    대신 몇 건이 왜 안 되는지는 basis 에 적어 드러낸다.
+#
+# 실측 대조(2026-09-22, 같은 시점):
+#    옛 방식(upa_port_call x facility_alias)      13,526/30,205 = 44.8%
+#    코드매칭, 정박지 포함                            175/552   = 31.7%
+#    코드매칭, 정박지 제외  ← 채택                    175/240   = 72.9%
+#    코드매칭, 정박지+KNOWN_GAP 제외                  175/179   = 97.8%
+#
+# ※ sub_code 는 양쪽 다 '01' 형태(0 패딩 2자리)여야 붙는다. 원천 PORT-MIS 가 그
+#   형태로 주고, common_pg_loader.TEXT_ID_COLUMNS 가 그대로 보존한다. 한동안
+#   적재 과정에서 앞자리 0 이 벗겨져 조인이 통째로 끊겼던 적이 있다(그쪽 주석).
 _Q_BERTH_RESOLVED = text("""
-    SELECT count(*) FILTER (WHERE fa.facility_type = 'BERTH') AS berth_n,
-           count(*)                                           AS total_n
-    FROM upa_port_call pc
-    JOIN mart.facility_alias fa ON fa.source_name = pc.facility_name
+    SELECT count(*) FILTER (WHERE m.match_level IN ('BERTH', 'WHARF')) AS berth_n,
+           count(*) FILTER (WHERE m.match_level = 'KNOWN_GAP')         AS known_gap_n,
+           count(*)                                                    AS total_n
+    FROM portmis_vessel pv
+    LEFT JOIN portmis_facility_map m
+           ON m.facility_cd       = pv.arrival_facility_cd
+          AND m.facility_sub_code IS NOT DISTINCT FROM pv.arrival_facility_sub_code
+    WHERE pv.arrival_facility_cd IS NOT NULL
+      -- 정박지(WAE·WAM)는 선석이 아니다 — 위 ② 참고.
+      AND pv.arrival_facility_cd NOT LIKE 'WA%'
 """)
 
 
@@ -86,8 +125,9 @@ async def build_safety_index(db: AsyncSession, driver: AsyncDriver) -> dict:
         axes.append(_axis("기상 여유", None, "관측값 없음 — 판정 불가"))
 
     # 2. 흘수 여유 — 접안 불가/경계 판정이 얼마나 섞여 있나.
-    #    UNKNOWN(부두 제원 미확보)은 분모에서 뺀다. 모르는 것을 안전으로도
-    #    위험으로도 세지 않기 위해서다 — 대신 basis 에 몇 건인지 밝힌다.
+    #    UNKNOWN(부두 제원 미확보)과 CHECK(선석별 수심이 달라 어느 선석인지 확인 필요)는
+    #    분모에서 뺀다. 모르는 것을 안전으로도 위험으로도 세지 않기 위해서다 —
+    #    대신 basis 에 몇 건인지 밝힌다.
     rows = {r["draught_verdict"]: r["n"] for r in (await db.execute(_Q_DRAUGHT)).mappings()}
     judged = rows.get("OK", 0) + rows.get("MARGINAL", 0) + rows.get("NOT_ALLOWED", 0)
     if judged:
@@ -95,12 +135,14 @@ async def build_safety_index(db: AsyncSession, driver: AsyncDriver) -> dict:
         axes.append(_axis(
             "흘수 여유", (1 - penalty / judged) * 100,
             f"판정 {judged}건 중 접안불가 {rows.get('NOT_ALLOWED', 0)}·"
-            f"경계 {rows.get('MARGINAL', 0)} (제원 미확보 {rows.get('UNKNOWN', 0)}건 제외)",
+            f"경계 {rows.get('MARGINAL', 0)} (제원 미확보 {rows.get('UNKNOWN', 0)}건·"
+            f"선석 확인 요청 {rows.get('CHECK', 0)}건 제외)",
         ))
     else:
         axes.append(_axis(
             "흘수 여유", None,
-            f"판정 가능한 접안 없음 (제원 미확보 {rows.get('UNKNOWN', 0)}건)",
+            f"판정 가능한 접안 없음 (제원 미확보 {rows.get('UNKNOWN', 0)}건·"
+            f"선석 확인 요청 {rows.get('CHECK', 0)}건)",
         ))
 
     # 3. 혼재 안전 — 규칙엔진이 실제로 잡아낸 격리 위반이 있는 선석 비율
@@ -132,13 +174,16 @@ async def build_safety_index(db: AsyncSession, driver: AsyncDriver) -> dict:
     # 5. 선석 특정 — 어느 선석에 붙었는지 모르면 인접 혼재를 따질 수 없다.
     br = (await db.execute(_Q_BERTH_RESOLVED)).mappings().first()
     if br and br["total_n"]:
+        gap = br["known_gap_n"]
+        unmapped = br["total_n"] - br["berth_n"] - gap
         axes.append(_axis(
             "선석 특정", 100.0 * br["berth_n"] / br["total_n"],
-            f"접안 기록 {br['total_n']}건 중 선석 확정 {br['berth_n']}건 "
-            f"(나머지는 정박지·호안 등 또는 미매핑)",
+            f"접안 신고 {br['total_n']}건 중 선석 확정 {br['berth_n']}건 "
+            f"(제원 공시 없음 {gap}건: 호안·의장안벽·공사중 / 미매핑 {unmapped}건. "
+            f"정박지 신고는 분모에서 제외)",
         ))
     else:
-        axes.append(_axis("선석 특정", None, "접안 기록 없음"))
+        axes.append(_axis("선석 특정", None, "접안 신고 없음"))
 
     # 6. 데이터 신선도 — 위 판정들이 언제 값으로 내려진 것인가.
     #    수집 주기가 1시간이라 60분까지는 만점, 3시간(기상 판정 MAX_STALENESS)에서 0.

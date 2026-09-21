@@ -49,9 +49,9 @@ _QUERY_BERTH_CARGO = text("""
 
 # 흘수 판정은 뷰가 이미 결론을 내려뒀다 — 여기서는 옮겨 적기만 한다.
 _QUERY_DRAUGHT_ALERTS = text("""
-    SELECT callsgn, facility_name, ukc_m, ukc_required_m, draught_verdict
+    SELECT callsgn, facility_name, ukc_m, ukc_required_m, draught_verdict, chart_depth_max_m
     FROM mart.berth_draught_check
-    WHERE draught_verdict IN ('NOT_ALLOWED', 'MARGINAL')
+    WHERE draught_verdict IN ('NOT_ALLOWED', 'MARGINAL', 'CHECK')
     ORDER BY ukc_m NULLS LAST
 """)
 
@@ -244,14 +244,24 @@ async def _draught_alerts(db: AsyncSession) -> list[dict]:
     rows = (await db.execute(_QUERY_DRAUGHT_ALERTS)).mappings().all()
     out = []
     for row in rows:
-        not_allowed = row["draught_verdict"] == "NOT_ALLOWED"
+        verdict = row["draught_verdict"]
+        not_allowed = verdict == "NOT_ALLOWED"
         ukc = f"UKC {row['ukc_m']:.2f} m" if row["ukc_m"] is not None else "UKC 산출 불가"
+        if verdict == "CHECK":
+            # 선석별 수심이 다른 부두(SK5 7~11m 등) — 가장 얕은 선석 기준으론 부족하지만
+            # 깊은 선석이면 된다. VTS 기록에 선석 번호가 없어 시스템은 어느 선석인지
+            # 모르므로 '불가'가 아니라 '확인 요청'이다(mart_views.sql berth_draught_check).
+            message = (f"{row['facility_name'] or '부두 미상'}: {row['callsgn']} "
+                       f"접안 선석 확인 요청 — 가장 얕은 선석 기준 {ukc}, "
+                       f"가장 깊은 선석({row['chart_depth_max_m']} m)이면 여유 있음")
+        else:
+            message = (f"{row['facility_name'] or '부두 미상'}: {row['callsgn']} "
+                       f"흘수 여유 부족 ({ukc}, {verdict})")
         out.append({
-            "level": "DANGER" if not_allowed else "WARNING",
+            "level": "DANGER" if not_allowed else ("INFO" if verdict == "CHECK" else "WARNING"),
             "type": "DRAUGHT",
             "berth_name": row["facility_name"],
-            "message": f"{row['facility_name'] or '부두 미상'}: {row['callsgn']} "
-                       f"흘수 여유 부족 ({ukc}, {row['draught_verdict']})",
+            "message": message,
             "risk_level": None,
             "basis": "mart.berth_draught_check (조위 반영 가용수심)",
             # 흘수 경고는 배 한 척의 문제다 — 그 배로 바로 갈 수 있게 한다
@@ -260,45 +270,55 @@ async def _draught_alerts(db: AsyncSession) -> list[dict]:
     return out
 
 
-_QUERY_SCHEDULING_EXCLUSIONS = text("""
-    SELECT call_sign, vessel_name, decision, reason, updated_at
-    FROM scheduling_exclusion
-    ORDER BY updated_at DESC
+# [2026-09-21] scheduling_exclusion -> assessment_history 로 교체.
+#
+# 옛 표는 "자동 배정이 배정을 만들지 못한 건"의 목록이었다. 우리가 배정을 만들지
+# 않으므로 못 만든 건도 없다(방향 C). 같은 자리를 채우는 것은 판정 이력이다 —
+# 관제사가 알아야 하는 건 '배정 실패'가 아니라 **'지금 자리가 조건에 안 맞는 배'** 다.
+#
+# 배 1척당 최신 판정 1건만 본다. 이력 전체를 펼치면 같은 배가 화면에 여러 번 뜬다.
+_QUERY_ACTIVE_ASSESSMENTS = text("""
+    SELECT DISTINCT ON (call_sign)
+           call_sign, vessel_name, stage, wharf_name, level, action, recipient,
+           reasons, assessed_at_utc
+    FROM assessment_history
+    WHERE level <> '적합'
+      -- 오래된 판정은 경고가 아니라 이력이다. 그 배는 이미 떠났을 수 있다.
+      AND assessed_at_utc > now() - interval '24 hours'
+    ORDER BY call_sign, assessed_at_utc DESC
 """)
 
-# 자동 배정 흐름(arrival_watcher.py)에서 온 판정 사유는 그대로 옮겨 적는다 —
-# 여기서 새 판단을 만들지 않는다는 원칙(위 모듈 docstring 1번)은 이 경고에도
-# 똑같이 적용된다. WEATHER_BLOCKED/ALL_CANDIDATES_UNSAFE는 이미 안전·기상
-# 에이전트가 위험 판정을 내린 뒤라 DANGER, NO_ELIGIBLE_BERTH는 위험 판정과
-# 무관하게 "자리가 없다"는 운영 이슈라 WARNING으로 낮춘다.
-_EXCLUSION_LEVEL = {
-    "NO_ELIGIBLE_BERTH": "WARNING",
-    "ALL_CANDIDATES_UNSAFE": "DANGER",
-    "WEATHER_BLOCKED": "DANGER",
-}
-_EXCLUSION_LABEL = {
-    "NO_ELIGIBLE_BERTH": "적합 선석 없음",
-    "ALL_CANDIDATES_UNSAFE": "전 후보 배정 불가(안전)",
-    "WEATHER_BLOCKED": "기상 불가",
+# 판정 등급 -> 경고 심각도. '판정불가'를 WARNING 으로 두는 것이 핵심이다 —
+# 근거가 없다는 사실 자체를 관제사가 봐야 한다(회의 §4 "근거 부족을 안전과 구분").
+# 조용히 넘기면 모르는 것을 통과시킨 것과 같아진다.
+_LEVEL_TO_ALERT = {
+    "부적합": "DANGER",
+    "주의": "WARNING",
+    "판정불가": "WARNING",
 }
 
 
-async def _scheduling_exclusion_alerts(db: AsyncSession) -> list[dict]:
-    """자동 배정(watch_arrivals)이 배정을 만들지 못한 건. 08_스케줄링_전면재설계_
-    자동배정_설계문서.md §5.3 3번 — 아무 조치 없이 조용히 대기 중인 배가 화면에
-    보이지 않으면 관제사가 그 존재 자체를 모른다."""
-    rows = (await db.execute(_QUERY_SCHEDULING_EXCLUSIONS)).mappings().all()
+async def _assessment_alerts(db: AsyncSession) -> list[dict]:
+    """최근 24시간 판정 중 '적합'이 아닌 것.
+
+    여기서 새 판단을 만들지 않는다(모듈 docstring 1번) — 이미 내려진 판정을
+    경고 형식으로 옮겨 적을 뿐이다.
+    """
+    rows = (await db.execute(_QUERY_ACTIVE_ASSESSMENTS)).mappings().all()
     out = []
     for row in rows:
-        label = _EXCLUSION_LABEL.get(row["decision"], row["decision"])
+        who = row["vessel_name"] or row["call_sign"]
+        where = row["wharf_name"] or "계류시설 미상"
+        head = (row["reasons"] or [""])[0]
+        # 조치안이 있으면 받을 곳까지 적는다. 우리가 실행하지 않는다는 뜻이 문장에 남는다.
+        tail = f" → {row['action']} 검토 필요({row['recipient']})" if row["action"] else ""
         out.append({
-            "level": _EXCLUSION_LEVEL.get(row["decision"], "WARNING"),
-            "type": row["decision"],
-            "berth_name": None,
-            "message": f"{row['vessel_name'] or row['call_sign']}: 자동 배정 불가 — {label}"
-                       + (f" ({row['reason']})" if row["reason"] else ""),
+            "level": _LEVEL_TO_ALERT.get(row["level"], "WARNING"),
+            "type": f"ASSESSMENT_{row['level']}",
+            "berth_name": row["wharf_name"],
+            "message": f"[{row['stage']}] {who} @ {where}: {row['level']} — {head}{tail}",
             "risk_level": None,
-            "basis": "scheduling_exclusion(arrival_watcher 자동 배정 판정)",
+            "basis": "assessment_history (판정 이력)",
             "callsgns": [row["call_sign"]] if row["call_sign"] else [],
         })
     return out
@@ -312,7 +332,7 @@ async def build_berth_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dict
     alerts = (
         await _segregation_alerts(db, driver)
         + await _draught_alerts(db)
-        + await _scheduling_exclusion_alerts(db)
+        + await _assessment_alerts(db)
     )
     order = {"DANGER": 0, "WARNING": 1, "INFO": 2}
     alerts.sort(key=lambda a: (order.get(a["level"], 9), a["type"]))
