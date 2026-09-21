@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     kosha_api_key: str | None = None
     port_mis_api_key: str | None = None
     mof_api_key: str | None = None
+    # 하역 개시 인터락 게이트(라즈베리파이) — MQTT 브로커(노트북 mosquitto)와 게이트→선석 대응.
+    # 시연 장치는 G01 = 선석 A, G02 = 선석 B. 선석은 마스터 표기(upa_berth_facility.wharf_name).
+    # 기본값은 풍속 중단 기준이 다른 두 부두(OTK1 14 m/s · 정일1 17 m/s)라 풍속 16 으로
+    # A 잠김·B 열림을 보일 수 있다(하드웨어/UI연동_전달사항_20260922.md 5절).
+    mqtt_host: str = "127.0.0.1"
+    mqtt_port: int = 1883
+    gate_berths: str = '{"G01": "OTK1부두", "G02": "정일1부두"}'
     log_level: str = Field(default="INFO")
 
     model_config = SettingsConfigDict(
