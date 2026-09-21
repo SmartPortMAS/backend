@@ -17,7 +17,14 @@ class RiskLevel(str, Enum):
     SAFE = "안전"
     CAUTION = "주의"
     DANGER = "위험"
-    BLOCKED = "배정불가"
+    # [2026-09-22] "배정불가" -> "하역불가". 우리는 배정을 거부하는 주체가 아니다.
+    # 이 등급이 실제로 말하는 것은 "이 화물 조합을 이 자리에서 하역하면 안 된다"이고,
+    # 그 판단은 우리가 할 수 있다. 자리를 주고 말고는 선석회의·VTS·터미널의 일이다.
+    #
+    # 판정 등급(AssessmentLevel: 적합/주의/부적합/판정불가)과는 **여전히 별개다**.
+    # 이쪽은 안전 에이전트의 위험 척도이고, 저쪽은 시스템의 산출물이다
+    # (app/models/assessment_history.py 의 '등급을 RiskLevel 과 분리한 이유' 참고).
+    BLOCKED = "하역불가"
 
 
 _RISK_LEVEL_ORDER: dict[RiskLevel, int] = {

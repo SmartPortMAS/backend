@@ -235,7 +235,7 @@ async def orchestrate(
                 summary=_anchorage_wait_summary(candidate, resolution.trace),
             )
 
-        if resolution.path == "배정불가" or resolution.berth is None:
+        if resolution.path == "제안불가" or resolution.berth is None:
             rejected.append(
                 RejectedCandidate(berth_id=candidate.berth_id, rank=candidate.rank, reason="; ".join(resolution.trace))
             )

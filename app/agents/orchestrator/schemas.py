@@ -20,12 +20,24 @@ class OverallDecision(str, Enum):
 
     APPROVED 외 네 상태는 모두 "하역을 진행하면 안 되는" 상태라는 공통점이 있다 —
     관제사가 화면에서 한눈에 구분할 수 있도록 원인별로 분리했다.
+
+    [2026-09-22] 값에서 **우리가 승인·배정한다는 뜻**을 걷어냈다.
+
+      "승인가능"      -> "적합"        우리는 승인하지 않는다. 조건에 맞는지만 말한다.
+      "전후보배정불가" -> "전 후보 부적합"  우리는 배정을 거부하는 주체가 아니다.
+
+    '배정'이라는 단어 자체를 지운 것이 아니다 — `NO_ELIGIBLE_BERTH`("적합선석없음")나
+    판정 근거의 "배정된 선석이…"는 **남이 한 배정**을 가리키는 정확한 서술이라 그대로
+    둔다. 문제는 그 배정을 우리가 한다고 읽히는 어휘였다.
+
+    이 값은 DB 에 저장되지 않는다(`assessment_history` 는 `AssessmentLevel` 을 쓴다).
+    화면이 `decision_label` 로 그대로 표시하므로 값이 곧 관제사가 읽는 문장이다.
     """
 
-    APPROVED = "승인가능"
+    APPROVED = "적합"
     WEATHER_BLOCKED = "기상불가_중단권고"
     NO_ELIGIBLE_BERTH = "적합선석없음"
-    ALL_CANDIDATES_UNSAFE = "전후보배정불가"
+    ALL_CANDIDATES_UNSAFE = "전 후보 부적합"
     # 전용 선석 점유 + 대체 선석 없음(단독선석 등) -> 톤수에 맞는 정박지에서 대기
     # (온산 MVP 이식: scheduling.service.resolve_berth_assignment의 '정박지대기' 경로).
     WAITING_ANCHORAGE = "정박지대기"
