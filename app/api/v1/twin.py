@@ -20,22 +20,29 @@
   흘수 — 지금은 mart.berth_draught_check 판정을 그대로 옮긴다. 앞으로는 같은 식
          (가용수심 = 표 수심 + 조위, UKC 가 흘수의 10% 이상이면 OK)에 조위 예측만 넣는다.
 
-조위 예측 (2026-09-21 연결)
-  국립해양조사원 조석예보(고·저조, 울산 DT_0020 — tide_obs 실측과 같은 관측소)를 받아
-  고조·저조 사이를 코사인으로 잇는다(물때표를 시간별로 읽는 통상 방법).
-  예보는 달·해에 의한 조석만 계산해 실측과 체계적으로 차이 난다 — 9/19~21 실측 대조
-  11점에서 실측이 +16~+27 cm(평균 +22) 높았다. 그래서 최근 72시간 실측과의 차이
-  (중앙값)를 더해 쓰고, 그 보정값을 응답에 그대로 적는다. 바람·기압에 의한 앞으로의
-  변동은 예측할 수 없다 — 화면은 "예보 기준 전망"으로 표기한다.
+조위 예측 (2026-09-21 연결 · 2026-09-22 원천 정리)
+  국립해양조사원 조석예보(고·저조, 울산 DT_0020 — tide_obs 실측과 같은 관측소)를
+  고조·저조 사이 코사인으로 잇는다(물때표를 시간별로 읽는 통상 방법).
+
+  예보를 **직접 받지 않고 tide_forecast 표에서 읽는다.** 같은 예보를 data-pipeline
+  이 하루 한 번(03:10) 받아 적재하고 있어서, 두 경로로 받으면 이 화면과
+  app/services/tide.py 판정이 서로 다른 값을 말하게 된다 — 실제로 갈려 있었다.
+
+  예보는 달·해에 의한 조석만 계산해 실측과 체계적으로 차이 난다. 9/20~21 수집분
+  6점을 실측과 대조하면 실측이 +21~+27 cm(중앙값 +24) 높다. 그래서 최근 72시간
+  실측과의 차이(중앙값)를 더해 쓰고, 그 보정값을 응답에 그대로 적는다. 바람·기압에
+  의한 앞으로의 변동은 예측할 수 없다 — 화면은 "예보 기준 전망"으로 표기한다.
+
+  ※ 체류 구간 전체의 **최저 조위**가 필요한 판정은 app/services/tide.py 를 쓴다
+    (접안 순간만 보면 반나절 뒤 저조에 바닥이 닿는 배를 놓친다). 여기 보간은
+    "앞으로 72시간을 시각별로 그려 보여주는" 용도다.
 """
 
-import asyncio
 import math
 import statistics
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -44,7 +51,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.weather.data_access import ULSAN_PORT_NX, ULSAN_PORT_NY, get_berth_threshold
 from app.agents.weather.rule_engine import evaluate
 from app.agents.weather.schemas import WorkStatus
-from app.config import get_settings
 from app.core.deps import get_session
 from app.neo4j_client import neo4j_client
 
@@ -82,44 +88,42 @@ _UKC_RATIO = 0.10     # mart.berth_draught_check 와 같은 기준(흘수의 10%
 _focus: dict = {"seq": 0, "berth": None}
 
 # ── 조위 예측 ────────────────────────────────────────────────────────────────
-_TIDE_URL = "https://apis.data.go.kr/1192136/tideFcstHghLw/GetTideFcstHghLwApiService"
 _TIDE_STATION = "DT_0020"          # 울산 — tide_obs 실측과 같은 관측소
 _KST = timezone(timedelta(hours=9))
-_TIDE_CACHE_TTL = timedelta(hours=12)   # 천문조 예보라 하루 안에 바뀌지 않는다
-_tide_cache: dict[str, tuple[datetime, list]] = {}
+
+# [2026-09-22] 요청 때마다 KHOA API 를 직접 부르던 것을 tide_forecast 표 조회로 바꿨다.
+#
+#   왜: 같은 예보를 data-pipeline 이 이미 하루 한 번(03:10) 받아 적재하고 있었다
+#       (tide_forecast_collector, alembic 0024). 같은 원천을 두 경로로 받으면
+#       화면과 판정이 서로 다른 값을 말할 수 있고, 실제로 이 파일과
+#       app/services/tide.py 가 그렇게 갈려 있었다.
+#
+#   덤으로 따라온 것들:
+#     · 요청 지연이 사라진다 — 8일치를 날짜별로 8번 부르던 왕복이 없어진다.
+#     · 포털 게이트웨이 504 에 흔들리지 않는다(9/22 새벽 8일 중 5일이 504였다).
+#     · serviceKey 가 응답으로 샐 경로 자체가 없어진다. 표에서 읽을 뿐이라
+#       예외 문구에 요청 주소가 들어갈 일이 없다.
+#     · khoa_tide_fcst_key 가 백엔드에 더는 필요 없다(수집기 쪽 키만 있으면 된다).
+#
+#   한계는 그대로 남고, 이제 드러난다: 표가 비어 있으면 수집이 안 된 것이다.
+#   조용히 0 으로 채우지 않고 error 로 돌려보낸다.
+_Q_TIDE_FORECAST = text("""
+    SELECT predicted_at_utc, tide_level_cm
+    FROM tide_forecast
+    WHERE station_id = :station
+      AND predicted_at_utc BETWEEN :start AND :end
+      AND tide_level_cm IS NOT NULL
+    ORDER BY predicted_at_utc
+""")
 
 
-async def _tide_extremes_for(day_kst) -> list[tuple[datetime, float]]:
-    """그날(KST)의 고·저조 [(UTC 시각, cm)]. 키가 없거나 실패하면 빈 목록."""
-    key = get_settings().khoa_tide_fcst_key
-    if not key:
-        return []
-    ds = day_kst.strftime("%Y%m%d")
-    now = datetime.now(timezone.utc)
-    hit = _tide_cache.get(ds)
-    if hit and now - hit[0] < _TIDE_CACHE_TTL:
-        return hit[1]
-    params = {"serviceKey": key, "type": "json", "obsCode": _TIDE_STATION,
-              "reqDate": ds, "numOfRows": 20, "pageNo": 1}
-    async with httpx.AsyncClient(timeout=15) as client:
-        # 포털 게이트웨이 504 는 일시적인 경우가 많다(2026-09-22 새벽 8일 중 5일이 504) —
-        # 서버 오류일 때만 한 번 더 묻는다. 실패는 캐시에 남기지 않아 다음 조회 때 다시 시도된다.
-        for attempt in range(2):
-            resp = await client.get(_TIDE_URL, params=params)
-            if resp.status_code < 500 or attempt == 1:
-                break
-            await asyncio.sleep(1.0)
-    resp.raise_for_status()
-    items = (((resp.json().get("body") or {}).get("items") or {}).get("item")) or []
-    if isinstance(items, dict):
-        items = [items]
-    out = sorted(
-        (datetime.strptime(i["predcDt"], "%Y-%m-%d %H:%M").replace(tzinfo=_KST).astimezone(timezone.utc),
-         float(i["predcTdlvVl"]))
-        for i in items
-    )
-    _tide_cache[ds] = (now, out)
-    return out
+async def _tide_extremes(db: AsyncSession, start: datetime, end: datetime
+                         ) -> list[tuple[datetime, float]]:
+    """구간의 고·저조 [(UTC 시각, cm)]. 수집분이 없으면 빈 목록."""
+    rows = (await db.execute(
+        _Q_TIDE_FORECAST, {"station": _TIDE_STATION, "start": start, "end": end}
+    )).mappings().all()
+    return [(r["predicted_at_utc"], float(r["tide_level_cm"])) for r in rows]
 
 
 def _tide_at(extremes: list[tuple[datetime, float]], t: datetime) -> float | None:
@@ -306,36 +310,27 @@ async def get_outlook(
         "tide_observed_at_utc": _iso(wx.get("tide_observed_at_utc")),
     }
 
-    # 조위 예측 — 오늘 앞뒤 며칠의 고·저조를 받아 잇고, 최근 72시간 실측과의 차이를 보정한다.
-    # 날짜별로 따로 받는다: 공공데이터포털이 하루치에서 504 를 내는 일이 실제로 있었고
-    # (2026-09-22 00:45, 9/26 분), 그 한 번으로 나머지 날까지 버리면 안 된다.
-    # ★ 실패 사유에 예외 문구를 그대로 넣지 않는다 — httpx 예외 문구에는 요청 주소가 통째로
-    #   들어 있어 serviceKey 가 응답으로 새어 나갔다(9/22 발견). 상태 코드·예외 이름만 적는다.
-    tide_forecast, extremes, bias_cm, tide_failures = None, [], None, []
-    today = now.astimezone(_KST).date()
-    for off in range(-3, 5):
-        day = today + timedelta(days=off)
-        try:
-            extremes += await _tide_extremes_for(day)
-        except httpx.HTTPStatusError as e:
-            tide_failures.append(f"{day:%m-%d} HTTP {e.response.status_code}")
-        except Exception as e:   # noqa: BLE001 — 조위 예측이 없어도 기상 전망은 보여준다
-            tide_failures.append(f"{day:%m-%d} {type(e).__name__}")
-    extremes.sort()
-    if not extremes and tide_failures:
-        tide_forecast = {"error": "조석예보 조회 실패 — " + ", ".join(tide_failures)}
-    if extremes:
+    # 조위 예측 — 수집된 고·저조를 잇고, 최근 72시간 실측과의 차이를 보정한다.
+    #
+    # 앞뒤로 넉넉히(-3일 ~ +5일) 읽는 이유: 보간은 요청 시각 **양옆의 극치**가 있어야
+    # 하고, 편차 보정은 지난 72시간 실측과 겹치는 예보가 있어야 한다.
+    tide_forecast, bias_cm = None, None
+    extremes = await _tide_extremes(db, now - timedelta(days=3), now + timedelta(days=5))
+    if not extremes:
+        tide_forecast = {"error": "조석예보 수집분 없음 — data-pipeline tide_forecast 확인 필요"}
+    else:
         obs = (await db.execute(_Q_TIDE_OBS, {"start": now - timedelta(hours=72)})).mappings().all()
         resid = [o["tide_level_cm"] - p for o in obs
                  if (p := _tide_at(extremes, o["observed_at_utc"])) is not None]
         bias_cm = round(statistics.median(resid), 1) if resid else 0.0
         tide_forecast = {
-            "source": "국립해양조사원 조석예보(고·저조) 울산 DT_0020 — 극치 사이 코사인 보간",
+            "source": "국립해양조사원 조석예보(고·저조) 울산 DT_0020 — 극치 사이 코사인 보간"
+                      " (data-pipeline tide_forecast 적재분)",
             "bias_cm": bias_cm,
             "bias_basis": f"최근 72시간 실측 {len(resid)}점과 예보의 차이 중앙값",
             "note": "천문조만 예보 — 바람·기압에 의한 앞으로의 변동은 반영 못 함",
-            # 받지 못한 날 — 그 날에 걸린 시각은 조위 없이(기상만) 판정된다
-            "missing_days": tide_failures,
+            # 수집분이 요청 구간을 다 덮지 못하면 그 시각은 조위 없이(기상만) 판정된다.
+            "covered_until_utc": _iso(extremes[-1][0]),
             "extremes": [{"at_utc": _iso(t), "tide_cm": h, "tide_m": round((h + (bias_cm or 0)) / 100, 2)}
                          for t, h in extremes if now <= t <= now + timedelta(hours=hours)],
         }
