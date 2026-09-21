@@ -44,10 +44,29 @@ DEFAULT_WINDOW_HOURS = 24  # 재항 이력 표본이 없는 선석에 쓰는 기
 # 이 값보다 짧게 잡으면 추천이 만들어진 직후 만료돼 화면에서 사라진다.
 MIN_FORWARD_HOURS = 12
 
+# 입항 직후라 아직 위치 수집(EC2 1시간 주기)에 안 잡혔을 수 있는 배는 이 시간 동안은
+# 위치 없이도 대상에 둔다(아래 present 조건).
+PRESENCE_GRACE_HOURS = 24
+
 # §5.1 — 07 문서 §4.3의 NOT EXISTS 조건을 CANCELLED 뿐 아니라 REJECTED도 제외하도록
 # 고쳤다(발견 경위는 설계문서 §5.1 참고) — 그래야 반려당한 선박이 다음 주기에
 # 다시 후보로 잡힌다.
+#
+# ★ 2026-09-21 — "지금 항내에 있는 배"만 (present 조건)
+#   "입항 기록 있음 + 출항 기록 없음"(dashboard_current 의 VTS·PORT-MIS 서류 상태)만으로
+#   고르면 출항 처리가 빠진 유령 기록이 대상에 남는다. 실측: 대상 286척 중 최근 3시간
+#   UPA 위치가 없는 배가 237척이었고, 그중 200척은 입항 7일 초과(가장 오래된 건 1/16).
+#   이 잡이 10분마다 그 배들에 오케스트레이터(LLM 포함)를 돌려 백엔드 1시간 동안 LLM
+#   호출 886건, 관제 경고(scheduling_exclusion) 256건이 쌓였다.
+#   mart.vessel_presence(data-pipeline mart_views.sql 2-1절, UPA 위치 판정)에 있는 배만
+#   대상으로 한다. 입항 PRESENCE_GRACE_HOURS 안의 배는 위치가 아직 없어도 둔다.
+#   "신호 없음 ≠ 출항"(vessel_latest_position 주석) — 여기서 빠지는 배를 지우는 게 아니라
+#   자동 추천만 하지 않는다. 신호가 끊긴 배는 대시보드 presence_state=NO_SIGNAL 로 남는다.
+#   (vessel_presence 는 뷰라 매 행 EXISTS 로 부르면 행마다 다시 계산될 수 있어 CTE 로 한 번만)
 _QUERY_PENDING_ARRIVALS = text("""
+    WITH present AS (
+        SELECT DISTINCT callsgn FROM mart.vessel_presence WHERE callsgn IS NOT NULL
+    )
     SELECT
         dc.callsgn, dc.vessel_name, dc.imo_no, dc.draught AS draught_m,
         dc.arrival_at_utc,
@@ -70,6 +89,10 @@ _QUERY_PENDING_ARRIVALS = text("""
       AND dc.arrival_at_utc IS NOT NULL
       AND dc.departure_at_utc IS NULL
       AND dc.draught IS NOT NULL AND dc.draught > 0
+      AND (
+          dc.callsgn IN (SELECT callsgn FROM present)
+          OR dc.arrival_at_utc > now() - make_interval(hours => :grace_hours)
+      )
       AND NOT EXISTS (
           SELECT 1 FROM berth_assignment ba
           WHERE upper(btrim(ba.call_sign)) = upper(btrim(dc.callsgn))
@@ -168,7 +191,9 @@ async def watch_arrivals() -> None:
     llm_client = get_llm_client()
 
     async with AsyncSessionFactory() as db:
-        rows = (await db.execute(_QUERY_PENDING_ARRIVALS)).mappings().all()
+        rows = (
+            await db.execute(_QUERY_PENDING_ARRIVALS, {"grace_hours": PRESENCE_GRACE_HOURS})
+        ).mappings().all()
 
     if not rows:
         # 대상이 아예 없으면(전부 배정됐거나 출항) 남아 있던 경고도 전부 해소된 것 —
