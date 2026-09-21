@@ -90,9 +90,18 @@ async def get_weather_overview(db: AsyncSession = Depends(get_session)) -> dict:
 
 
 # --------------------------------------------------------------------------
-# 선석 현황 (Neo4j Berth + Postgres upa_port_call 점유 현황)
+# 선석 현황 (Neo4j Berth + mart.vessel_presence 점유 현황)
 #
-# ★ mart.facility_alias 경유로 조인한다 (P1 처방). VTS 운항관제
+# ★ 2026-09-17 — 점유는 UPA 선박위치로 판정한다 (mart_views.sql 2-1절).
+# 예전엔 upa_port_call 에서 "입항했고 출항 기록 없음"인 입항 건을 셌는데, 출항
+# 처리가 빠진 유령 기록이 남아 선석 58곳에 818척(그중 775척은 입항 7일 초과)이
+# 점유로 잡혔고, 입항~출항 구간에 든 정박지 대기 배도 선석 점유로 세졌다.
+# 이제 "최신 위치가 들어오고, 멈춰 있고, 선석에 붙어 있는 배"만 센다 — 한 척은
+# 한 곳에만 있으므로 중복도 생기지 않는다. port_call 은 뷰 안에서 "어느 선석으로
+# 신고했나"라는 이름표로만 쓰인다.
+#
+# 아래 facility_alias 설명은 그 이름표를 마스터 표기로 바꿀 때 여전히 유효하다
+# (뷰 안에서 거친다). VTS 운항관제
 # (upa_port_call.facility_name)와 선석 제원 마스터(upa_berth_facility.wharf_name)는
 # 서로 다른 표기 체계라 예전처럼 문자열 완전일치로 붙이면 점유 중인 선석
 # 대부분이 "여유"로 오표시된다(실측: 92% 오표시).
@@ -118,29 +127,22 @@ RETURN b.id AS berth_id, b.wharf_name AS wharf_name, b.port_name AS port_name,
 """
 
 _QUERY_BERTH_OCCUPANCY = text("""
-    WITH latest_calls AS (
-        SELECT DISTINCT ON (port_call_id)
-            port_call_id, facility_name, vessel_name, arrival_at_utc, departure_at_utc
-        FROM upa_port_call
-        WHERE arrival_at_utc IS NOT NULL
-          AND arrival_at_utc < :now
-          AND (departure_at_utc IS NULL OR departure_at_utc > :now)
-        ORDER BY port_call_id, arrival_at_utc
-    )
-    SELECT fa.wharf_name, count(*) AS occupant_count,
-           array_agg(lc.vessel_name ORDER BY lc.arrival_at_utc DESC) AS vessel_names
-    FROM latest_calls lc
-    JOIN mart.facility_alias fa
-      ON fa.source_name = lc.facility_name AND fa.facility_type = 'BERTH'
-    GROUP BY fa.wharf_name
+    SELECT berth_name AS wharf_name,
+           count(*) AS occupant_count,
+           array_agg(vessel_name ORDER BY vessel_name) AS vessel_names,
+           array_agg(callsgn ORDER BY vessel_name) AS callsigns,
+           array_agg(berth_basis ORDER BY vessel_name) AS bases,
+           array_agg(berth_dist_m ORDER BY vessel_name) AS distances_m,
+           max(snapshot_at_utc) AS observed_at_utc
+    FROM mart.vessel_presence
+    WHERE presence_zone = 'BERTH'
+    GROUP BY berth_name
 """)
 
 
 @router.get("/berths", summary="선석 목록 및 실시간 점유 현황")
 async def get_berths_overview(db: AsyncSession = Depends(get_session)) -> list[dict]:
-    """전체 선석 목록 + 취급화물 + 실시간 점유 현황(upa_port_call, facility_alias 매칭)."""
-    now = datetime.now(timezone.utc)
-
+    """전체 선석 목록 + 취급화물 + 실시간 점유 현황(UPA 선박위치, mart.vessel_presence)."""
     async with neo4j_client.driver.session() as session:
         async def _tx(tx):
             result = await tx.run(_CYPHER_ALL_BERTHS)
@@ -148,9 +150,7 @@ async def get_berths_overview(db: AsyncSession = Depends(get_session)) -> list[d
 
         berths = await session.execute_read(_tx)
 
-    occupancy_rows = (
-        await db.execute(_QUERY_BERTH_OCCUPANCY, {"now": now})
-    ).mappings().all()
+    occupancy_rows = (await db.execute(_QUERY_BERTH_OCCUPANCY)).mappings().all()
     # 같은 wharf_name을 가진 Neo4j Berth 노드가 여럿일 수 있다(예: 'SK2부두(민유)'와
     # 'SK2부두(국유)' — 마스터에 선석번호 구분이 없는 채로 두 노드가 있는 경우).
     # 그 경우 같은 점유 현황을 양쪽 다 보여준다 — 어느 쪽인지 구분할 근거가 없는
@@ -160,56 +160,58 @@ async def get_berths_overview(db: AsyncSession = Depends(get_session)) -> list[d
     out = []
     for b in berths:
         occ = occupancy_by_wharf.get(b["wharf_name"])
+        occupied = bool(occ and occ["occupant_count"])
         out.append({
             **b,
-            "occupancy_status": "점유" if occ and occ["occupant_count"] else "여유",
-            "current_vessel_names": occ["vessel_names"] if occ and occ["occupant_count"] else [],
+            "occupancy_status": "점유" if occupied else "여유",
+            "current_vessel_names": occ["vessel_names"] if occupied else [],
+            # 판정 근거 — '신고+위치'(신고 선석 1km 안) / '위치'(가장 가까운 선석 300m 안)
+            # / '신고'(좌표 없는 부이 등). 화면이 "왜 점유로 봤나"를 그대로 보여줄 수 있게.
+            "current_vessels": [
+                {"vessel_name": n, "callsgn": c, "basis": s, "distance_m": d}
+                for n, c, s, d in zip(
+                    occ["vessel_names"], occ["callsigns"], occ["bases"], occ["distances_m"]
+                )
+            ] if occupied else [],
+            "occupancy_observed_at_utc": occ["observed_at_utc"] if occupied else None,
         })
     return out
 
 
-@router.get("/berths/unmapped", summary="선석으로 매칭되지 않은 시설의 재항 현황")
+@router.get("/berths/unmapped", summary="선석·정박지로 판정되지 않은 정지 선박의 신고 시설 현황")
 async def get_unmapped_facility_calls(db: AsyncSession = Depends(get_session)) -> list[dict]:
-    """facility_alias가 선석으로 매칭 못한 시설명별 현재 재항 척수(P1 잔여 갭 노출용).
+    """지금 멈춰 있지만 위치로 선석·정박지에 붙지 않은 배를 최신 VTS 신고 시설별로 센다.
 
-    대부분 '정박지 01'~'07'(Neo4j Anchorage 어느 코드와 대응하는지 근거자료 없음)
-    과 '현대오일터미널신항부두'(신항1·2부두 중 어느 쪽인지 표기로 판별 불가)다.
-    억지로 맞추지 않고 그대로 노출한다 — mart_views.sql 0-B절 참고.
+    대부분 호안·물양장·의장안벽(OTHER)과 '정박지 01'~'07'·'현대오일터미널신항부두'
+    (UNMAPPED)다. 위치로 선석·정박지가 확인된 배는 여기서 빠진다 — 신고 표기가
+    UNMAPPED 여도 좌표로 풀렸으면 더는 갭이 아니다(mart_views.sql 2-1절).
     """
-    now = datetime.now(timezone.utc)
     rows = (
         await db.execute(
             text("""
-                WITH latest_calls AS (
-                    SELECT DISTINCT ON (port_call_id)
-                        port_call_id, facility_name, arrival_at_utc, departure_at_utc
-                    FROM upa_port_call
-                    WHERE arrival_at_utc IS NOT NULL AND arrival_at_utc < :now
-                      AND (departure_at_utc IS NULL OR departure_at_utc > :now)
-                    ORDER BY port_call_id, arrival_at_utc
-                )
-                SELECT lc.facility_name, fa.facility_type, count(*) AS occupant_count
-                FROM latest_calls lc
-                JOIN mart.facility_alias fa ON fa.source_name = lc.facility_name
-                WHERE fa.facility_type IN ('UNMAPPED', 'OTHER')
-                GROUP BY lc.facility_name, fa.facility_type
+                SELECT vts_facility_name AS facility_name,
+                       vts_facility_type AS facility_type,
+                       count(*) AS occupant_count
+                FROM mart.vessel_presence
+                WHERE presence_zone = 'STOPPED'
+                  AND vts_facility_type IN ('UNMAPPED', 'OTHER')
+                  AND vts_event IS DISTINCT FROM '출항'
+                GROUP BY vts_facility_name, vts_facility_type
                 ORDER BY occupant_count DESC
             """),
-            {"now": now},
         )
     ).mappings().all()
     return [dict(row) for row in rows]
 
 
 # --------------------------------------------------------------------------
-# 정박지 현황 (Neo4j Anchorage + upa_port_call 재선 이력, mart.facility_alias 경유)
+# 정박지 현황 (Neo4j Anchorage + mart.vessel_presence 대기 현황)
 #
-# 예전엔 E1/E2/E3 매핑을 이 파일에 하드코딩했다. 지금은 mart.facility_alias의
-# facility_type='ANCHORAGE' 행(정박지-E1 → E1 등)에서 그대로 가져온다 —
-# 매핑이 하나 늘어도(예: 정박지 01~07의 대응이 나중에 확인되면) mart_views.sql
-# 쪽 수동 별칭만 추가하면 되고 backend 코드는 안 건드려도 된다.
-# '정박지 01'~'07'은 아직 대응 근거가 없어(mart_views.sql 0-B절) 이 조인에
-# 안 걸리고, current_occupants는 여전히 null로 남는다 — 억지로 맞추지 않는다.
+# 2026-09-17 — 정박지 대기도 UPA 선박위치로 센다. 예전엔 upa_port_call 의
+# '정박지-E1'~'E3' 신고만 facility_alias 로 붙여서 E1~E3 외 17곳(M1~M7·T·W·급유
+# 정박지)은 늘 null 이었고, 유령 기록(정박지 "미출항" 141건 중 130건)이 대기
+# 척수에 섞였다. 이제 upa_anchorage 구역(Neo4j Anchorage.id 와 같은 이름) 안에
+# 멈춰 있는 배를 세므로 20곳 모두 값이 있다.
 # --------------------------------------------------------------------------
 
 _CYPHER_ALL_ANCHORAGES = """
@@ -219,28 +221,20 @@ RETURN a.id AS anchorage_id, a.name AS name, a.tonnage_rule AS tonnage_rule,
 """
 
 _QUERY_ANCHORAGE_OCCUPANCY = text("""
-    WITH latest_calls AS (
-        SELECT DISTINCT ON (port_call_id)
-            port_call_id, facility_name, arrival_at_utc, departure_at_utc
-        FROM upa_port_call
-        WHERE arrival_at_utc IS NOT NULL
-          AND arrival_at_utc < :now
-          AND (departure_at_utc IS NULL OR departure_at_utc > :now)
-        ORDER BY port_call_id, arrival_at_utc
-    )
-    SELECT fa.anchorage_key, count(*) AS occupant_count
-    FROM latest_calls lc
-    JOIN mart.facility_alias fa
-      ON fa.source_name = lc.facility_name AND fa.facility_type = 'ANCHORAGE'
-    GROUP BY fa.anchorage_key
+    SELECT anchorage_name, count(*) AS occupant_count,
+           array_agg(vessel_name ORDER BY vessel_name) AS vessel_names
+    FROM mart.vessel_presence
+    WHERE presence_zone = 'ANCHORAGE'
+    GROUP BY anchorage_name
 """)
+
+# 위치 스냅샷이 아예 없으면(수집 전·DB 비어 있음) 0척이 아니라 "모름"이다.
+_QUERY_POSITION_SNAPSHOT = text("SELECT max(snapshot_at_utc) AS at FROM mart.vessel_presence")
 
 
 @router.get("/anchorages", summary="정박지 목록 및 실시간 대기 현황")
 async def get_anchorages_overview(db: AsyncSession = Depends(get_session)) -> list[dict]:
-    """전체 정박지 목록 + 실시간 대기 척수(mart.facility_alias에 매핑된 것만, 나머지는 null)."""
-    now = datetime.now(timezone.utc)
-
+    """전체 정박지 목록 + 실시간 대기 척수(UPA 선박위치로 구역 안에 멈춘 배, mart.vessel_presence)."""
     async with neo4j_client.driver.session() as session:
         async def _tx(tx):
             result = await tx.run(_CYPHER_ALL_ANCHORAGES)
@@ -248,16 +242,18 @@ async def get_anchorages_overview(db: AsyncSession = Depends(get_session)) -> li
 
         anchorages = await session.execute_read(_tx)
 
-    occupancy_rows = (
-        await db.execute(_QUERY_ANCHORAGE_OCCUPANCY, {"now": now})
-    ).mappings().all()
-    count_by_anchorage = {row["anchorage_key"]: row["occupant_count"] for row in occupancy_rows}
+    occupancy_rows = (await db.execute(_QUERY_ANCHORAGE_OCCUPANCY)).mappings().all()
+    by_anchorage = {row["anchorage_name"]: row for row in occupancy_rows}
+    snapshot_at = (await db.execute(_QUERY_POSITION_SNAPSHOT)).scalar()
 
     out = []
     for a in anchorages:
+        occ = by_anchorage.get(a["anchorage_id"])
         out.append({
             **a,
-            "current_occupants": count_by_anchorage.get(a["anchorage_id"]),
+            "current_occupants": (occ["occupant_count"] if occ else 0) if snapshot_at else None,
+            "current_vessel_names": occ["vessel_names"] if occ else [],
+            "occupancy_observed_at_utc": snapshot_at,
         })
     return out
 
@@ -289,11 +285,36 @@ _QUERY_DASHBOARD_CURRENT_VESSELS = text("""
 """)
 
 
+# 위치 판정 결과(mart.vessel_presence)를 선박마다 붙인다. 화면의 "접안 중 N척"·
+# "정박지 대기 N척"이 AIS 자기신고 항해상태가 아니라 선석 점유(/berths)와 같은
+# 기준으로 세어지게 하려는 것이다 — 한 화면에 기준이 두 개면 숫자가 서로 어긋난다
+# (2026-09-17 실측: 자기신고 '정박(계류)' 34척 vs 위치 판정 선석 41척).
+# SQL 에서 MMSI OR 호출부호로 조인하면 5초가 걸려 여기서 합친다.
+_QUERY_PRESENCE_BY_VESSEL = text("""
+    SELECT mmsi, callsgn, presence_zone, berth_name, berth_basis, anchorage_name
+    FROM mart.vessel_presence
+""")
+
+
 @router.get("/vessels", summary="선박 실시간 위치 조회")
 async def get_vessel_positions(db: AsyncSession = Depends(get_session)) -> list[dict]:
-    """선박별 최신 위치 1건(지도 표시용). 좌표 결측 행은 제외."""
+    """선박별 최신 위치 1건(지도 표시용). 좌표 결측 행은 제외. 위치 판정(presence_*) 포함."""
     rows = (await db.execute(_QUERY_DASHBOARD_CURRENT_VESSELS)).mappings().all()
-    return [dict(row) for row in rows]
+    presence = (await db.execute(_QUERY_PRESENCE_BY_VESSEL)).mappings().all()
+    by_mmsi = {p["mmsi"]: p for p in presence if p["mmsi"] is not None}
+    by_callsgn = {p["callsgn"]: p for p in presence if p["mmsi"] is None and p["callsgn"]}
+
+    out = []
+    for row in rows:
+        item = dict(row)
+        p = by_mmsi.get(item.get("mmsi")) if item.get("mmsi") is not None else by_callsgn.get(item.get("callsgn"))
+        # 최신 스냅샷(3시간)에 없는 배는 판정이 없다 — null 로 두고 추정하지 않는다.
+        item["presence_zone"] = p["presence_zone"] if p else None
+        item["presence_berth_name"] = p["berth_name"] if p else None
+        item["presence_berth_basis"] = p["berth_basis"] if p else None
+        item["presence_anchorage_name"] = p["anchorage_name"] if p else None
+        out.append(item)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -310,13 +331,15 @@ async def get_vessel_positions(db: AsyncSession = Depends(get_session)) -> list[
 _QUERY_DRAUGHT_CHECK = text("""
     SELECT callsgn, facility_name, chart_depth_m, tide_level_m, available_depth_m,
            vessel_draught_m, ukc_m, ukc_required_m, draught_verdict,
-           tide_observed_at_utc, draught_observed_at_utc, arrival_at_utc
+           tide_observed_at_utc, draught_observed_at_utc, arrival_at_utc,
+           chart_depth_max_m
     FROM mart.berth_draught_check
     ORDER BY CASE draught_verdict
                  WHEN 'NOT_ALLOWED' THEN 0
                  WHEN 'MARGINAL' THEN 1
-                 WHEN 'UNKNOWN' THEN 2
-                 ELSE 3
+                 WHEN 'CHECK' THEN 2      -- 선석별 수심 다름 → 접안 선석 확인 요청
+                 WHEN 'UNKNOWN' THEN 3
+                 ELSE 4
              END, arrival_at_utc DESC
 """)
 

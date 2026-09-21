@@ -86,8 +86,9 @@ async def build_safety_index(db: AsyncSession, driver: AsyncDriver) -> dict:
         axes.append(_axis("기상 여유", None, "관측값 없음 — 판정 불가"))
 
     # 2. 흘수 여유 — 접안 불가/경계 판정이 얼마나 섞여 있나.
-    #    UNKNOWN(부두 제원 미확보)은 분모에서 뺀다. 모르는 것을 안전으로도
-    #    위험으로도 세지 않기 위해서다 — 대신 basis 에 몇 건인지 밝힌다.
+    #    UNKNOWN(부두 제원 미확보)과 CHECK(선석별 수심이 달라 어느 선석인지 확인 필요)는
+    #    분모에서 뺀다. 모르는 것을 안전으로도 위험으로도 세지 않기 위해서다 —
+    #    대신 basis 에 몇 건인지 밝힌다.
     rows = {r["draught_verdict"]: r["n"] for r in (await db.execute(_Q_DRAUGHT)).mappings()}
     judged = rows.get("OK", 0) + rows.get("MARGINAL", 0) + rows.get("NOT_ALLOWED", 0)
     if judged:
@@ -95,7 +96,8 @@ async def build_safety_index(db: AsyncSession, driver: AsyncDriver) -> dict:
         axes.append(_axis(
             "흘수 여유", (1 - penalty / judged) * 100,
             f"판정 {judged}건 중 접안불가 {rows.get('NOT_ALLOWED', 0)}·"
-            f"경계 {rows.get('MARGINAL', 0)} (제원 미확보 {rows.get('UNKNOWN', 0)}건 제외)",
+            f"경계 {rows.get('MARGINAL', 0)} (제원 미확보 {rows.get('UNKNOWN', 0)}건·"
+            f"선석 확인 요청 {rows.get('CHECK', 0)}건 제외)",
         ))
     else:
         axes.append(_axis(
