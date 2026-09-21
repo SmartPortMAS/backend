@@ -391,3 +391,134 @@ async def find_assessability_facts(
         )
         for row in rows
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# D3 — 인접 선석 확장 탐색 (9/17 회의 §3, 목표일 9/23)
+#
+# ★ 왜 새로 필요한가 (2026-09-22 실측)
+#   위의 쿼리들은 전부 "대상 화물 1 : 이미 골라 준 화물 N" 1홉이다. 그 N을 누가
+#   고르느냐가 문제였다 — berth_alerts.py 는 `mart.berth_current_cargo` 를
+#   facility_name 으로 묶어 **같은 선석** 화물끼리만 짝지었다. 그래서 Neo4j 에
+#   적재돼 있는 (:Berth)-[:ADJACENT_TO]->(:Berth) 120개 관계를 백엔드가 단 한
+#   번도 타지 않았다(`grep -rn ADJACENT_TO backend/app` → 0건).
+#
+#   결과적으로 "옆 부두에 상극 화물이 붙어 있다"는 조합은 지금까지 아무 경고도
+#   내지 않았다. 실측 인접쌍은 부두 단위 11쌍 — S-Oil 1·2·4부두, 효성-달포,
+#   OTK1-대한유화, 정일1-2, SK5~8 이 서로 251~484m 안에 있다.
+#
+# ★ 왜 "한 방"인가
+#   재항 현황은 Postgres 에만 있는 실시간 상태라 그래프가 들고 있을 수 없다.
+#   대신 호출부가 **이미 읽어 둔** 선석별 화물 목록을 그대로 파라미터로 넘긴다
+#   (berth_alerts 는 전 선석 화물을 한 번에 읽으므로 추가 조회가 0이다).
+#   그러면 선석→인접→재항화물→충돌이 Cypher 한 번의 탐색으로 끝난다.
+#
+# ★ 경로 문장을 Cypher 가 만든다
+#   근거를 화면이 다시 조립하면 표현이 갈라진다. 어떤 관계를 타고 결론에
+#   닿았는지는 그래프가 제일 정확히 알고 있으므로 여기서 문장을 만든다.
+#
+# ★ 같은 부두 안의 쌍은 일부러 뺀다(WHERE nb.wharf_name <> $wharf_name).
+#   그건 berth_alerts 의 기존 같은-선석 판정이 이미 보고 있다 — 두 경로가 같은
+#   쌍을 각각 경고하면 관제사가 같은 위험을 두 번 본다.
+#   Berth 노드는 선석마다 1개라 한 부두에 여러 개다. 부두 단위로 접은 뒤
+#   가장 가까운 거리만 남긴다(min) — 같은 부두쌍이 여러 줄로 불어나지 않게.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CYPHER_ADJACENT_BERTH_CONFLICTS = """
+MATCH (here:Berth {wharf_name: $wharf_name})-[adj:ADJACENT_TO]->(nb:Berth)
+WHERE nb.wharf_name <> $wharf_name
+WITH nb.wharf_name AS neighbor_wharf, min(adj.distance_m) AS distance_m
+UNWIND $neighbor_cargo AS nc
+WITH neighbor_wharf, distance_m, nc
+WHERE nc.wharf_name = neighbor_wharf
+MATCH (a:Chemical {id: $target})
+MATCH (b:Chemical {id: nc.chem_id})
+// 충돌 근거 세 갈래를 한 서브쿼리로 합친다. 근거가 다른 신호라 어느 하나로
+// 대체할 수 없다 — MSDS 텍스트 마이닝 2방향(비대칭이라 양쪽을 다 봐야 한다.
+// 파일 상단 설명 참고) + IMDG Chapter 7.2 공인 격리표.
+// `CALL (a, b) {` 는 Neo4j 5.23+ 의 변수 스코프 문법이다(현 서버 5.26).
+// 예전 `CALL { WITH a, b` 는 5.26 에서 deprecated 경고를 낸다.
+CALL (a, b) {
+    MATCH (a)-[:INCOMPATIBLE_WITH]->(m)<-[:IS_CLASSIFIED_AS]-(b)
+    RETURN 'MSDS_INCOMPATIBLE' AS basis, m.name AS via, NULL AS code,
+           'target_incompatible_with_adjacent' AS direction
+  UNION
+    MATCH (b)-[:INCOMPATIBLE_WITH]->(m)<-[:IS_CLASSIFIED_AS]-(a)
+    RETURN 'MSDS_INCOMPATIBLE' AS basis, m.name AS via, NULL AS code,
+           'adjacent_incompatible_with_target' AS direction
+  UNION
+    MATCH (a)-[:HAS_IMDG_CLASS]->(ca:ImdgClass)-[s:SEGREGATE]->(cb:ImdgClass)
+          <-[:HAS_IMDG_CLASS]-(b)
+    RETURN 'IMDG_SEGREGATION' AS basis, ca.code + ' / ' + cb.code AS via,
+           s.code AS code, 'imdg_segregation' AS direction
+}
+RETURN DISTINCT
+    neighbor_wharf                       AS neighbor_wharf,
+    distance_m                           AS distance_m,
+    b.id                                 AS chem_id,
+    coalesce(b.name_ko, nc.cargo_name)   AS name_ko,
+    nc.callsgn                           AS callsgn,
+    basis                                AS basis,
+    via                                  AS via,
+    code                                 AS segregation_code,
+    direction                            AS direction,
+    $wharf_name + ' —인접(' +
+        CASE WHEN distance_m IS NULL THEN '거리 미상'
+             ELSE toString(toInteger(round(distance_m))) + 'm' END +
+        ')→ ' + neighbor_wharf +
+        ' —재항→ ' + coalesce(b.name_ko, nc.cargo_name) +
+        ' —' + CASE basis
+                   WHEN 'MSDS_INCOMPATIBLE' THEN '혼재금지(' + via + ')'
+                   ELSE 'IMDG격리(' + via + ' → ' + coalesce(code, '?') + ')'
+               END +
+        '→ ' + coalesce(a.name_ko, $target)  AS path_text
+// 거리 미상(SK5~8 처럼 좌표 없이 부두번호로 이은 쌍)은 맨 뒤로. Cypher 는
+// ORDER BY ... NULLS LAST 를 안 받아서 정렬 키를 직접 만든다.
+ORDER BY coalesce(distance_m, 1000000.0), neighbor_wharf, chem_id
+"""
+
+
+async def find_adjacent_berth_conflicts(
+    driver: AsyncDriver,
+    *,
+    wharf_name: str,
+    target_chem_id: str,
+    neighbor_cargo: list[dict],
+) -> list[dict]:
+    """대상 화물 하나에 대해 **인접 부두** 재항 화물과의 충돌을 한 번에 찾는다.
+
+    neighbor_cargo 는 호출부가 이미 읽어 둔 재항 현황 그대로 넘긴다 —
+    각 항목은 최소한 {"wharf_name", "chem_id"} 를 갖고, "callsgn"·"cargo_name"
+    이 있으면 경로 문장에 함께 실린다.
+
+    반환 행에는 `path_text`(그래프가 만든 경로 문장)가 들어 있다. 화면·프롬프트는
+    이 문장을 그대로 쓰면 되고, 근거를 다시 조립하지 않는다.
+    """
+    if not wharf_name or not target_chem_id or not neighbor_cargo:
+        return []
+
+    payload = [
+        {
+            "wharf_name": c.get("wharf_name"),
+            "chem_id": c.get("chem_id"),
+            "callsgn": c.get("callsgn"),
+            "cargo_name": c.get("cargo_name"),
+        }
+        for c in neighbor_cargo
+        if c.get("wharf_name") and c.get("chem_id")
+    ]
+    if not payload:
+        return []
+
+    async with driver.session() as session:
+
+        async def _tx(tx):
+            result = await tx.run(
+                _CYPHER_ADJACENT_BERTH_CONFLICTS,
+                wharf_name=wharf_name,
+                target=target_chem_id,
+                neighbor_cargo=payload,
+            )
+            return [record.data() async for record in result]
+
+        return await session.execute_read(_tx)
