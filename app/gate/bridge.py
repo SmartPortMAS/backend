@@ -12,10 +12,18 @@
   되는지는 파이가 판단해 status.denied 로 돌려준다. 여기서 먼저 거부하면 "화면이 막았다"가
   되고, 하드웨어 페일세이프를 보여주는 시연 장면 ③이 성립하지 않는다.
 
-판정은 새로 만들지 않는다
-  선석별 기상 판정은 weather 에이전트 rule_engine.evaluate(부두군 임계값)를 그대로 부른다.
-  정상이면 UNLOCKED, 하역중단 이상·판단불가면 LOCKED. 상태가 바뀔 때만 발행하고,
-  발행하지 않아도 60초마다 한 번은 다시 보내 파이가 재부팅돼도 최신 판정을 갖게 한다.
+잠그는 근거는 둘이고, 둘 다 새로 만들지 않는다
+  ① 기상 — weather 에이전트 rule_engine.evaluate(부두군 임계값)를 3초마다 그대로 부른다.
+     정상이 아니면(하역중단 이상·판단불가) 잠근다.
+  ② 판정 — 지금 그 선석에 붙어 있는 배(mart.vessel_presence)의 최신 '하역중' 판정이
+     부적합·판정불가면 잠근다. services/gate_state.py(/ws/hardware)와 같은 규칙이다
+     (models/assessment_history.GATE_BLOCKING_LEVELS). 판정 이력 표가 없는 DB면 ①만 쓴다.
+     · 판정 이력은 값이 바뀔 때만 기록되므로 시간으로 자르지 않는다. 대신 "지금 붙어
+       있는 배"의 "이번 입항 뒤" 판정만 본다 — 떠난 배의 판정으로 잠그지 않고, 오래
+       그대로인 부적합을 놓치지도 않는다.
+     · 붙어 있는 배가 없으면 ①만 적용하고 화면에 그렇게 쓴다.
+  둘 중 하나라도 잠그면 LOCKED. 상태가 바뀔 때만 발행하고, 발행하지 않아도 60초마다
+  한 번은 다시 보내 파이가 재부팅돼도 최신 판정을 갖게 한다.
 
 시연 입력
   시연장에서 실제 풍속이 16 m/s 가 될 리 없어, 풍속·파고를 주입하는 입력을 둔다.
@@ -40,6 +48,7 @@ from app.agents.weather.rule_engine import evaluate
 from app.agents.weather.schemas import WorkStatus
 from app.config import get_settings
 from app.database import AsyncSessionFactory
+from app.models.assessment_history import GATE_BLOCKING_LEVELS, AssessmentStage
 from app.neo4j_client import neo4j_client
 
 logger = logging.getLogger("gate_bridge")
@@ -48,6 +57,34 @@ OFFLINE_AFTER_SEC = 15.0      # 파이는 5초마다 status 를 보낸다 — �
 EVAL_PERIOD_SEC = 3.0         # 판정 주기 (weather_now 한 줄 조회라 가볍다)
 REPUBLISH_SEC = 60.0          # 바뀌지 않아도 이 간격으로 interlock 을 다시 발행
 _OBS_MAX_AGE = timedelta(hours=3)   # weather 에이전트 MAX_STALENESS 와 같다
+ASSESS_PERIOD_SEC = 15.0      # 판정 이력은 감시 작업이 10분마다 쓴다 — 15초면 충분하다
+_BLOCKING = tuple(level.value for level in GATE_BLOCKING_LEVELS)   # 부적합 · 판정불가
+
+_Q_HAS_ASSESSMENT = text("SELECT to_regclass('public.assessment_history') IS NOT NULL")
+# 게이트 선석에 지금 붙어 있는 배와, 그 배의 이번 입항 뒤 최신 '하역중' 판정.
+# 입항 시각을 모르면 3일로 자른다(지난 입항의 판정을 끌어오지 않게).
+_Q_BERTH_ASSESSMENT = text("""
+    WITH here AS (
+        SELECT upper(btrim(callsgn)) AS cs, vessel_name, berth_name, vts_arrival_at_utc
+        FROM mart.vessel_presence
+        WHERE presence_zone = 'BERTH'
+          AND berth_name = ANY(CAST(:berths AS text[]))
+          AND nullif(btrim(callsgn), '') IS NOT NULL
+    )
+    SELECT h.berth_name, h.cs AS call_sign, coalesce(a.vessel_name, h.vessel_name) AS vessel_name,
+           a.level, a.reasons, a.wharf_name AS assessed_wharf, a.assessed_at_utc
+    FROM here h
+    LEFT JOIN LATERAL (
+        SELECT ah.level, ah.reasons, ah.wharf_name, ah.vessel_name, ah.assessed_at_utc
+        FROM assessment_history ah
+        WHERE upper(btrim(ah.call_sign)) = h.cs
+          AND ah.stage = :during_cargo
+          AND ah.assessed_at_utc >= coalesce(h.vts_arrival_at_utc, now() - interval '3 days')
+        ORDER BY ah.assessed_at_utc DESC
+        LIMIT 1
+    ) a ON true
+    ORDER BY h.berth_name, h.cs
+""")
 
 _Q_WEATHER_NOW = text("""
     SELECT wind_speed_ms, weather_observed_at_utc, wave_height_sig_m, wave_observed_at_utc
@@ -80,6 +117,9 @@ class GateBridge:
         self._demo: dict = {}                                 # {"wind_ms", "wave_m", "set_at_utc"}
         self._groups: dict[str, str | None] = {}              # gate_id -> berth_group (Neo4j, 한 번만)
         self._thresholds: dict[str, dict] = {}
+        self._assess: dict[str, list[dict]] = {}              # 선석 -> 붙어 있는 배와 최신 하역중 판정
+        self._assess_mono = 0.0
+        self._assess_connected: bool | None = None             # None = 아직 안 봄, False = 표 없음
         self.connected = False
         self.client: mqtt.Client | None = None
         self._task: asyncio.Task | None = None
@@ -169,12 +209,43 @@ class GateBridge:
             return None
         return self._groups[gate_id]
 
+    async def _refresh_assessment(self, db) -> None:
+        """게이트 선석별로 지금 붙어 있는 배와 그 배의 최신 하역중 판정을 읽는다(15초 캐시)."""
+        if self._assess_connected is not None and time.monotonic() - self._assess_mono < ASSESS_PERIOD_SEC:
+            return
+        self._assess_mono = time.monotonic()
+        if not (await db.execute(_Q_HAS_ASSESSMENT)).scalar():
+            self._assess_connected, self._assess = False, {}
+            return
+        rows = (await db.execute(_Q_BERTH_ASSESSMENT, {
+            "berths": sorted(set(self.berth_of.values())),
+            "during_cargo": AssessmentStage.DURING_CARGO.value,
+        })).mappings().all()
+        by_berth: dict[str, list[dict]] = {}
+        for r in rows:
+            by_berth.setdefault(r["berth_name"], []).append({
+                "call_sign": r["call_sign"],
+                "vessel_name": r["vessel_name"],
+                "level": r["level"],                     # None = 이번 입항 뒤 하역중 판정 없음
+                "reasons": list(r["reasons"] or [])[:3],
+                "assessed_wharf": r["assessed_wharf"],
+                "assessed_at_utc": r["assessed_at_utc"].isoformat() if r["assessed_at_utc"] else None,
+                "blocking": r["level"] in _BLOCKING,
+            })
+        self._assess_connected, self._assess = True, by_berth
+
     async def evaluate_once(self) -> None:
         now = datetime.now(timezone.utc)
         with self._lock:
             demo = dict(self._demo)
         async with AsyncSessionFactory() as db:
             wx = (await db.execute(_Q_WEATHER_NOW)).mappings().first() or {}
+            try:
+                await self._refresh_assessment(db)
+            except Exception as e:  # noqa: BLE001 — 판정 이력을 못 읽어도 기상 잠금은 계속한다
+                await db.rollback()
+                self._assess_connected = None
+                logger.warning("판정 이력 조회 실패: %s", e)
             for gate_id, berth in self.berth_of.items():
                 group = await self._berth_group(gate_id, berth)
                 th = await get_berth_threshold(db, berth_group=group)
@@ -192,15 +263,26 @@ class GateBridge:
                     wind_speed_ms=wind, wind_is_stale=wind_stale,
                     wave_height_m=wave, wave_is_stale=wave_stale, threshold=th,
                 )
-                state = "UNLOCKED" if status is WorkStatus.NORMAL else "LOCKED"
-                reason = _short_reason(status, wind, wave, th) if state == "LOCKED" else ""
-                payload = {"state": state}
-                if state == "LOCKED":
-                    payload["reason"] = reason
+                weather_lock = status is not WorkStatus.NORMAL
+                blocking = [v for v in self._assess.get(berth, []) if v["blocking"]]
+                state = "LOCKED" if (weather_lock or blocking) else "UNLOCKED"
+                reason, reason_ko = "", []
+                if weather_lock:
+                    reason = _short_reason(status, wind, wave, th)
                     # 화면 근거는 넘긴 항목만 — "파고 0.5m < 2.0m 정상" 같은 줄까지 붙이면 관제사가
                     # 무엇 때문에 잠겼는지 한눈에 못 본다. 넘긴 항목이 없으면(판단불가) 전부 보인다.
                     exceeded = [r for r in reasons if "->" in r]
-                    payload["reason_ko"] = " · ".join(exceeded or reasons)
+                    reason_ko.append(" · ".join(exceeded or reasons))
+                if blocking:
+                    v = blocking[0]
+                    reason = reason or ("VERDICT UNFIT" if v["level"] == "부적합" else "VERDICT UNKNOWN")
+                    why = v["reasons"][0] if v["reasons"] else ""
+                    reason_ko.append(f"{v['vessel_name'] or v['call_sign']} 하역중 판정 {v['level']}"
+                                     + (f" — {why}" if why else ""))
+                payload = {"state": state}
+                if state == "LOCKED":
+                    payload["reason"] = reason[:16]
+                    payload["reason_ko"] = " / ".join(reason_ko)
                 with self._lock:
                     prev = self._interlock.get(gate_id)
                 changed = prev is None or prev["payload"].get("state") != state or prev["payload"].get("reason") != reason
@@ -210,6 +292,7 @@ class GateBridge:
                     with self._lock:
                         self._interlock[gate_id] = {
                             "payload": payload, "status": status.value, "reasons": reasons,
+                            "lock_by": {"weather": weather_lock, "assessment": bool(blocking)},
                             "wind_ms": wind, "wave_m": wave, "demo": bool(demo),
                             "sent_at_utc": now.isoformat(), "sent_mono": time.monotonic(), "published": ok,
                         }
@@ -234,6 +317,7 @@ class GateBridge:
             status = dict(self._status)
             interlock = dict(self._interlock)
             demo = dict(self._demo)
+        assess = dict(self._assess)
         gates = []
         for i, (gate_id, berth) in enumerate(self.berth_of.items()):
             st, at = status.get(gate_id, (None, None))
@@ -250,7 +334,10 @@ class GateBridge:
                     "reason_ko": il["payload"].get("reason_ko"), "status": il["status"],
                     "reasons": il["reasons"], "wind_ms": il["wind_ms"], "wave_m": il["wave_m"],
                     "demo": il["demo"], "sent_at_utc": il["sent_at_utc"],
+                    "lock_by": il.get("lock_by"),
                 },
+                # 지금 이 선석에 붙어 있는 배와 최신 하역중 판정 (없으면 빈 목록 — 기상만 적용)
+                "vessels": assess.get(berth, []),
                 "status": st,                       # 파이가 보낸 그대로 (interlock·valve·denied·last_result…)
                 "offline": at is None or (now_mono - at) > OFFLINE_AFTER_SEC,
                 "status_age_sec": age,
@@ -258,6 +345,7 @@ class GateBridge:
         return {
             "broker": {"host": self.host, "port": self.port, "connected": self.connected, "error": self._last_error},
             "demo": demo or None,
+            "assessment_connected": self._assess_connected,
             "gates": gates,
             "ts_utc": datetime.now(timezone.utc).isoformat(),
         }
