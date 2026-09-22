@@ -1,4 +1,4 @@
-"""upa_vessel_position 을 선박당 최신 1행으로 — 자연키 vessel_uid 단독
+"""(2026-09-22 무효화 — 0028 참고) upa_vessel_position 을 선박당 최신 1행으로
 
 Revision ID: 0020
 Revises: 0019
@@ -57,22 +57,13 @@ _NEW_IDX = "upa_vessel_position_uidx__vessel_uid"
 
 
 def upgrade() -> None:
-    # 1) 기존 행을 선박당 최신 1건만 남긴다. 유니크 인덱스를 먼저 만들면
-    #    중복 때문에 실패하므로 정리가 앞선다.
-    op.execute(
-        """
-        DELETE FROM upa_vessel_position a
-        USING upa_vessel_position b
-        WHERE a.vessel_uid = b.vessel_uid
-          AND (a.received_at_utc < b.received_at_utc
-               OR (a.received_at_utc = b.received_at_utc AND a.ctid < b.ctid))
-        """
-    )
-    op.execute(f"DROP INDEX IF EXISTS {_OLD_IDX}")
-    op.execute(
-        f"CREATE UNIQUE INDEX IF NOT EXISTS {_NEW_IDX} "
-        f"ON upa_vessel_position (vessel_uid)"
-    )
+    # [2026-09-22 되돌림] 이 리비전은 이제 아무것도 지우지 않는다.
+    #   원래는 선박당 최신 1행만 남기고(DELETE) 키를 vessel_uid 단독으로 바꿨다.
+    #   그런데 "이력은 ulsan_vessel_mart 가 맡는다"던 그 표를 0027 이 지워, 둘을
+    #   함께 돌리면 위치 이력이 어디에도 남지 않는다(실측: 6/27~ 93,404행 -> 2,688행).
+    #   아직 0020 을 안 돌린 DB 는 이력을 그대로 지키고, 이미 돌린 DB 는 0028 이
+    #   키를 되살린다(지워진 행은 S3 시각별 원본으로 8/6 이후를 다시 채울 수 있다).
+    pass
 
 
 def downgrade() -> None:
