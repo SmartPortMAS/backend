@@ -21,8 +21,22 @@ from app.models.environmental_obs import TideObs, WaveObs, WeatherForecast, Weat
 
 # 울산항 격자좌표 (data-pipeline의 weather_forecast_collector.py와 동일한 값).
 # 두 저장소가 별도 배포 단위라 상수를 공유하지 않고 각자 정의한다.
-ULSAN_PORT_NX = 102
-ULSAN_PORT_NY = 84
+#
+# [2026-09-21 정정] 102/84 -> 103/82.
+#   102/84 의 격자 중심은 35.5502N/129.3278E 로 울산항에서 11.4 km 북서쪽
+#   **내륙**이었다. 그 격자는 WAV(파고)가 정의되지 않아 KMA 가 0 을 돌려주고
+#   (실측: 408행 전부 0.0), 풍속도 해상보다 최대 4.5 m/s 낮게 나온다.
+#   풍속은 berth_weather_threshold 의 중단 게이트(12~17 m/s)에 직접 들어가므로
+#   내륙 격자를 쓰면 중단 판정이 조용히 누락된다.
+#
+#   새 값은 기상청 공식 DFS 변환으로 울산항 좌표(35.4665N, 129.399889E)를
+#   환산한 결과다 — data-pipeline 쪽 latlon_to_grid() 와 같은 알고리즘.
+#
+#   ※ 이 상수를 바꾸면 102/84 로 쌓인 옛 행은 조회되지 않는다(의도된 것).
+#     정박지·진입수로용 해상 격자(105/82)도 함께 수집되지만, 부두 하역·이안
+#     판정은 부두 격자를 쓰는 것이 맞아 여기서는 울산항 격자만 본다.
+ULSAN_PORT_NX = 103
+ULSAN_PORT_NY = 82
 
 
 @dataclass(frozen=True)

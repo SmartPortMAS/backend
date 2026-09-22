@@ -1,13 +1,28 @@
+"""종합 판정 API.
+
+[2026-09-21 전면 개편] 배정을 만드는 두 엔드포인트를 없앴다.
+
+없앤 것:
+  POST /orchestrator/assess-and-commit → BerthAssignment(status=APPROVED) INSERT
+  POST /orchestrator/reject            → BerthAssignment(status=REJECTED) INSERT
+
+둘 다 관제사 콘솔에서 누른 버튼이 **자리를 잠그던** 경로다. 우리는 자리를
+잠그지 않는다(9/17 회의 §1, 방향 C). 대신 같은 자리에 판정을 남기는
+`POST /orchestrator/assess-and-record` 를 뒀다 — 콘솔에서 배 하나를 골라
+지금 바로 판정하고 그 결과를 `assessment_history` 에 기록한다.
+
+`/assess` 는 그대로다. 판단만 하고 아무것도 쓰지 않는다.
+"""
+
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, text
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.orchestrator.schemas import OrchestratorRequest, OrchestratorResult, OverallDecision
+from app.agents.orchestrator.schemas import OrchestratorRequest, OrchestratorResult
 from app.agents.orchestrator.service import orchestrate
-from app.agents.scheduling.occupancy import find_free_slot
 from app.core.deps import get_llm_client, get_session
 from app.core.exceptions import (
     CargoCategoryUnknownError,
@@ -16,37 +31,30 @@ from app.core.exceptions import (
     MsdsUpstreamError,
 )
 from app.llm.base import LLMClient
-from app.models.berth_assignment import (
-    ACTIVE_STATUSES,
-    STATUS_APPROVED,
-    STATUS_REJECTED,
-    BerthAssignment,
-)
 from app.neo4j_client import neo4j_client
+from app.services.assessment import (
+    level_from_decision,
+    record_from_orchestrator,
+    stage_from_nav_status,
+)
 
 router = APIRouter(prefix="/orchestrator", tags=["orchestrator"])
 
 _DESCRIPTION = """
-**선석 배정 화면의 주 엔드포인트.** 기상 → 선석 후보 → 선석별 기상 재판정 → 혼재 판정을
+**선석 검증 화면의 주 엔드포인트.** 기상 → 선석 후보 → 선석별 기상 재판정 → 혼재 판정을
 순서대로 돌려 결론 하나를 냅니다. 개별 에이전트 API를 따로 호출해 합치지 마세요 —
 기상이 불가면 선석 탐색을 건너뛰고, 선석 확정 후 그 부두그룹 임계값으로 기상을 다시
 판정하는 순서가 여기 들어 있습니다.
 
-**`overall_decision`**
+**`assigned_wharf_name` 을 반드시 채워 주세요(검증모드).** 비우면 118석 전체를
+탐색해 top-3를 고릅니다 — 이 시스템이 하지 않기로 한 동작입니다. 배정은 항만공사
+선석회의가 하고, 우리는 그 배정이 조건에 맞는지 확인합니다.
 
-| 값 | 함께 볼 필드 |
-|---|---|
-| `승인가능` | `selected_berth` |
-| `기상불가_중단권고` | `weather_assessment.reasons` |
-| `적합선석없음` | — |
-| `전후보배정불가` | `rejected_candidates` |
-| `정박지대기` | `anchorage_assignment` |
+**`overall_decision`** 은 아직 배정 주체의 어휘(`승인가능`/`적합선석없음` …)로 나옵니다.
+화면에 그대로 쓰지 마세요 — `assessment_history.level`(적합/주의/부적합/판정불가)로
+옮겨진 값을 쓰거나, `/orchestrator/assess-and-record` 를 부르면 그 변환까지 끝납니다.
 
-**`승인가능` 외 네 상태는 모두 "지금 하역하면 안 되는" 상태**입니다. 관제사가 원인을
-구분하도록 분리한 것이니 화면에서도 구분해 주세요.
-
-`assignment_trace`는 전용 → 대체 → 정박지 판단 경로를 사람이 읽는 문장으로 담습니다.
-왜 이 선석이 나왔는지 설명할 때 그대로 노출하면 됩니다.
+`assignment_trace`는 판단 경로를 사람이 읽는 문장으로 담습니다.
 
 배경: `04_오케스트레이터_설계문서.md`
 """
@@ -59,17 +67,8 @@ _RESPONSES: dict = {
 }
 
 
-@router.post(
-    "/assess",
-    response_model=OrchestratorResult,
-    summary="선석 배정 종합 판정 (기상 + 스케줄링 + 안전관제)",
-    description=_DESCRIPTION,
-    responses=_RESPONSES,
-)
-async def assess(
-    request: OrchestratorRequest,
-    db: AsyncSession = Depends(get_session),
-    llm_client: LLMClient = Depends(get_llm_client),
+async def _orchestrate_or_http(
+    db: AsyncSession, llm_client: LLMClient, request: OrchestratorRequest,
 ) -> OrchestratorResult:
     try:
         return await orchestrate(db, neo4j_client.driver, llm_client, request)
@@ -86,40 +85,41 @@ async def assess(
         raise HTTPException(status_code=502, detail=f"LLM 판단 생성 실패 ({e.provider}): {e.reason}")
 
 
+@router.post(
+    "/assess",
+    response_model=OrchestratorResult,
+    summary="종합 판정 (기상 + 스케줄링 + 안전관제) — 아무것도 기록하지 않음",
+    description=_DESCRIPTION,
+    responses=_RESPONSES,
+)
+async def assess(
+    request: OrchestratorRequest,
+    db: AsyncSession = Depends(get_session),
+    llm_client: LLMClient = Depends(get_llm_client),
+) -> OrchestratorResult:
+    return await _orchestrate_or_http(db, llm_client, request)
+
+
 # ---------------------------------------------------------------------------
-# 즉석 확정 (2026-08-19 신설)
+# 판정 기록 (2026-09-21 — 옛 assess-and-commit 자리)
 #
-# /assess는 판단만 하고 아무것도 쓰지 않는다 — 실제 배정은 arrival_watcher(10분
-# 주기 배경 잡)가 이미 만들어 둔 REQUESTED 행을 POST /approvals/{id}/decision으로
-# 승인해야만 생긴다. 그런데 관제사가 종합에이전트 콘솔에서 임의의 배를 직접 골라
-# /assess를 부르면, 그 배가 아직 arrival_watcher 주기에 안 걸렸을 수 있다 — 이때
-# "승인"을 눌러도 승인할 REQUESTED 행 자체가 없어 아무 일도 안 일어난다(실사용
-# 중 발견: 관제사가 승인을 눌렀는데 선석배정현황에 계속 대기로 뜸).
+# 관제사가 콘솔에서 배 하나를 골라 "지금 판정"을 누르는 경우다. 배경 잡
+# (watch_arrivals, 10분)이 아직 그 배를 안 훑었을 수 있으므로 즉석으로 돌린다.
 #
-# 이 엔드포인트는 그 경우를 위한 것이다 — 판단과 확정을 한 번에 한다: 다시
-# orchestrate()를 돌려(콘솔이 보여준 결과와 승인 시점 사이에 다른 배가 그 자리를
-# 먼저 가져갔을 수 있으므로 그대로 믿지 않고 재검증한다) APPROVED가 나오면 그
-# 자리에서 slot_no를 잡아 status=APPROVED로 바로 INSERT한다. REQUESTED를 거치지
-# 않는다 — 관제사가 이미 이 자리에서 승인을 결정했으므로 별도 승인 대기가 의미가
-# 없다.
+# 옛 판은 여기서 berth_assignment 를 status=APPROVED 로 INSERT 했다 — 콘솔
+# 버튼이 곧 배정이었다. 지금은 판정 1건을 남길 뿐이고, 어떤 자원도 잠기지 않는다.
 # ---------------------------------------------------------------------------
 
 
-class AssessAndCommitRequest(OrchestratorRequest):
-    call_sign: str = Field(description="선박 호출부호 — 배정 행 식별 키")
+class AssessAndRecordRequest(OrchestratorRequest):
+    call_sign: str = Field(description="선박 호출부호 — 판정 행의 식별 키")
     vessel_name: str | None = None
-    imo_no: str | None = None
-    approved_by: str = Field(description="이 확정을 실행한 관제사")
 
 
-# arrival_watcher._QUERY_PENDING_ARRIVALS와 동일 소스(mart.dashboard_current —
-# upa_port_call/portmis_vessel을 이미 조인해 둔 뷰)에서 VTS 확인 입출항 시각을
-# 가져온다. 프론트가 보낸 window_start/window_end는 계획값(관제사 콘솔에서는
-# "지금~+8시간" 고정값)이라 실제 입출항 시각과 다르다 — actual_berthing_at/
-# actual_departure_at은 반드시 이 확정 관측치로 채워야 한다(모델 주석: "계획이
-# 아니라 사후 확인값").
-_QUERY_ACTUAL_PORT_CALL_TIMES = text("""
-    SELECT arrival_at_utc, departure_at_utc
+# 시점(stage)은 AIS 항해상태로만 정한다 — 프런트가 보낸 값을 믿지 않고 여기서 읽는다.
+# PORT-MIS 를 쓰지 않는 이유는 app/models/assessment_history.py::AssessmentStage 참고.
+_QUERY_LIVE_STATE = text("""
+    SELECT nav_status_code, received_at_utc, facility_name, draught
     FROM mart.dashboard_current
     WHERE callsgn = :call_sign
     ORDER BY received_at_utc DESC NULLS LAST
@@ -127,251 +127,66 @@ _QUERY_ACTUAL_PORT_CALL_TIMES = text("""
 """)
 
 
-class AssessAndCommitResult(BaseModel):
+class AssessAndRecordResult(BaseModel):
     result: OrchestratorResult
-    committed: bool = Field(description="실제로 berth_assignment가 생성됐는가")
-    assignment_id: int | None = Field(default=None, description="committed=True일 때 생성된 행의 id")
-    not_committed_reason: str | None = Field(
-        default=None, description="committed=False인 이유(사람이 읽는 문장) — result만으로는 "
-        "'왜 못 만들었는지'(만석 vs 배정불가)가 구분 안 되므로 별도로 둔다"
+    recorded: bool = Field(
+        description="판정이 실제로 기록됐는가. 직전 판정과 시점·등급·조치안이 모두 같으면 "
+        "기록하지 않는다(변화만 남긴다) — 그때 False"
     )
+    level: str = Field(description="적합 | 주의 | 부적합 | 판정불가")
+    stage: str | None = Field(default=None, description="AIS 항해상태로 정한 시점. 상태를 모르면 None")
 
 
 @router.post(
-    "/assess-and-commit",
-    response_model=AssessAndCommitResult,
-    summary="종합 판정 + 즉석 확정 (관제사가 콘솔에서 직접 승인, §5.3)",
+    "/assess-and-record",
+    response_model=AssessAndRecordResult,
+    summary="종합 판정 + 판정 이력 기록 (배정하지 않음)",
     responses=_RESPONSES,
 )
-async def assess_and_commit(
-    request: AssessAndCommitRequest,
+async def assess_and_record(
+    request: AssessAndRecordRequest,
     db: AsyncSession = Depends(get_session),
     llm_client: LLMClient = Depends(get_llm_client),
-) -> AssessAndCommitResult:
-    try:
-        result = await orchestrate(db, neo4j_client.driver, llm_client, request)
-    except MsdsNotFoundError as e:
-        raise HTTPException(status_code=404, detail=f"MSDS not found for identifier: {e.identifier}")
-    except MsdsUpstreamError as e:
-        raise HTTPException(status_code=502, detail=f"KOSHA MSDS API 호출 실패: {e.reason}")
-    except CargoCategoryUnknownError as e:
+) -> AssessAndRecordResult:
+    if not request.assigned_wharf_name:
         raise HTTPException(
             status_code=422,
-            detail=f"화물({e.chem_id})에 선석 카테고리(cargo_category)가 지정되어 있지 않습니다.",
-        )
-    except LLMGenerationError as e:
-        raise HTTPException(status_code=502, detail=f"LLM 판단 생성 실패 ({e.provider}): {e.reason}")
-
-    if result.overall_decision is not OverallDecision.APPROVED or not result.selected_berth:
-        return AssessAndCommitResult(
-            result=result, committed=False,
-            not_committed_reason=f"판정 결과가 {result.overall_decision.value}라 확정할 선석이 없습니다.",
-        )
-
-    slot_no = await find_free_slot(
-        db, berth_id=result.selected_berth.berth_id,
-        window_start=request.window_start, window_end=request.window_end,
-        exclude_call_sign=request.call_sign,
-    )
-    if slot_no is None:
-        return AssessAndCommitResult(
-            result=result, committed=False,
-            not_committed_reason=f"추천 선석 '{result.selected_berth.wharf_name}'이 방금 만석이 "
-            "됐습니다(판정과 확정 사이의 경합) — 다시 실행해 보세요.",
-        )
-
-    actual_times = (
-        await db.execute(_QUERY_ACTUAL_PORT_CALL_TIMES, {"call_sign": request.call_sign})
-    ).mappings().first()
-
-    now = datetime.now(timezone.utc)
-
-    # [2026-08-23] 재확정(같은 배 · 같은 선석 · 겹치는 시간대)이면 새 행을 만들지
-    # 않고 기존 행을 갱신한다.
-    #
-    # 왜 필요한가 — 2026-08-21에 find_free_slot에 exclude_call_sign을 추가해
-    # "자기 예약 때문에 만석으로 오판정되던" 문제를 고쳤는데, 그 결과 슬롯은
-    # 잡히지만 뒤이은 INSERT가 배제 제약에 걸려 **HTTP 500**이 났다(실측 재현:
-    # 같은 call_sign으로 assess-and-commit 2회 → ExclusionViolationError).
-    # 수정 전에는 "방금 만석이 됐습니다"라는 틀린 안내라도 나갔는데 수정 후엔
-    # 에러 화면이라, 관제사 입장에서는 오히려 나빠진 상태였다.
-    #
-    # 제약과 점유 판정 모두 활성 상태(REQUESTED/APPROVED/SCHEDULED/BERTHED)만
-    # 대상이므로, 갱신 대상도 같은 조건으로 찾는다 — 이미 REJECTED된 행은
-    # 자원을 점유하지 않으므로 건드리지 않고 새로 만든다.
-    existing = await db.scalar(
-        select(BerthAssignment)
-        .where(
-            BerthAssignment.berth_id == result.selected_berth.berth_id,
-            func.upper(func.btrim(BerthAssignment.call_sign))
-            == request.call_sign.strip().upper(),
-            BerthAssignment.status.in_(ACTIVE_STATUSES),
-            BerthAssignment.planned_window.op("&&")(
-                func.tstzrange(request.window_start, request.window_end, "[)")
+            detail=(
+                "assigned_wharf_name 이 필요합니다 — 이 시스템은 선석을 고르지 않고 "
+                "이미 배정된 시설이 조건에 맞는지 확인합니다."
             ),
         )
-        .order_by(BerthAssignment.created_at.desc())
-        .limit(1)
-    )
 
-    if existing is not None:
-        # planned_window·slot_no·berth_id는 건드리지 않는다 — 같은 배가 같은
-        # 시간대를 다시 확정하는 것이므로 점유 자원 자체는 바뀌지 않는다.
-        #
-        # status를 APPROVED로 올리는 이유: 이 엔드포인트의 동작 자체가 승인이다.
-        # arrival_watcher가 만든 REQUESTED 행을 관제사가 콘솔에서 확정하는 경로가
-        # 여기라, approved_by만 채우고 status를 REQUESTED로 두면 "누가 승인했는지는
-        # 적혀 있는데 승인되지 않은 행"이라는 모순 상태가 남는다.
-        #
-        # assignment_reason과 rejected_candidates는 둘 다 이번 판정(result)에서
-        # 나온 값이라 함께 갱신한다 — 한쪽만 바꾸면 요약문과 판정 근거가 서로
-        # 다른 시점을 가리킨다. actual_* 도 위에서 방금 조회한 VTS 확인값이므로
-        # 같이 반영한다(모델 주석: "계획이 아니라 사후 확인값").
-        existing.status = STATUS_APPROVED
-        existing.approved_by = request.approved_by
-        existing.assignment_reason = result.summary
-        existing.rejected_candidates = result.decision_detail()
-        if actual_times:
-            existing.actual_berthing_at = actual_times["arrival_at_utc"]
-            existing.actual_departure_at = actual_times["departure_at_utc"]
-        existing.updated_at = now
-        await db.commit()
-        await db.refresh(existing)
-        return AssessAndCommitResult(
-            result=result, committed=True, assignment_id=existing.id,
-            not_committed_reason=None,
-        )
+    base = OrchestratorRequest(**request.model_dump(include=set(OrchestratorRequest.model_fields)))
+    result = await _orchestrate_or_http(db, llm_client, base)
 
-    assignment = BerthAssignment(
-        berth_id=result.selected_berth.berth_id,
-        slot_no=slot_no,
+    live = (await db.execute(_QUERY_LIVE_STATE, {"call_sign": request.call_sign})).mappings().first()
+    stage = stage_from_nav_status(live["nav_status_code"] if live else None)
+
+    recorded = await record_from_orchestrator(
+        db,
         call_sign=request.call_sign,
-        imo_no=request.imo_no,
         vessel_name=request.vessel_name,
-        cargo_chem_id=request.cargo.chem_id,
-        planned_window=(request.window_start, request.window_end),
-        # VTS 확인 입출항 시각(mart.dashboard_current) — 아직 출항 전이면
-        # departure_at_utc는 null 그대로 둔다(추측 금지, arrival_watcher와 동일 원칙).
-        actual_berthing_at=actual_times["arrival_at_utc"] if actual_times else None,
-        actual_departure_at=actual_times["departure_at_utc"] if actual_times else None,
-        status=STATUS_APPROVED,
-        approved_by=request.approved_by,
-        assignment_reason=result.summary,
-        rejected_candidates=result.decision_detail(),
-        created_at=now,
-        updated_at=now,
-    )
-    db.add(assignment)
-    await db.commit()
-    await db.refresh(assignment)
-
-    return AssessAndCommitResult(result=result, committed=True, assignment_id=assignment.id)
-
-
-# ---------------------------------------------------------------------------
-# 즉석 반려 (2026-08-20 신설)
-#
-# assess-and-commit의 반려판, arrival_watcher가 만든 REQUESTED 행이 없는 배도
-# 콘솔에서 바로 반려할 수 있어야 한다(관제사가 종합 판정을 보고 승인/반려를
-# 그 자리에서 정한다는 게 이 콘솔의 원래 목적 — REQUESTED 행의 유무는 그
-# 판단과 무관해야 한다). berth_id/slot_no/planned_window 없이 REJECTED 행만
-# 남긴다 — 애초에 자원을 점유한 적 없는 반려이므로 EXCLUDE 제약 대상도 아니다
-# (berth_assignment.py 모델 주석 참고). arrival_watcher의 NOT EXISTS 조건은
-# REJECTED를 제외 대상에서 빼므로, 이 배는 다음 주기에 다시 후보로 잡힌다 —
-# 반려가 영구 배제는 아니다.
-# ---------------------------------------------------------------------------
-
-
-class RejectRequest(BaseModel):
-    call_sign: str = Field(description="선박 호출부호 — 배정 행 식별 키")
-    vessel_name: str | None = None
-    imo_no: str | None = None
-    cargo_chem_id: str | None = None
-    rejected_by: str = Field(description="이 반려를 실행한 관제사")
-    reason: str | None = Field(default=None, description="반려 사유(콘솔이 보여준 판정 요약 등)")
-
-
-class RejectResult(BaseModel):
-    assignment_id: int
-
-
-@router.post(
-    "/reject",
-    response_model=RejectResult,
-    summary="종합 판정 반려 (관제사가 콘솔에서 직접 반려, §5.3)",
-)
-async def reject(request: RejectRequest, db: AsyncSession = Depends(get_session)) -> RejectResult:
-    now = datetime.now(timezone.utc)
-
-    # [2026-08-23] 재확정(같은 배 · 같은 선석 · 겹치는 시간대)이면 새 행을 만들지
-    # 않고 기존 행을 갱신한다.
-    #
-    # 왜 필요한가 — 2026-08-21에 find_free_slot에 exclude_call_sign을 추가해
-    # "자기 예약 때문에 만석으로 오판정되던" 문제를 고쳤는데, 그 결과 슬롯은
-    # 잡히지만 뒤이은 INSERT가 배제 제약에 걸려 **HTTP 500**이 났다(실측 재현:
-    # 같은 call_sign으로 assess-and-commit 2회 → ExclusionViolationError).
-    # 수정 전에는 "방금 만석이 됐습니다"라는 틀린 안내라도 나갔는데 수정 후엔
-    # 에러 화면이라, 관제사 입장에서는 오히려 나빠진 상태였다.
-    #
-    # 제약과 점유 판정 모두 활성 상태(REQUESTED/APPROVED/SCHEDULED/BERTHED)만
-    # 대상이므로, 갱신 대상도 같은 조건으로 찾는다 — 이미 REJECTED된 행은
-    # 자원을 점유하지 않으므로 건드리지 않고 새로 만든다.
-    existing = await db.scalar(
-        select(BerthAssignment)
-        .where(
-            BerthAssignment.berth_id == result.selected_berth.berth_id,
-            func.upper(func.btrim(BerthAssignment.call_sign))
-            == request.call_sign.strip().upper(),
-            BerthAssignment.status.in_(STATUS_ACTIVE),
-            BerthAssignment.planned_window.op("&&")(
-                func.tstzrange(request.window_start, request.window_end, "[)")
+        stage=stage,
+        wharf_name=request.assigned_wharf_name,
+        result=result,
+        input_snapshot={
+            "source": "관제사 콘솔",
+            "target_facility": request.assigned_wharf_name,
+            "portmis_facility": live["facility_name"] if live else None,
+            "nav_status_code": live["nav_status_code"] if live else None,
+            "position_at_utc": (
+                live["received_at_utc"].isoformat()
+                if live and isinstance(live["received_at_utc"], datetime) else None
             ),
-        )
-        .order_by(BerthAssignment.created_at.desc())
-        .limit(1)
+            "draught_m": float(request.vessel.draught_m) if request.vessel.draught_m else None,
+            "requested_at_utc": datetime.now(timezone.utc).isoformat(),
+        },
     )
-
-    if existing is not None:
-        # planned_window·slot_no·berth_id는 건드리지 않는다 — 같은 배가 같은
-        # 시간대를 다시 확정하는 것이므로 점유 자원 자체는 바뀌지 않는다.
-        #
-        # status를 APPROVED로 올리는 이유: 이 엔드포인트의 동작 자체가 승인이다.
-        # arrival_watcher가 만든 REQUESTED 행을 관제사가 콘솔에서 확정하는 경로가
-        # 여기라, approved_by만 채우고 status를 REQUESTED로 두면 "누가 승인했는지는
-        # 적혀 있는데 승인되지 않은 행"이라는 모순 상태가 남는다.
-        #
-        # assignment_reason과 rejected_candidates는 둘 다 이번 판정(result)에서
-        # 나온 값이라 함께 갱신한다 — 한쪽만 바꾸면 요약문과 판정 근거가 서로
-        # 다른 시점을 가리킨다. actual_* 도 위에서 방금 조회한 VTS 확인값이므로
-        # 같이 반영한다(모델 주석: "계획이 아니라 사후 확인값").
-        existing.status = STATUS_APPROVED
-        existing.approved_by = request.approved_by
-        existing.assignment_reason = result.summary
-        existing.rejected_candidates = result.decision_detail()
-        if actual_times:
-            existing.actual_berthing_at = actual_times["arrival_at_utc"]
-            existing.actual_departure_at = actual_times["departure_at_utc"]
-        existing.updated_at = now
-        await db.commit()
-        await db.refresh(existing)
-        return AssessAndCommitResult(
-            result=result, committed=True, assignment_id=existing.id,
-            not_committed_reason=None,
-        )
-
-    assignment = BerthAssignment(
-        call_sign=request.call_sign,
-        imo_no=request.imo_no,
-        vessel_name=request.vessel_name,
-        cargo_chem_id=request.cargo_chem_id,
-        status=STATUS_REJECTED,
-        approved_by=request.rejected_by,
-        assignment_reason=request.reason,
-        created_at=now,
-        updated_at=now,
-    )
-    db.add(assignment)
     await db.commit()
-    await db.refresh(assignment)
 
-    return RejectResult(assignment_id=assignment.id)
+    level, _ = level_from_decision(result)
+    return AssessAndRecordResult(
+        result=result, recorded=recorded, level=level.value,
+        stage=stage.value if stage is not None else None,
+    )

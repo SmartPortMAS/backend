@@ -26,6 +26,7 @@ from app.agents.safety.msds_context import resolve_cargo
 from app.agents.safety.schemas import AdjacentCargo, CargoRef
 from app.core.exceptions import CargoCategoryUnknownError
 from app.models import MsdsChemical
+from app.services.tide import min_tide_in_window
 
 from .category_map import representative_chem_id
 from .graph_queries import (
@@ -172,13 +173,17 @@ async def find_berth_candidates(
 
     berth_ids = [row["berth_id"] for row in eligible]
 
-    # 점유 판정은 우리 시스템 자신의 배정 기록(berth_assignment)만 본다 — VTS
-    # 실측(upa_port_call)은 안 쓴다(2026-08-19 결정). 이 스케줄링 에이전트가 선석을
-    # 직접 배정하는 주체이므로, 점유 여부도 그 배정 기록 스스로가 기준이어야
-    # 한다는 설계 의도다. VTS 관측을 섞으면 "우리가 배정한 게 아닌데도 점유"라는
-    # 모순이 생기고(실측: 출항 미기록 유령 재항 3,910건, 최고 8개월분 — VTS 데이터
-    # 자체의 신뢰도가 이 판단에 못 미쳤다), 애초에 스케줄링 에이전트를 두는 이유
-    # (우리 기준으로 직접 배정)와도 맞지 않는다.
+    # [2026-09-22] 이 주석은 "점유 판정은 우리 배정 기록(berth_assignment)만 본다 —
+    # 이 에이전트가 선석을 직접 배정하는 주체이므로"라고 적혀 있었다. 둘 다 더는
+    # 사실이 아니다. 우리는 배정하지 않고(방향 C), berth_assignment 표는 alembic
+    # 0027 이 지웠다.
+    #
+    # 지금 점유는 **실측 위치**로 본다(mart.vessel_presence, occupancy.py).
+    # VTS 사후 이력(upa_port_call)을 안 쓴다는 2026-08-19 결정은 그대로 유효하다 —
+    # 출항 미기록 유령 재항이 3,910건(최고 8개월분) 있었다. 그건 사후 이력의 문제고,
+    # 실시간 위치에는 그 문제가 구조적으로 없다.
+    #
+    # 점유는 탈락 사유가 아니라 표시 항목이다(백테스트 S2 — 정보로 강등).
     reservation_map = await find_overlapping_reservations(
         db, berth_ids=berth_ids, window_start=request.window_start,
         window_end=request.window_end, exclude_call_sign=request.vessel.call_sign,
@@ -263,9 +268,35 @@ async def find_berth_candidates(
     )
 
 
+# 사전배정 시설명 -> 정본 wharf_name.
+#
+# [2026-09-21] berth_id 경로 추가.
+#   검증모드의 입력은 mart.dashboard_current.facility_name 인데, 그 값은
+#   arrival_views_v2.sql 에서
+#       COALESCE(m.berth_id, m.wharf_name, pm.arrival_facility_nm)
+#   로 만들어진다. 즉 **선석 단위 식별자(berth_id)가 1순위**다.
+#   그런데 mart.facility_alias 는 PORT-MIS/VTS **원문 표기**를 wharf_name 에
+#   잇는 사전이라 berth_id 형식('3부두-2선석', 'S-Oil부이')은 들어 있지 않다.
+#
+#   실측(2026-09-21, 검증모드 대상 고유 시설명 11종):
+#       별칭 사전으로 해소        7종
+#       berth_id 로 해소(추가분)  2종  <- 이 UNION 이 살리는 몫
+#       어느 쪽도 아님            2종  ('장생포호안' — 선석 마스터에 없는 호안,
+#                                      '신항남방파제T/S부두 01' — 공백 표기 차이)
+#   남은 2종은 입력값 그대로 시도하고, 그래도 못 찾으면 NO_ELIGIBLE_BERTH 로
+#   떨어진다. 없는 선석을 지어내지 않는다.
 _QUERY_RESOLVE_WHARF_ALIAS = text("""
-    SELECT wharf_name FROM mart.facility_alias
-    WHERE source_name = :name AND facility_type = 'BERTH'
+    SELECT wharf_name FROM (
+        SELECT wharf_name, 1 AS pri
+        FROM mart.facility_alias
+        WHERE source_name = :name AND facility_type = 'BERTH'
+        UNION ALL
+        SELECT wharf_name, 2 AS pri
+        FROM berth
+        WHERE berth_id = :name
+    ) x
+    ORDER BY pri
+    LIMIT 1
 """)
 
 
@@ -278,7 +309,7 @@ async def build_candidate_for_wharf_name(
     window_start: datetime,
     window_end: datetime,
     draught_margin_m: float = 1.0,
-) -> tuple[BerthCandidate | None, str | None]:
+) -> tuple[BerthCandidate | None, str | None, bool]:
     """이미 정해진 선석 이름(사전배정 선석) 하나를 검증용 BerthCandidate로 만든다.
 
     find_berth_candidates(카테고리로 top-3 새로 탐색)와 달리, 특정 선석 하나가
@@ -292,8 +323,13 @@ async def build_candidate_for_wharf_name(
     별칭 사전에 없으면 입력값을 그대로 시도한다(이미 정본 표기일 수 있으므로).
 
     Returns:
-        (candidate, None) — 찾았고 흘수 여유(draught_margin_m) 조건도 만족
-        (None, reason) — 선석을 못 찾았거나 흘수 여유가 부족함
+        (candidate, None, False) — 찾았고 흘수 여유(draught_margin_m) 조건도 만족
+        (None, reason, evidence_missing) — 확인 실패.
+
+    세 번째 값이 **근거 부족인지 실제 부적합인지**를 가른다(회의 §4 "근거 부족을
+    안전과 구분"). 표기를 못 찾은 것·조위 예보가 없는 것은 근거 부족이라
+    '판정불가'로 가야 하고, 가용수심 대비 흘수가 실제로 모자란 것은 '부적합'이다.
+    둘을 뭉치면 관제사가 "이 배에 문제가 있다"와 "우리가 모른다"를 구분할 수 없다.
     """
     alias_row = (
         await db.execute(_QUERY_RESOLVE_WHARF_ALIAS, {"name": wharf_name})
@@ -302,21 +338,72 @@ async def build_candidate_for_wharf_name(
 
     berth = await get_berth_by_wharf_name(neo4j_driver, wharf_name=canonical_wharf_name)
     if berth is None:
-        return None, f"선석 '{wharf_name}'을(를) 찾을 수 없습니다(선석 제원 마스터 미등록)."
+        return None, f"선석 '{wharf_name}'을(를) 찾을 수 없습니다(선석 제원 마스터 미등록).", True
 
     if berth["depth_m"] is None:
-        return None, f"선석 '{canonical_wharf_name}'의 수심 정보가 없어 안전 여부를 판단할 수 없습니다."
+        return None, f"선석 '{canonical_wharf_name}'의 수심 정보가 없어 안전 여부를 판단할 수 없습니다.", True
+
+    # ── 흘수 여유 = (해도 수심 + 체류 중 최저 조위) − 흘수 ──────────────────
+    #
+    # [2026-09-21, D2 ③] 조위 항을 넣었다. 예전엔 해도 수심만 봤다.
+    #
+    # 조위는 하루 두 번 오르내리므로 **배가 붙어 있는 동안 가장 얕아지는 순간**이
+    # 안전을 정한다. 접안 순간만 보면 통과인데 몇 시간 뒤 바닥에 닿는 배를 놓친다.
+    # 오경보 백테스트가 실제 사례를 잡았다 — SEA DRAGON/S-Oil 1부두는 접안 시각
+    # 기준 +0.26m 였지만 체류 중 최저는 -0.21m 였다(app/services/tide.py 참고).
+    #
+    # 예보를 쓴다. 판정 대상이 미래 구간이라 관측(tide_obs, 과거만 있음)으로는
+    # 잴 수 없다.
+    tide = await min_tide_in_window(db, window_start=window_start, window_end=window_end)
+
+    if tide is None:
+        # ★ 여기서 해도 수심만으로 통과시키지 않는다. 조위를 모르면 가용수심을
+        #   모르는 것이고, 모르는 것은 '판정불가'다(회의 §4). 호출부가 이 문자열을
+        #   받아 UNKNOWN 으로 기록한다.
+        return None, (
+            f"선석 '{canonical_wharf_name}'의 체류 구간 조위 예보가 없어 "
+            f"가용수심을 계산할 수 없습니다(예보 범위 밖)."
+        ), True
+
+    tide_m = tide.level_cm / 100.0
+    available_depth_m = berth["depth_m"] + tide_m
+    actual_margin_m = available_depth_m - vessel.draught_m
 
     # find_berth_candidates(탐색모드)의 min_depth = draught + draught_margin_m와
     # 같은 기준. 검증모드라고 더 느슨하게 볼 이유가 없다 — 같은 배가 같은
     # 안전여유 기준을 통과해야 한다.
-    actual_margin_m = berth["depth_m"] - vessel.draught_m
     if actual_margin_m < draught_margin_m:
-        return None, (
-            f"선석 '{canonical_wharf_name}' 수심({berth['depth_m']}m) 대비 흘수여유가 "
-            f"{actual_margin_m:.1f}m로 요구 기준({draught_margin_m}m)에 못 미칩니다"
-            f"(선박 흘수 {vessel.draught_m}m)."
+        # [2026-09-22] '선석 확인 요청' 을 먼저 가린다 — mart.berth_draught_check 의
+        # CHECK 판정과 같은 규칙이다.
+        #
+        # 한 부두 안에서도 선석마다 수심이 다르다(실측: 4부두 9~11m · SK2부두 7.5~8m).
+        # 위 depth_m 은 그중 가장 얕은 값이고, 우리는 이 배가 몇 번 선석에 붙는지
+        # 모른다 — VTS·PORT-MIS 어느 쪽도 선석 번호를 주지 않는다. 가장 깊은
+        # 선석이면 기준을 넘는 경우, 시스템이 할 말은 "불가"가 아니라 "어느 선석인지
+        # 확인"이다. 항만은 수심이 맞는 선석에 배정하기 때문이다.
+        #
+        # 근거 부족(True)으로 돌려보내 '판정불가'가 되게 한다. 부적합으로 적으면
+        # 실제로는 붙어도 되는 배에 하역보류가 걸린다.
+        depth_max_m = berth.get("depth_max_m")
+        if depth_max_m is not None and depth_max_m > berth["depth_m"] \
+                and (depth_max_m + tide_m - vessel.draught_m) >= draught_margin_m:
+            return None, (
+                f"선석 '{canonical_wharf_name}'은 선석마다 수심이 달라"
+                f"(가장 얕은 곳 {berth['depth_m']}m · 가장 깊은 곳 {depth_max_m}m) "
+                f"어느 선석에 접안하는지 확인이 필요합니다 — 가장 깊은 선석이면 "
+                f"흘수 {vessel.draught_m}m 에 여유가 있습니다."
+            ), True
+        # 조위에 편차 보정이 들어갔으면 얼마를 더했는지 문장에 남긴다 — 관제사가
+        # 예보 원값과 다른 숫자를 보고 의아해하지 않게(services/tide.py 한계 ②).
+        bias_note = (
+            f", 실측 보정 {tide.bias_cm:+.1f}cm" if tide.bias_sample_n else ""
         )
+        return None, (
+            f"선석 '{canonical_wharf_name}' 가용수심 {available_depth_m:.2f}m"
+            f"(해도 {berth['depth_m']}m + 체류 중 최저 조위 {tide_m:+.2f}m{bias_note}, "
+            f"{tide.at_utc:%m-%d %H:%M}Z) 대비 흘수여유가 {actual_margin_m:.2f}m로 "
+            f"요구 기준({draught_margin_m}m)에 못 미칩니다(선박 흘수 {vessel.draught_m}m)."
+        ), False
 
     # 점유 판정은 berth_assignment(우리 배정 기록)만 본다 — find_berth_candidates와
     # 동일 결정(2026-08-19, 위 주석 참고).
@@ -357,7 +444,7 @@ async def build_candidate_for_wharf_name(
             adjacency_map.get(berth["berth_id"], []), real_cargo_by_wharf
         ),
     )
-    return candidate, None
+    return candidate, None, False
 
 
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -532,12 +619,12 @@ async def resolve_berth_assignment(
     anchorage_row = select_anchorage_for_dwt(vessel.dwt_t, anchorage_candidates)
     if anchorage_row is None:
         if vessel.dwt_t is None:
-            trace.append("선박 DWT 미상 -> 톤수별 정박지 매칭 불가 -> 배정불가")
+            trace.append("선박 DWT 미상 -> 톤수별 정박지 매칭 불가 -> 제안불가")
         elif vessel.dwt_t >= VLCC_BUOY_DWT:
-            trace.append(f"DWT {vessel.dwt_t} >= {VLCC_BUOY_DWT}(VLCC급) -> 정박지 대신 부이/외해 대기 필요 -> 배정불가")
+            trace.append(f"DWT {vessel.dwt_t} >= {VLCC_BUOY_DWT}(VLCC급) -> 정박지 대신 부이/외해 대기 필요 -> 제안불가")
         else:
-            trace.append(f"DWT {vessel.dwt_t}에 맞는 정박지 없음 -> 배정불가")
-        return BerthResolution(path="배정불가", trace=trace)
+            trace.append(f"DWT {vessel.dwt_t}에 맞는 정박지 없음 -> 제안불가")
+        return BerthResolution(path="제안불가", trace=trace)
 
     trace.append(f"정박지 '{anchorage_row['name']}' 대기 배정")
     return BerthResolution(
@@ -551,3 +638,139 @@ async def resolve_berth_assignment(
         ),
         trace=trace,
     )
+
+
+# ---------------------------------------------------------------------------
+# 대체 선석 **제안** (2026-09-21 복구, D4)
+#
+# [왜 다시 넣었나]
+#   9/21 오전에 검증모드에서 재탐색 경로를 통째로 끊었다. 점유를 이유로 재탐색이
+#   돌다가 "이미 잘 붙어 있는 배"를 부적합으로 만든 사고 때문이었다(D7BX/UTT부두).
+#   그 조치 자체는 맞았지만 **추천까지 같이 날아갔다.** 둘은 다른 문제다.
+#
+#       점유 중이다        → 재탐색 사유가 아니다. 정보다.
+#       흘수·기상·혼재 부적합 → **대체안을 내야 한다.** 그게 우리가 할 일이다.
+#
+#   9/17 회의 §1 이 정한 방향 C 가 정확히 이것이다 — "기존 배정은 그대로 따르되,
+#   조건이 기준을 벗어나면 에이전트가 조치안(대체 선석·정박지 대기·하역 보류)을
+#   만들고 그 조치를 할 **권한이 있는 곳에 근거와 함께 넘긴다**."
+#
+# [배정과 추천의 경계]
+#   여기서 나오는 것은 **의견**이다. 어떤 행도 만들지 않고, 어떤 자리도 잠그지
+#   않는다(berth_assignment 는 2026-09-21 에 표째 삭제됐다). assessment_history 의
+#   action_detail 에 담겨 화면에 뜨고, 실제로 옮길지는 선석회의·VTS·터미널이 정한다.
+# ---------------------------------------------------------------------------
+
+
+async def suggest_alternative_berths(
+    db: AsyncSession,
+    neo4j_driver: AsyncDriver,
+    *,
+    cargo: CargoRef,
+    vessel: VesselSpec,
+    window_start: datetime,
+    window_end: datetime,
+    exclude_wharf_name: str | None = None,
+    draught_margin_m: float = 1.0,
+    limit: int = 3,
+) -> tuple[list[BerthCandidate], str | None]:
+    """배정된 시설이 부적합할 때 내놓을 대체 선석 후보.
+
+    Returns:
+        (후보 목록, 못 찾은 이유). 후보가 있으면 이유는 None.
+
+    수심 조건은 **조위를 반영한 소요 해도수심**으로 건다 —
+        필요한 해도수심 = 흘수 + 안전여유 − 체류 중 최저 조위
+    검증에서 조위를 쓰면서 추천에서 안 쓰면, 통과 기준이 서로 달라
+    "지금 자리는 부적합인데 추천된 자리도 사실은 부적합"인 일이 생긴다.
+    """
+    target_row = await resolve_cargo(db, cargo)
+    category = await get_chemical_category(neo4j_driver, target_row.chem_id)
+    if not category:
+        return [], f"화물({target_row.chem_id})의 선석 카테고리를 알 수 없어 대체안을 찾을 수 없습니다."
+
+    tide = await min_tide_in_window(db, window_start=window_start, window_end=window_end)
+    if tide is None:
+        return [], "체류 구간 조위 예보가 없어 대체안의 가용수심을 계산할 수 없습니다."
+    tide_m = tide.level_cm / 100.0
+
+    min_depth = vessel.draught_m + draught_margin_m - tide_m
+    eligible = await find_eligible_berths(
+        neo4j_driver, category=category, min_depth=min_depth, dwt_t=vessel.dwt_t,
+    )
+
+    # 같은 계선시설이 Berth 노드로 여러 개 있다(실측: 'S-Oil 2부두' 3개, 'S-Oil 4부두' 2개).
+    # 마스터에 선석번호 구분 없이 중복 적재된 것이라, 그대로 두면 **같은 부두가 대체안
+    # 1·2·3위를 모두 차지해** 관제사에게 선택지가 하나도 없는 목록이 나간다.
+    # 여기서 계선시설 이름 단위로 누른다 — 수심이 가장 깊은 노드를 대표로 쓴다.
+    excluded = (exclude_wharf_name or "").strip()
+    by_wharf: dict[str, dict] = {}
+    for row in eligible:
+        name = (row.get("wharf_name") or "").strip()
+        if not name or name == excluded:
+            continue
+        kept = by_wharf.get(name)
+        if kept is None or (row.get("depth_m") or 0) > (kept.get("depth_m") or 0):
+            by_wharf[name] = row
+    eligible = list(by_wharf.values())
+
+    if not eligible:
+        return [], (
+            f"'{category}'를 취급하면서 가용수심 조건(해도 {min_depth:.2f}m 이상)을 "
+            f"만족하는 다른 선석이 없습니다."
+        )
+
+    berth_ids = [row["berth_id"] for row in eligible]
+    # 점유는 **탈락 사유가 아니라 표시 항목**이다(백테스트 S2 — 정보로 강등).
+    # 관제사가 "빈 자리부터 보자"고 판단할 수 있게 정렬에만 쓴다.
+    live_map = await find_overlapping_reservations(
+        db, berth_ids=berth_ids, window_start=window_start, window_end=window_end,
+        exclude_call_sign=vessel.call_sign,
+    )
+    adjacency_map = await find_adjacent_categories(neo4j_driver, berth_ids=berth_ids)
+    adjacent_wharf_names = list({
+        entry["adjacent_wharf_name"]
+        for entries in adjacency_map.values()
+        for entry in entries
+        if entry.get("adjacent_wharf_name")
+    })
+    real_cargo_by_wharf = await _real_adjacent_cargo_by_wharf(db, adjacent_wharf_names)
+
+    candidates: list[BerthCandidate] = []
+    for row in eligible:
+        occupants = live_map.get(row["wharf_name"], [])
+        candidates.append(
+            BerthCandidate(
+                rank=0,
+                berth_id=row["berth_id"],
+                wharf_name=row["wharf_name"],
+                port_name=row["port_name"],
+                depth_m=row["depth_m"],
+                berth_group=row.get("berth_group"),
+                onsan_scope=bool(row.get("onsan_scope")),
+                # 가용수심 기준 여유. 해도 수심이 아니라 조위를 더한 값으로 잰다.
+                draught_margin_m=row["depth_m"] + tide_m - vessel.draught_m,
+                occupancy_status=(
+                    OccupancyStatus.OCCUPIED if occupants else OccupancyStatus.AVAILABLE
+                ),
+                conflicting_port_calls=[
+                    ConflictingPortCall(
+                        vessel_name=c["vessel_name"],
+                        arrival_at_utc=c["arrival_at_utc"],
+                        departure_at_utc=c["departure_at_utc"],
+                    )
+                    for c in occupants
+                ],
+                adjacent_cargos=_adjacent_cargos_for(
+                    adjacency_map.get(row["berth_id"], []), real_cargo_by_wharf
+                ),
+            )
+        )
+
+    # 빈 자리 먼저, 그 다음 여유가 큰 순. 점유는 탈락이 아니라 후순위일 뿐이다.
+    candidates.sort(
+        key=lambda c: (c.occupancy_status is OccupancyStatus.OCCUPIED, -c.draught_margin_m)
+    )
+    for i, c in enumerate(candidates[:limit], start=1):
+        c.rank = i
+    return candidates[:limit], None

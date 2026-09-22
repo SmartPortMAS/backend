@@ -20,12 +20,24 @@ class OverallDecision(str, Enum):
 
     APPROVED 외 네 상태는 모두 "하역을 진행하면 안 되는" 상태라는 공통점이 있다 —
     관제사가 화면에서 한눈에 구분할 수 있도록 원인별로 분리했다.
+
+    [2026-09-22] 값에서 **우리가 승인·배정한다는 뜻**을 걷어냈다.
+
+      "승인가능"      -> "적합"        우리는 승인하지 않는다. 조건에 맞는지만 말한다.
+      "전후보배정불가" -> "전 후보 부적합"  우리는 배정을 거부하는 주체가 아니다.
+
+    '배정'이라는 단어 자체를 지운 것이 아니다 — `NO_ELIGIBLE_BERTH`("적합선석없음")나
+    판정 근거의 "배정된 선석이…"는 **남이 한 배정**을 가리키는 정확한 서술이라 그대로
+    둔다. 문제는 그 배정을 우리가 한다고 읽히는 어휘였다.
+
+    이 값은 DB 에 저장되지 않는다(`assessment_history` 는 `AssessmentLevel` 을 쓴다).
+    화면이 `decision_label` 로 그대로 표시하므로 값이 곧 관제사가 읽는 문장이다.
     """
 
-    APPROVED = "승인가능"
+    APPROVED = "적합"
     WEATHER_BLOCKED = "기상불가_중단권고"
     NO_ELIGIBLE_BERTH = "적합선석없음"
-    ALL_CANDIDATES_UNSAFE = "전후보배정불가"
+    ALL_CANDIDATES_UNSAFE = "전 후보 부적합"
     # 전용 선석 점유 + 대체 선석 없음(단독선석 등) -> 톤수에 맞는 정박지에서 대기
     # (온산 MVP 이식: scheduling.service.resolve_berth_assignment의 '정박지대기' 경로).
     WAITING_ANCHORAGE = "정박지대기"
@@ -90,6 +102,25 @@ class OrchestratorResult(BaseModel):
         description="검증모드(assigned_wharf_name 지정)에서, 최종 selected_berth.wharf_name이 "
         "assigned_wharf_name과 다르면 True — 원래 있던 자리가 아니라 대체 선석으로 바뀌었다는 "
         "뜻이라 관제사가 바로 알아야 한다. 탐색모드에서는 항상 False.",
+    )
+    suggested_alternatives: list[BerthCandidate] = Field(
+        default_factory=list,
+        description="배정된 시설이 부적합할 때 내놓는 **대체 선석 제안**(최대 3). "
+        "9/17 회의 §3 의 조치안 '대체선석'이다. **의견일 뿐 배정이 아니다** — 어떤 "
+        "자리도 잠그지 않고, 실제로 옮길지는 선석회의·VTS·터미널이 정한다. "
+        "적합 판정이면 비어 있다(옮길 이유가 없으므로).",
+    )
+    suggestion_note: str | None = Field(
+        default=None,
+        description="대체안을 못 찾았을 때 그 이유. 후보가 있으면 None. "
+        "'없음'과 '못 찾음'을 구분하려고 둔다.",
+    )
+    evidence_missing: bool = Field(
+        default=False,
+        description="결론이 '근거 부족'에서 나왔는가. True 면 판정 자체를 못 한 것이고"
+        "(계선시설 표기 미해소·조위 예보 없음 등), False 면 근거를 갖추고 내린 판정이다. "
+        "회의 §4 '근거 부족을 안전과 구분' — 이 값이 assessment_history.level 에서 "
+        "'판정불가'와 '부적합'을 가른다.",
     )
     summary: str = Field(description="관제사가 읽을 종합 의견 (1~2문단)")
     berth_match_summary: str | None = Field(

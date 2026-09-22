@@ -39,6 +39,7 @@ from .graph_queries import (
 )
 from .msds_context import resolve_cargo, summarize_hazard_sections
 from .prompt import SYSTEM_PROMPT, build_user_prompt
+from .stabilized_cargo import with_stabilized_checklist
 from .rule_engine import (
     Assessability,
     compute_assessability_floor,
@@ -452,7 +453,11 @@ async def assess_safety(
     return SafetyAssessmentResult(
         target_cargo_name=_cargo_display_name(v.target_row),
         risk_level=v.rule_engine_floor,
-        checklist=llm_result.checklist,
+        # 중합성 화물(IMDG ", STABILIZED")이면 탱크 온도·억제제 확인 항목을 규칙으로
+        # 맨 앞에 붙인다 — LLM 이 뽑을지에 맡기지 않는다(stabilized_cargo.py, 2026-09-17).
+        checklist=with_stabilized_checklist(
+            llm_result.checklist, v.target_row.un_no, v.target_row.cas_no,
+        ),
         key_hazards=llm_result.key_hazards,
         reasoning=llm_result.reasoning,
         conflicts=v.conflicts,

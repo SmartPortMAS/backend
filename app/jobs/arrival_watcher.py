@@ -1,63 +1,104 @@
-"""입항 이벤트 감지 → 자동 추천 (10분 주기).
+"""입항 감시 → **판정 기록** (10분 주기).
 
-08_스케줄링_전면재설계_자동배정_설계문서.md §5.1, §5.3 — 07 문서 §4.3이 설계한
-"입항허가 완료 + 아직 배정 없는 선박" 쿼리를, 관제사 화면이 아니라 이 백그라운드
-잡이 폴링해 오케스트레이터를 자동 호출하는 트리거로 쓴다.
+[2026-09-21 전면 개편] 이 잡은 더 이상 선석을 배정하지 않는다.
 
-원안(07 문서 §4.3)은 `mart.dashboard_current`(AIS)와 `portmis_vessel`을 여기서
-다시 FULL OUTER JOIN하는 구조였지만, 실제로는 `mart.dashboard_current` 뷰 자체가
-이미 그 조인을 끝내 둔 "한 줄 조회" 뷰라는 걸 확인했다(dashboard.py 주석,
-2026-08-19 라이브 스키마 조회로 재확인) — 그래서 이 잡은 그 뷰 하나만 본다.
-화물 식별은 `mart.cargo_msds`(호출부호 -> chem_id, 이미 UN번호까지 MSDS와
-매칭해 둔 뷰)를 그대로 재사용한다.
+이전 판은 `berth_assignment`(예약) · `anchorage_queue`(대기열) · `scheduling_exclusion`
+(제외 사유) 세 표에 썼다. 셋 다 **배정 주체가 쓰는 표**다. 우리는 배정 주체가
+아니다(9/17 회의 §1: "기존 선석 배정은 그대로 따른다"). 지금은 표 하나에만 쓴다.
 
-DWT는 이 자동 흐름에서 항상 None이다 — 어떤 실시간 소스도 재화중량톤수를
-제공하지 않는다(총톤수(GT)·순톤수만 있음, DWT와는 다른 값). "모르면 배정하지
-않는다"가 아니라 "모르면 DWT 게이트를 건너뛴다"이므로(VesselSpec.dwt_t 자체가
-선택 필드) 안전 문제는 아니다 — 다만 부이(VLCC 전용) 게이트는 dwt_t가 없으면
-항상 탈락하므로(§4.1.3-A, 의도된 비대칭), 이 자동 흐름으로는 부이가 추천되는
-일이 사실상 없다.
+    assessment_history — "이 배가 지금 있는 자리가 조건에 맞는가"
+
+배정은 항만공사 선석회의가, 항내 이동 통제는 VTS 가, 하역 개시·중단은 터미널이
+한다(회의 §2). 우리는 그 셋에게 근거를 넘긴다 — `action` 과 `recipient` 가 그것이다.
+
+───────────────────────────────────────────────────────────────────────────
+검증 대상: **PORT-MIS 배정 ∪ AIS 실제 접안** (P1-C, 2026-09-21)
+
+두 소스 모두 "이 배의 자리"에 대한 **관측**이지 결정이 아니다. 그래서 둘을
+합쳐도 방향 C 와 충돌하지 않는다 — 우리는 자리를 고르는 게 아니라 읽을 뿐이다.
+
+합쳐야 하는 이유는 실측이다. 2026-09-21 기준 실제 계류 중인 액체화물선 10척 중
+PORT-MIS 가 같은 선석을 적고 있는 배는 **1척**뿐이었다. 나머지는 PORT-MIS 가
+아직 '정박지'라고 적고 있는데 AIS 는 이미 부두에 붙어 있다고 말한다 — 원유운반선
+BOCT5, LPG 운반선 D8MP 등이 여기 해당했다. PORT-MIS 만 보면 이들이 통째로
+검증에서 빠진다.
+
+어느 소스에서 왔는지는 `input_snapshot.source` 에 남긴다. 둘이 어긋나는 것 자체가
+신고 정정이 필요하다는 신호이므로, 사후에 셀 수 있어야 한다.
+───────────────────────────────────────────────────────────────────────────
+
+시점(stage)은 AIS 항해상태로만 정한다. PORT-MIS 는 수집창 `[어제, 오늘+3일]` 밖이면
+동결되기 때문이다 — 자세한 실측은 `app/models/assessment_history.py::AssessmentStage`.
+
+DWT 는 이 자동 흐름에서 항상 None 이다 — 어떤 실시간 소스도 재화중량톤수를 주지
+않는다(총톤수·순톤수만 있고 DWT 와는 다른 값). "모르면 판정하지 않는다"가 아니라
+"모르면 DWT 축을 건너뛴다"이므로 안전 문제는 아니다.
 """
 
 import logging
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.orchestrator.schemas import OrchestratorRequest, OverallDecision
+from app.agents.orchestrator.schemas import OrchestratorRequest
 from app.agents.orchestrator.service import orchestrate
 from app.agents.safety.schemas import CargoRef
-from app.agents.scheduling.occupancy import find_free_slot
 from app.agents.scheduling.schemas import VesselSpec
 from app.database import AsyncSessionFactory
 from app.llm.factory import get_llm_client
-from app.models.anchorage_queue import STATUS_WAITING, AnchorageQueue
-from app.models.berth_assignment import STATUS_REQUESTED, BerthAssignment
-from app.models.scheduling_exclusion import SchedulingExclusion
+from app.models.assessment_history import AssessmentLevel
 from app.neo4j_client import neo4j_client
+from app.services.assessment import (
+    record_assessment,
+    record_from_orchestrator,
+    stage_from_nav_status,
+)
 
 logger = logging.getLogger("arrival_watcher")
 
 DEFAULT_WINDOW_HOURS = 24  # 재항 이력 표본이 없는 선석에 쓰는 기본 접안 예상 기간(추정치)
-# 아직 출항하지 않은 배의 계획기간이 과거로 끝나지 않도록 두는 최소 여유.
-# 이 값보다 짧게 잡으면 추천이 만들어진 직후 만료돼 화면에서 사라진다.
-MIN_FORWARD_HOURS = 12
+MIN_FORWARD_HOURS = 12  # 판정 창이 만들어지자마자 과거로 끝나지 않게 두는 최소 여유
 
-# §5.1 — 07 문서 §4.3의 NOT EXISTS 조건을 CANCELLED 뿐 아니라 REJECTED도 제외하도록
-# 고쳤다(발견 경위는 설계문서 §5.1 참고) — 그래야 반려당한 선박이 다음 주기에
-# 다시 후보로 잡힌다.
-_QUERY_PENDING_ARRIVALS = text("""
+
+_QUERY_ASSESSMENT_TARGETS = text("""
+    WITH live AS (
+        -- [2026-09-22] berth_occupancy_live -> mart.vessel_presence.
+        --   같은 질문에 뷰가 둘이라 답이 갈렸다(실측 같은 스냅샷: 14척 vs 0척).
+        --   전자는 now() 기준 30분 안의 위치만 접안으로 봐서, 수집이 밀리면
+        --   판정 대상이 통째로 사라졌다 — 이 job 은 그러면 아무 배도 판정하지
+        --   않고 조용히 끝난다. vessel_presence 는 최신 스냅샷 기준이다.
+        --
+        --   뷰가 이미 선박당 1행이고 berth_name 이 정본 표기라 facility_alias 를
+        --   다시 태우면 안 된다 — alias 는 wharf_name 당 source_name 이 여러 개라
+        --   조인하면 배가 불어난다(2026-09-20 실측: 2부두 3척 -> 9척).
+        SELECT upper(btrim(vp.callsgn)) AS cs,
+               vp.berth_name AS wharf_name, vp.berth_dist_m AS distance_m
+        FROM mart.vessel_presence vp
+        WHERE vp.presence_zone = 'BERTH'
+          AND nullif(btrim(vp.berth_name), '') IS NOT NULL
+          AND nullif(btrim(vp.callsgn), '') IS NOT NULL
+    ),
+    pm AS (
+        SELECT DISTINCT ON (upper(btrim(callsgn))) upper(btrim(callsgn)) AS cs,
+               collected_at_utc, arrival_report_type
+        FROM portmis_vessel
+        WHERE nullif(btrim(callsgn), '') IS NOT NULL
+        ORDER BY upper(btrim(callsgn)), arrival_at_utc DESC NULLS LAST
+    )
     SELECT
         dc.callsgn, dc.vessel_name, dc.imo_no, dc.draught AS draught_m,
-        dc.arrival_at_utc,
+        dc.arrival_at_utc, dc.nav_status_code, dc.received_at_utc AS position_at_utc,
+        -- PORT-MIS 공식 배정 계선시설. '정박지-E1' 같은 정박지 배정도 여기로 온다.
+        dc.facility_name AS assigned_facility_name,
+        lv.wharf_name AS moored_wharf_name,
+        lv.distance_m AS moored_distance_m,
+        pm.collected_at_utc AS portmis_collected_at,
+        pm.arrival_report_type,
         (
             SELECT cm.chem_id FROM mart.cargo_msds cm
             WHERE cm.callsgn = dc.callsgn AND cm.chem_id IS NOT NULL
             LIMIT 1
         ) AS chem_id,
-        -- 이 배가 붙어 있는 시설의 실측 재항 중앙값(없으면 NULL → 기본값 사용).
-        -- 계획기간의 끝을 정하는 데 쓴다.
         (
             SELECT bds.median_hours
             FROM mart.facility_alias fa
@@ -66,160 +107,126 @@ _QUERY_PENDING_ARRIVALS = text("""
             LIMIT 1
         ) AS median_dwell_hours
     FROM mart.dashboard_current dc
+    LEFT JOIN live lv ON lv.cs = upper(btrim(dc.callsgn))
+    LEFT JOIN pm ON pm.cs = upper(btrim(dc.callsgn))
     WHERE dc.is_liquid_cargo_vessel
-      AND dc.arrival_at_utc IS NOT NULL
-      AND dc.departure_at_utc IS NULL
-      AND dc.draught IS NOT NULL AND dc.draught > 0
-      AND NOT EXISTS (
-          SELECT 1 FROM berth_assignment ba
-          WHERE upper(btrim(ba.call_sign)) = upper(btrim(dc.callsgn))
-            AND ba.status NOT IN ('CANCELLED', 'REJECTED')
-      )
-    ORDER BY dc.arrival_at_utc ASC
+      AND (
+            -- (가) PORT-MIS 가 선석을 적어 둔 배 (정박지 배정은 대상이 아니다)
+            (
+                dc.arrival_at_utc IS NOT NULL
+                AND dc.departure_at_utc IS NULL
+                AND nullif(btrim(dc.facility_name), '') IS NOT NULL
+                AND dc.facility_name NOT LIKE '%정박지%'
+            )
+            -- (나) AIS 가 실제로 부두에 붙어 있다고 말하는 배.
+            --      PORT-MIS 가 뭐라고 적었든, 출항 신고가 왔든 안 왔든 상관없다 —
+            --      '지금 붙어 있다'가 관측이고 그게 판정 대상이다.
+            OR lv.wharf_name IS NOT NULL
+          )
+    ORDER BY dc.arrival_at_utc ASC NULLS LAST
 """)
 
 
-async def _insert_requested(
-    db: AsyncSession, *, berth_id: str, slot_no: int,
-    callsgn: str, vessel_name: str | None, imo_no: str | None,
-    chem_id: str, window_start: datetime, window_end: datetime,
-    assignment_reason: str, rejected_candidates: dict,
-    actual_berthing_at: datetime | None = None,
-) -> None:
-    now = datetime.now(timezone.utc)
-    db.add(BerthAssignment(
-        berth_id=berth_id,
-        slot_no=slot_no,
-        call_sign=callsgn,
-        imo_no=imo_no,
-        vessel_name=vessel_name,
-        cargo_chem_id=chem_id,
-        planned_window=(window_start, window_end),
-        status=STATUS_REQUESTED,
-        assignment_reason=assignment_reason,
-        rejected_candidates=rejected_candidates,
-        # 이 배는 이미 VTS에 입항이 확인된 상태다(mart.dashboard_current.arrival_at_utc,
-        # _QUERY_PENDING_ARRIVALS가 이미 이 조건으로 걸러냄) — window_start는 그 실측
-        # 시각을 그대로 쓰고 있으므로(아래), 여기서도 같은 값을 실제 접안 확인 컬럼에
-        # 넣는다(2026-08-20, "선박정보에서 입출항 시간 못 가져오냐"는 지적). window_end는
-        # 실제 출항이 아니라 24시간 추정값이라 actual_departure_at에는 안 넣는다 —
-        # 그건 scheduler.py::release_completed_berths가 VTS 출항 확인 시점에 채운다.
-        actual_berthing_at=actual_berthing_at,
-        created_at=now,
-    ))
-    await _clear_exclusion(db, call_sign=callsgn)
-    await db.commit()
+def _target_wharf(row: dict) -> tuple[str | None, str]:
+    """검증할 계류시설과 그 출처.
+
+    PORT-MIS 배정을 먼저 본다 — 그게 공식 기록이고, AIS 는 아직 이동 중일 수 있다.
+    PORT-MIS 가 정박지거나 비어 있으면 AIS 실측으로 내려간다.
+    """
+    assigned = (row.get("assigned_facility_name") or "").strip()
+    if assigned and "정박지" not in assigned:
+        return assigned, "PORT-MIS"
+    moored = (row.get("moored_wharf_name") or "").strip()
+    if moored:
+        return moored, "AIS"
+    return None, "없음"
 
 
-_EXCLUSION_DECISIONS = {
-    OverallDecision.NO_ELIGIBLE_BERTH.name,
-    OverallDecision.ALL_CANDIDATES_UNSAFE.name,
-    OverallDecision.WEATHER_BLOCKED.name,
-}
+def _snapshot(row: dict, *, source: str, target: str | None) -> dict:
+    """판정을 재현하는 데 필요한 관측의 시각과 값.
 
+    `portmis_collected_at` 은 선택이 아니다 — PORT-MIS 는 수집창 밖이면 동결되므로
+    이 값이 없으면 '며칠 묵은 배정으로 내려진 판정인가'를 사후에 가릴 수 없다.
+    """
 
-async def _clear_exclusion(db: AsyncSession, *, call_sign: str) -> None:
-    """이 배가 이번 주기에 배정/대기열 등록으로 해소됐으니 남아 있던 경고를 지운다."""
-    await db.execute(
-        text("DELETE FROM scheduling_exclusion WHERE call_sign = :call_sign"),
-        {"call_sign": call_sign},
-    )
+    def _iso(value) -> str | None:
+        return value.isoformat() if isinstance(value, datetime) else None
 
-
-async def _upsert_exclusion(
-    db: AsyncSession, *, row: dict, decision: OverallDecision,
-    reason: str | None, window_start: datetime, window_end: datetime,
-) -> None:
-    """자동 추천이 안 된 사유를 배 1척당 최신 상태 1행으로 기록한다(§5.3 3번,
-    /dashboard/alerts 연동). 이미 같은 배로 걸려 있던 행이 있으면 사유/시각만
-    갱신한다 — 매 주기 새 행을 쌓으면 관제 화면에 같은 배가 중복 노출된다."""
-    now = datetime.now(timezone.utc)
-    existing = (
-        await db.execute(
-            text("SELECT id FROM scheduling_exclusion WHERE call_sign = :call_sign"),
-            {"call_sign": row["callsgn"]},
-        )
-    ).first()
-    if existing:
-        await db.execute(
-            text(
-                "UPDATE scheduling_exclusion SET decision = :decision, reason = :reason, "
-                "draught_m = :draught_m, window_start = :window_start, window_end = :window_end, "
-                "updated_at = :now WHERE call_sign = :call_sign"
-            ),
-            {
-                "decision": decision.name, "reason": reason, "draught_m": row["draught_m"],
-                "window_start": window_start, "window_end": window_end, "now": now,
-                "call_sign": row["callsgn"],
-            },
-        )
-    else:
-        db.add(SchedulingExclusion(
-            call_sign=row["callsgn"], vessel_name=row["vessel_name"], imo_no=row["imo_no"],
-            cargo_chem_id=row["chem_id"], decision=decision.name, reason=reason,
-            draught_m=row["draught_m"], window_start=window_start, window_end=window_end,
-            created_at=now, updated_at=now,
-        ))
+    return {
+        "source": source,
+        "target_facility": target,
+        "portmis_facility": row.get("assigned_facility_name"),
+        "portmis_collected_at": _iso(row.get("portmis_collected_at")),
+        "portmis_report_type": row.get("arrival_report_type"),
+        "ais_moored_wharf": row.get("moored_wharf_name"),
+        "ais_distance_m": (
+            float(row["moored_distance_m"]) if row.get("moored_distance_m") is not None else None
+        ),
+        "position_at_utc": _iso(row.get("position_at_utc")),
+        "nav_status_code": row.get("nav_status_code"),
+        "draught_m": float(row["draught_m"]) if row.get("draught_m") is not None else None,
+        "arrival_at_utc": _iso(row.get("arrival_at_utc")),
+    }
 
 
 async def watch_arrivals() -> None:
-    """입항허가 완료 + 아직 배정 없는 액체화물선을 순회하며 오케스트레이터 추천을
-    자동 생성한다(status=REQUESTED — 확정 아님, §5.3)."""
+    """검증 대상을 순회하며 판정을 `assessment_history` 에 남긴다."""
     llm_client = get_llm_client()
 
     async with AsyncSessionFactory() as db:
-        rows = (await db.execute(_QUERY_PENDING_ARRIVALS)).mappings().all()
+        rows = [dict(r) for r in (await db.execute(_QUERY_ASSESSMENT_TARGETS)).mappings().all()]
 
     if not rows:
-        # 대상이 아예 없으면(전부 배정됐거나 출항) 남아 있던 경고도 전부 해소된 것 —
-        # scheduling_exclusion을 그대로 두면 이미 떠난 배 경고가 화면에 계속 남는다.
-        async with AsyncSessionFactory() as db:
-            await db.execute(text("DELETE FROM scheduling_exclusion"))
-            await db.commit()
-        logger.info("watch_arrivals: 대상 없음")
+        logger.info("watch_arrivals: 검증 대상 없음")
         return
 
-    # 이번 주기에 더는 "입항허가 완료 + 미배정" 상태가 아닌 배(배정 완료 또는 출항)의
-    # 경고는 자기치유적으로 정리한다 — watch_arrivals가 유일한 쓰기 경로이므로 여기서
-    # 안 지우면 영영 안 지워진다.
-    pending_callsigns = [row["callsgn"] for row in rows]
-    async with AsyncSessionFactory() as db:
-        await db.execute(
-            text("DELETE FROM scheduling_exclusion WHERE call_sign <> ALL(CAST(:callsigns AS text[]))"),
-            {"callsigns": pending_callsigns},
-        )
-        await db.commit()
+    logger.info("watch_arrivals: %d척 판정 시작", len(rows))
+    recorded = skipped = unknown = 0
 
-    logger.info("watch_arrivals: %d척 처리 시작", len(rows))
-    for raw_row in rows:
-        if not raw_row["chem_id"]:
-            logger.info("watch_arrivals: %s 화물 미식별(chem_id 없음) - 건너뜀", raw_row["callsgn"])
-            continue
-
-        # mart.dashboard_current.imo_no는 소스에 따라 정수로 올 때가 있다(실측
-        # 확인, 2026-08-19) — BerthAssignment/AnchorageQueue/SchedulingExclusion의
-        # imo_no는 전부 String 컬럼이라 그대로 넣으면 asyncpg가
-        # "expected str, got int"로 거부하고 그 배는 물론 이후 배 전체 처리가
-        # 중단된다(예외가 이 루프 밖으로 전파됨). 여기서 한 번만 정규화한다.
-        row = dict(raw_row)
-        if row["imo_no"] is not None:
+    for row in rows:
+        callsgn = row["callsgn"]
+        # mart.dashboard_current.imo_no 는 소스에 따라 정수로 올 때가 있다(2026-08-19 실측).
+        if row.get("imo_no") is not None:
             row["imo_no"] = str(row["imo_no"])
 
-        # 계획기간(planned_window) — 여기가 틀리면 추천이 만들어지자마자 만료된다.
-        #
-        # 예전에는 [입항시각, 입항시각+24h] 였다. 그런데 이 쿼리가 뽑는 배는 전부
-        # "아직 출항하지 않은" 배다(departure_at_utc IS NULL). 즉 5일 전에 들어와
-        # 지금도 항내에 있는 배가 섞이는데, 그런 배는 창이 나흘 전에 끝나 버린다.
-        # 그 결과 추천 123건 중 화면 필터(upper(planned_window) > now())를 통과하는
-        # 것이 3건뿐이었고, 선석 배정현황이 늘 "0건"으로 보였다(2026-08-20 실측).
-        #
-        # 창의 끝은 "이 배가 언제 자리를 비우는가"다. 출항 예정 시각(ETD)이 원천에
-        # 없으므로 그 선석의 실제 재항 이력 중앙값(mart.berth_dwell_stats, 실측
-        # 29,607건)으로 잡는다. 다만 아직 항내에 있는 배는 그 중앙값을 이미 넘겼을
-        # 수 있으므로, 최소한 지금부터 한 주기(MIN_FORWARD_HOURS)는 살아 있게 한다 —
-        # "지금 자리를 쓰고 있다"는 사실 자체가 창이 아직 안 닫혔다는 뜻이다.
+        target, source = _target_wharf(row)
+        snapshot = _snapshot(row, source=source, target=target)
+        stage = stage_from_nav_status(row.get("nav_status_code"))
+
+        # ── 판정불가 네 갈래 ────────────────────────────────────────────────
+        # 회의 §4 "근거 부족을 안전과 구분". 모르는 것을 '적합'으로 밀지 않는다.
+        # 실측 근거: 오늘 백테스트 표본 125건 중 흘수 정보가 아예 없는 건이
+        # 51건(40.8%)이었다 — 이걸 통과시키면 40%를 근거 없이 통과시키는 것이다.
+        blocker: str | None = None
+        if target is None:
+            blocker = "계류시설을 특정할 수 없습니다(PORT-MIS 정박지·미배정, AIS 접안 미탐지)"
+        elif stage is None:
+            blocker = "AIS 항해상태가 없어 지금 어느 시점인지 판단할 수 없습니다"
+        elif not row.get("chem_id"):
+            blocker = "적재 화물을 식별할 수 없습니다(MSDS 매칭 없음)"
+        elif not row.get("draught_m") or float(row["draught_m"]) <= 0:
+            blocker = "흘수 정보가 없어 수심 여유를 계산할 수 없습니다"
+
+        if blocker is not None:
+            async with AsyncSessionFactory() as db:
+                wrote = await record_assessment(
+                    db, call_sign=callsgn, vessel_name=row.get("vessel_name"),
+                    stage=stage, wharf_name=target, level=AssessmentLevel.UNKNOWN,
+                    headline=blocker, input_snapshot=snapshot,
+                )
+                await db.commit()
+            unknown += 1
+            recorded += int(wrote)
+            skipped += int(not wrote)
+            logger.info("watch_arrivals: %s 판정불가 - %s", callsgn, blocker)
+            continue
+
+        # ── 판정 창 ────────────────────────────────────────────────────────
+        # 끝은 "이 배가 언제 자리를 비우는가"다. 출항 예정 시각이 원천에 없으므로
+        # 그 선석의 실제 재항 이력 중앙값(mart.berth_dwell_stats)으로 잡되, 이미
+        # 중앙값을 넘긴 배도 있으므로 최소 한 주기는 살아 있게 한다.
         now = datetime.now(timezone.utc)
-        window_start = row["arrival_at_utc"] or now
+        window_start = row.get("arrival_at_utc") or now
         dwell_h = row.get("median_dwell_hours") or DEFAULT_WINDOW_HOURS
         window_end = max(
             window_start + timedelta(hours=float(dwell_h)),
@@ -228,83 +235,42 @@ async def watch_arrivals() -> None:
 
         request = OrchestratorRequest(
             vessel=VesselSpec(
-                draught_m=row["draught_m"], dwt_t=None, name_hint=row["vessel_name"],
-                # 자기 예약을 점유로 세지 않도록 호출부호를 같이 넘긴다.
-                call_sign=row["callsgn"],
+                draught_m=row["draught_m"], dwt_t=None, name_hint=row.get("vessel_name"),
+                call_sign=callsgn,
             ),
             cargo=CargoRef(chem_id=row["chem_id"]),
             window_start=window_start,
             window_end=window_end,
-            assigned_wharf_name=None,  # 항상 탐색모드(§1.2, §5.1)
+            # 검증모드 고정 — 이 시설 하나만 확인한다. None 을 넘기면 오케스트레이터가
+            # 탐색모드로 떨어져 선석 top-3 를 새로 고른다. 그건 배정이다.
+            assigned_wharf_name=target,
+        )
+        logger.info(
+            "watch_arrivals: %s 검증 (%s / 출처 %s / 시점 %s)",
+            callsgn, target, source, stage.value,
         )
 
         async with AsyncSessionFactory() as db:
             try:
                 result = await orchestrate(db, neo4j_client.driver, llm_client, request)
             except Exception:
-                logger.exception("watch_arrivals: %s 오케스트레이터 호출 실패", row["callsgn"])
+                logger.exception("watch_arrivals: %s 오케스트레이터 호출 실패", callsgn)
                 continue
 
-            if result.overall_decision is OverallDecision.WAITING_ANCHORAGE:
-                # 정박지는 잠금 대상이 아니므로 berth_assignment가 아니라 anchorage_queue에
-                # 등록한다(§4.3, §5.3 "정박지 대기는 같은 승인 게이트를 타지 않는다").
-                now = datetime.now(timezone.utc)
-                db.add(AnchorageQueue(
-                    call_sign=row["callsgn"], vessel_name=row["vessel_name"], imo_no=row["imo_no"],
-                    cargo_chem_id=row["chem_id"], draught_m=row["draught_m"],
-                    anchorage_id=result.anchorage_assignment.anchorage_id if result.anchorage_assignment else None,
-                    entered_at=now, window_start=window_start, window_end=window_end,
-                    status=STATUS_WAITING, assignment_reason=result.summary,
-                    created_at=now,
-                ))
-                await _clear_exclusion(db, call_sign=row["callsgn"])
-                await db.commit()
-                logger.info("watch_arrivals: %s -> 정박지 대기열 등록", row["callsgn"])
-                continue
-
-            if result.overall_decision is not OverallDecision.APPROVED or not result.selected_berth:
-                # NO_ELIGIBLE_BERTH/ALL_CANDIDATES_UNSAFE/WEATHER_BLOCKED는 berth_assignment를
-                # 만들지 않고, 대신 scheduling_exclusion에 기록해 관제 경고 센터
-                # (/dashboard/alerts)가 노출하게 한다(§5.3 3번).
-                if result.overall_decision.name in _EXCLUSION_DECISIONS:
-                    await _upsert_exclusion(
-                        db, row=row, decision=result.overall_decision,
-                        reason=result.summary, window_start=window_start, window_end=window_end,
-                    )
-                    await db.commit()
-                logger.info(
-                    "watch_arrivals: %s -> %s (배정 대상 아님)",
-                    row["callsgn"], result.overall_decision.value,
-                )
-                continue
-
-            slot_no = await find_free_slot(
-                db, berth_id=result.selected_berth.berth_id,
-                window_start=window_start, window_end=window_end,
+            wrote = await record_from_orchestrator(
+                db, call_sign=callsgn, vessel_name=row.get("vessel_name"),
+                stage=stage, wharf_name=target, result=result, input_snapshot=snapshot,
             )
-            if slot_no is None:
-                # 추천 계산 시점과 INSERT 시점 사이의 경합(드묾) — 다음 주기에 재시도된다.
-                logger.warning(
-                    "watch_arrivals: %s 추천 선석 '%s' 방금 만석 - 다음 주기 재시도",
-                    row["callsgn"], result.selected_berth.wharf_name,
-                )
-                continue
+            await db.commit()
 
-            await _insert_requested(
-                db,
-                berth_id=result.selected_berth.berth_id,
-                slot_no=slot_no,
-                callsgn=row["callsgn"],
-                vessel_name=row["vessel_name"],
-                imo_no=row["imo_no"],
-                chem_id=row["chem_id"],
-                window_start=window_start,
-                window_end=window_end,
-                assignment_reason=result.summary,
-                rejected_candidates=result.decision_detail(),
-                actual_berthing_at=row["arrival_at_utc"],
-            )
-            logger.info(
-                "watch_arrivals: %s -> '%s' 슬롯 %d 추천(REQUESTED)",
-                row["callsgn"], result.selected_berth.wharf_name, slot_no,
-            )
+        recorded += int(wrote)
+        skipped += int(not wrote)
+        logger.info(
+            "watch_arrivals: %s -> %s%s",
+            callsgn, result.overall_decision.value, "" if wrote else " (변화 없음, 기록 생략)",
+        )
+
+    logger.info(
+        "watch_arrivals: 완료 — 대상 %d척 · 기록 %d건 · 변화없음 %d건 · 판정불가 %d척",
+        len(rows), recorded, skipped, unknown,
+    )

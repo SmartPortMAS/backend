@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import GLOBAL_DEFAULT_BERTH_GROUP
 
 from .data_access import get_berth_threshold, get_forecast_range, get_latest_wave, get_latest_weather
+from .rule_engine import wave_applies_to as rule_engine_wave_applies_to
 from .rule_engine import PRECIP_STOP_MM, MAX_STALENESS, evaluate, severity
 from .schemas import (
     ForecastPoint,
@@ -128,6 +129,13 @@ async def assess_weather(db: AsyncSession, request: WeatherAssessmentRequest) ->
     # 단계로는 자동 격상하지 않는다.
     current_precip_mm = PRECIP_STOP_MM if request.precip_observed else None
 
+    # [2026-09-21, D2 ②] 외해 부이 파고를 항내 부두에 대입하지 않는다.
+    # wharf_name 을 안 넘긴 호출은 예전대로 적용한다(하위 호환) — 다만 그러면
+    # 항내 부두가 외해 파고로 막히므로, 판정 경로는 반드시 이 값을 채워야 한다.
+    wave_applies = (
+        rule_engine_wave_applies_to(request.wharf_name) if request.wharf_name else True
+    )
+
     status, reasons = evaluate(
         wind_speed_ms=wind_speed_ms,
         wind_is_stale=wind_is_stale,
@@ -136,6 +144,7 @@ async def assess_weather(db: AsyncSession, request: WeatherAssessmentRequest) ->
         threshold=threshold,
         extra_condition_active=request.extra_condition_active,
         precip_mm=current_precip_mm,
+        wave_applies=wave_applies,
     )
 
     forecast_warning = None
