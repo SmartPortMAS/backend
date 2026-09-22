@@ -564,15 +564,32 @@ async def get_safety_index(db: AsyncSession = Depends(get_session)) -> dict:
 
 
 # --------------------------------------------------------------------------
-# 선석 배정현황 — berth + berth_assignment 조인, 슬롯 단위.
+# 선석 현황 — upa_berth_facility + AIS 실측 접안 + 최신 판정, 슬롯 단위.
 #
-# 08_스케줄링_전면재설계_자동배정_설계문서.md §7 — 위 /berths(upa_port_call
-# VTS 관측 기준 "실제로 배가 있는가")와는 다른 질문에 답한다. 이건 "우리
-# 시스템이 이 선석에 무엇을 배정(추천/승인)했는가"를 보여준다 — 데이터
-# 출처가 다르므로 /berths를 확장하지 않고 새 엔드포인트로 분리했다(§7.1).
+# [2026-09-21] 이 화면의 질문이 바뀌었다.
+#   이전: "우리 시스템이 이 선석에 무엇을 배정(추천/승인)했는가"
+#   지금: "이 선석에 지금 무엇이 붙어 있고, 그게 조건에 맞는가"
+# 우리는 배정하지 않으므로(방향 C) 보여줄 배정이 없다. 대신 관측(누가 붙어
+# 있나)과 판정(맞나)을 겹쳐 보여준다.
+#
+# [2026-09-22] 점유 근거를 mart.vessel_presence 로 통일했다.
+#   한동안 이 화면만 mart.berth_occupancy_live(별도 뷰)를 봤다. 위 /berths 가
+#   upa_port_call(사후 이력)을 쓰던 시절엔 그 편이 나았지만, /berths 도 이제
+#   vessel_presence 를 쓴다 — 같은 질문에 뷰가 둘이면 화면마다 척수가 달라진다.
+#
+#   실측(2026-09-22, 같은 스냅샷)으로 실제로 갈렸다:
+#       vessel_presence      접안 14척
+#       berth_occupancy_live 접안  0척
+#   후자는 now() 기준 30분 안의 위치만 '접안'으로 봤는데 최신 위치가 6시간 33분
+#   전이라 전부 NO_SIGNAL 로 떨어졌다 — 수집이 잠깐만 밀려도 이 화면이 통째로
+#   빈다. vessel_presence 는 최신 스냅샷 기준으로 판정하고 낡은 정도를
+#   quality_flag·position_age_min 으로 따로 밝힌다.
+#
+# /berths 와 이 화면의 차이는 이제 소스가 아니라 **질문**이다 — 저쪽은 "어디에
+# 몇 척", 이쪽은 "그 배가 이 자리에 맞는가"(판정 오버레이).
 #
 # 빈 슬롯도 slot_no 1..max_concurrent_vessels 전부 채워서 내려준다 — 프론트가
-# "몇 개 슬롯 중 몇 개가 찼는지"를 계산 없이 바로 그릴 수 있게.
+# "몇 자리 중 몇 자리가 찼는지"를 계산 없이 바로 그릴 수 있게.
 #
 # [2026-08-21] 온산 MVP 스코프(15개 선석)로 범위를 좁혔다 — 스케줄링 에이전트가
 # onsan_scope 하드 필터로 이 선석에만 배정하도록 바뀌었고(graph_queries.py
@@ -598,6 +615,27 @@ _ONSAN_SCOPE_WHARF_NAMES = (
 # --------------------------------------------------------------------------
 
 _QUERY_BERTH_ASSIGNMENTS = text("""
+    WITH live AS (
+        -- 슬롯은 우리가 나눠 주는 자리가 아니라 **지금 붙어 있는 배를 센 결과**다.
+        -- 부두에 가까운 순으로 번호를 매긴다 — 실제 선석 번호가 아니라 표시 순서다.
+        -- 거리가 없는 배(좌표 없는 부이 등 '신고'만으로 잡힌 건)는 뒤로 보낸다.
+        SELECT vp.berth_name AS wharf_name, vp.callsgn, vp.vessel_name,
+               vp.berth_dist_m AS distance_m, vp.berth_basis,
+               vp.received_at_utc, vp.quality_flag, vp.position_age_min,
+               row_number() OVER (
+                   PARTITION BY vp.berth_name
+                   ORDER BY vp.berth_dist_m NULLS LAST, vp.callsgn
+               )::int AS slot_no
+        FROM mart.vessel_presence vp
+        WHERE vp.presence_zone = 'BERTH' AND vp.berth_name IS NOT NULL
+    ),
+    latest_assessment AS (
+        SELECT DISTINCT ON (call_sign) call_sign, id, stage, level, action, recipient,
+               reasons, axes, acknowledged_by, assessed_at_utc
+        FROM assessment_history
+        WHERE assessed_at_utc > now() - interval '48 hours'
+        ORDER BY call_sign, assessed_at_utc DESC
+    )
     SELECT b.wharf_name, b.latitude, b.longitude,
            COALESCE(b.berth_vessel_count, 1)::int AS max_concurrent_vessels,
            b.port_name, b.length_m, b.depth_m, b.berth_capacity AS max_dwt,
@@ -606,103 +644,70 @@ _QUERY_BERTH_ASSIGNMENTS = text("""
            -- 원천 값을 쓰면 스케줄링 에이전트(그래프)와 이 화면이 어긋난다 —
            -- 가스부두가 판정은 '가스', 화면 표시는 '유류' 로 나왔다.
            bhc.handling_cargo_name, b.wharf_se_name,
-           ba.id AS assignment_id,
-           ba.slot_no, ba.status, ba.call_sign, ba.vessel_name,
-           ba.cargo_chem_id, mc.name_ko AS cargo_name,
-           lower(ba.planned_window) AS window_start, upper(ba.planned_window) AS window_end,
-           -- 실제 입항은 ba.actual_berthing_at을 우선 쓴다(2026-08-20 — arrival_watcher가
-           -- 배정 생성 시점에 이미 VTS 확인 입항시각을 직접 채워 둔다, 이 배정 자신의
-           -- 값이라 재항 건 혼동이 없다). 그 다음은 portmis_vessel(공식 신고, 2026-08-20
-           -- details 파싱 복원 이후 사용 가능해짐) — VTS(upa_port_call)보다 신뢰도가
-           -- 높다. 아래 두 LATERAL 모두 없는 배정만 VTS로 마지막 보충한다.
-           COALESCE(ba.actual_berthing_at, pm.arrival_at_utc, pc.arrival_at_utc) AS actual_arrival_utc,
-           COALESCE(ba.actual_departure_at, pm.departure_at_utc, pc.departure_at_utc) AS actual_departure_utc,
-           -- PORT-MIS만 주는 값 — 입항 시점에 선사가 신고하는 출항 "예정" 시각.
-           -- 아직 출항 전이어도(actual_departure_utc가 null이어도) 언제쯤 비는지
-           -- 미리 보여줄 수 있다("출항시간 기준으로 자리를 비워야" 요청, 2026-08-20).
+           lv.slot_no, lv.callsgn AS call_sign, lv.vessel_name,
+           lv.distance_m, lv.received_at_utc AS position_at_utc,
+           -- 점유 판정 근거와 신선도 — 화면이 "왜 여기 있다고 보나"와
+           -- "그 판단이 얼마나 최근 것인가"를 그대로 보여줄 수 있게.
+           lv.berth_basis, lv.quality_flag, lv.position_age_min,
+           -- 판정 — 이 배가 이 자리에 맞는가. 없으면 전부 NULL(아직 판정 전).
+           la.id AS assessment_id, la.stage, la.level, la.action, la.recipient,
+           la.reasons, la.acknowledged_by, la.assessed_at_utc,
+           cm.chem_id AS cargo_chem_id, mc.name_ko AS cargo_name,
+           -- 실제 입출항은 PORT-MIS(공식 신고)를 우선하고 VTS 로 보충한다.
+           -- 다만 PORT-MIS 는 수집창 [어제, 오늘+3일] 밖이면 동결되므로
+           -- portmis_collected_at 을 함께 내려보내 화면이 신선도를 알 수 있게 한다.
+           pm.arrival_at_utc AS actual_arrival_utc,
+           pm.departure_at_utc AS actual_departure_utc,
            pm.departure_sched_utc AS departure_scheduled_utc,
-           ba.assignment_reason, ba.approved_by, ba.rejected_candidates AS decision_detail
+           pm.collected_at_utc AS portmis_collected_at
     FROM upa_berth_facility b
-    -- record_uid로 조인했더니 늘 빈 배열이었다(2026-08-21 실측) — record_uid는
-    -- common_pg_loader.add_record_uid()가 unique_cols==["record_uid"]인 표에만
-    -- 채우는데, upa_berth_facility는 진작 wharf_name 자연키로 전환돼 있어(upa_
-    -- loader.py TABLE_MAP) record_uid가 이 표에서는 항상 NULL이다 — NULL=NULL은
-    -- SQL에서 거짓이라 한 행도 안 붙었다. mart.berth_handling_cargo는 이 표에서
-    -- 그대로 SELECT한 뷰(집계 없음)라 (wharf_name, port_operator_name)이 그대로
-    -- 유일키다(SK2부두처럼 이름이 겹치는 곳도 운영사가 다르다 — 실측 0건 중복
-    -- 확인) — 위 berth_assignment 조인의 SK2부두 대응과 같은 원리.
+    -- record_uid 로 조인했더니 늘 빈 배열이었다(2026-08-21 실측) — upa_berth_facility 는
+    -- wharf_name 자연키로 전환돼 record_uid 가 항상 NULL 이고 NULL=NULL 은 거짓이다.
+    -- mart.berth_handling_cargo 는 이 표를 그대로 SELECT 한 뷰라
+    -- (wharf_name, port_operator_name) 이 유일키다(SK2부두처럼 이름이 겹쳐도 운영사가 다름).
     JOIN mart.berth_handling_cargo bhc
       ON bhc.wharf_name = b.wharf_name
      AND bhc.port_operator_name IS NOT DISTINCT FROM b.port_operator_name
-    LEFT JOIN berth_assignment ba
-      -- berth_id 는 부두명이거나, 이름이 겹칠 때는 "부두명(수역구분)" 이다.
-      --
-      -- 같은 이름을 쓰는 부두가 실제로 있다 — 'SK2부두' 는 SK가스㈜(국유,
-      -- LPG 7.5m)와 SK에너지㈜(민유, 석유제품 8.0m) 두 곳이다. 그래서
-      -- berth_neo4j_loader 가 그래프 노드 id 를 'SK2부두(국유)' 처럼 구분해
-      -- 만들고, 배정도 그 id 로 저장된다.
-      --
-      -- 그런데 여기 조인은 부두명만 봤다. 그 결과 SK2부두에 난 배정은 어느
-      -- 행에도 붙지 못해, 승인까지 끝난 배가 지도와 목록에서 통째로 사라졌다
-      -- (2026-08-21 실측 — DB 는 APPROVED 인데 화면에는 없었다).
-      -- 접미사를 붙여 되돌리면 국유/민유가 각각 제 행에만 붙는다.
-      ON (
-           ba.berth_id = b.wharf_name
-        OR ba.berth_id = b.wharf_name || '(' || COALESCE(b.wharf_se_name, '?') || ')'
-      )
-     AND ba.status IN ('REQUESTED', 'APPROVED', 'SCHEDULED', 'BERTHED')
-     -- 관제사가 승인/반려하지 않고 방치한 REQUESTED 추천은 계획기간(planned_window)이
-     -- 이미 끝나면 뺀다(2026-08-20, 실사용 중 발견 — SK5부두 슬롯 1에 8/11·8/18·8/20
-     -- 세 건이 동시에 "점유 중"으로 뜸. 셋 다 서로 겹치지 않는 시간대라 EXCLUDE
-     -- 제약은 정상 작동한 것이었고, 문제는 출항 확인 이벤트가 없어 release_
-     -- completed_berths가 못 닫는 낡은 REQUESTED가 계속 쌓이는 쪽이었다). APPROVED
-     -- 이후 상태는 관제사가 이미 확정한 실제 점유이므로 계획기간이 지나도(실제 출항
-     -- 지연 등) 계속 보여준다 — 여기서 거르는 건 "아무도 결정하지 않은 채 시효가
-     -- 지난 추천"뿐이다. DB 행 자체는 감사 기록으로 남고 지우지 않는다.
-     AND (ba.status != 'REQUESTED' OR ba.planned_window IS NULL OR upper(ba.planned_window) > now())
-    LEFT JOIN msds_chemical mc ON mc.chem_id = ba.cargo_chem_id
-    -- PORT-MIS(공식 신고) 실제 입출항 + 출항예정 — call_sign 기준으로 이 배의
-    -- 가장 최근 방문 하나만 붙인다(같은 배가 재항을 여러 번 했을 수 있어서).
-    -- 계획 구간과 겹치거나 가까운(2일 버퍼) 건만 인정해 다른 방문과 혼동을 막는다
-    -- (아래 VTS LATERAL과 동일 원칙 — 실측으로 재현했던 "지난달 기록이 붙는" 사고).
+    -- [2026-09-21] berth_assignment(우리 예약) -> 실측 접안.
+    --   이 화면의 질문이 바뀌었다. 전에는 "우리가 이 선석에 무엇을 배정했나"였고
+    --   지금은 **"이 선석에 지금 무엇이 붙어 있고, 그게 조건에 맞는가"** 다.
+    --   vessel_presence.berth_name 은 이미 wharf 정본 표기라 facility_alias 를
+    --   거치지 않는다 (별칭 조인은 척수를 뻥튀기한다 — 실측 2부두 3척 -> 9척).
+    LEFT JOIN live lv ON lv.wharf_name = b.wharf_name
+    LEFT JOIN latest_assessment la ON upper(btrim(la.call_sign)) = upper(btrim(lv.callsgn))
     LEFT JOIN LATERAL (
-        SELECT pv.arrival_at_utc, pv.departure_at_utc, pv.departure_sched_utc
+        SELECT cm2.chem_id FROM mart.cargo_msds cm2
+        WHERE upper(btrim(cm2.callsgn)) = upper(btrim(lv.callsgn)) AND cm2.chem_id IS NOT NULL
+        -- ORDER BY 없는 LIMIT 1 은 한 배에 화물이 여럿일 때 어느 물질이 뽑힐지
+        -- 우연에 맡긴다 — 인화점·IMDG 등급이 달라 화면 표시가 실제로 흔들린다.
+        ORDER BY cm2.chem_id
+        LIMIT 1
+    ) cm ON true
+    LEFT JOIN msds_chemical mc ON mc.chem_id = cm.chem_id
+    LEFT JOIN LATERAL (
+        SELECT pv.arrival_at_utc, pv.departure_at_utc, pv.departure_sched_utc, pv.collected_at_utc
         FROM portmis_vessel pv
-        WHERE ba.call_sign IS NOT NULL
-          AND upper(btrim(pv.callsgn)) = upper(btrim(ba.call_sign))
+        WHERE lv.callsgn IS NOT NULL
+          AND upper(btrim(pv.callsgn)) = upper(btrim(lv.callsgn))
           AND pv.arrival_at_utc IS NOT NULL
-          AND pv.arrival_at_utc > lower(ba.planned_window) - interval '2 days'
-          AND pv.arrival_at_utc < upper(ba.planned_window) + interval '2 days'
         ORDER BY pv.arrival_at_utc DESC
         LIMIT 1
     ) pm ON true
-    -- VTS(upa_port_call) 실제 입출항 — PORT-MIS·ba 실측값이 전부 없을 때만 쓰는
-    -- 마지막 폴백(2026-08-19, "선박 정보에 입항/출항시간 있지 않냐"는 지적).
-    LEFT JOIN LATERAL (
-        SELECT pc2.arrival_at_utc, pc2.departure_at_utc
-        FROM upa_port_call pc2
-        WHERE ba.call_sign IS NOT NULL
-          AND upper(btrim(pc2.callsgn)) = upper(btrim(ba.call_sign))
-          AND pc2.arrival_at_utc IS NOT NULL
-          AND pc2.arrival_at_utc > lower(ba.planned_window) - interval '2 days'
-          AND pc2.arrival_at_utc < upper(ba.planned_window) + interval '2 days'
-        ORDER BY pc2.arrival_at_utc DESC
-        LIMIT 1
-    ) pc ON true
     WHERE b.wharf_name = ANY(CAST(:onsan_wharf_names AS text[]))
-    ORDER BY b.wharf_name, ba.slot_no
+    ORDER BY b.wharf_name, lv.slot_no
 """)
 
 
-@router.get("/berth-assignments", summary="선석 배정현황 조회 (슬롯 단위, §7.2)")
+@router.get("/berth-assignments", summary="선석 현황 조회 (실측 접안 + 최신 판정, 슬롯 단위)")
 async def get_berth_assignments(db: AsyncSession = Depends(get_session)) -> list[dict]:
-    """선석별 슬롯 배정 상태. REQUESTED(추천, 승인 대기)/APPROVED 이후(확정)를 구분해서
-    보여준다 — 승인 액션은 POST /approvals/{id}/decision.
+    """선석별로 지금 붙어 있는 배와 그 배의 최신 판정.
 
-    upa_berth_facility.wharf_name은 UNIQUE라 선석당 행이 하나뿐이다(2026-08-19,
-    berth_assignment.berth_id FK를 여기로 옮기면서 중복 berth 마스터 행 문제 자체가
-    없어짐 — 이전에는 berth 테이블에 같은 wharf_name 중복 행이 생겨 지도에 원이
-    여러 개 겹쳐 찍히는 문제가 있었다).
+    `slots[].status` 에는 배정 상태가 아니라 **판정 등급**(적합/주의/부적합/판정불가)이
+    들어간다. 아직 판정 전이면 None 이다 — 배는 붙어 있는데 판정이 없다는 뜻이고,
+    그것도 관제사가 알아야 할 사실이라 숨기지 않는다.
+
+    확인 액션은 `POST /approvals/{assessment_id}/acknowledge` 다. 승인이 아니라
+    "이 판정을 봤다"는 기록이며, 눌러도 아무 자원이 잠기지 않는다.
     """
     rows = (
         await db.execute(
@@ -730,37 +735,35 @@ async def get_berth_assignments(db: AsyncSession = Depends(get_session)) -> list
             "slots": [],
         })
         if row["slot_no"] is not None:
+            # 이 슬롯은 예약이 아니라 **지금 붙어 있는 배**다. status 자리에는
+            # 배정 상태가 아니라 판정 등급이 들어간다 — 아직 판정 전이면 None.
             entry["slots"].append({
                 "slot_no": row["slot_no"],
-                # 읽기전용 표시용 — 실제 승인/반려는 이 페이지가 아니라 종합에이전트
-                # 콘솔(AgentConsole)이 GET /approvals/pending으로 같은 id를 조회해
-                # POST /approvals/{id}/decision을 부른다(2026-08-19, 이 페이지에 있던
-                # 승인 버튼이 이 id 자체가 응답에 없어 "undefined"로 호출되던 버그를
-                # 고치면서 승인 액션 자체를 여기서 뺐다 — 두 화면에 같은 액션이
-                # 따로 있으면 관제사가 어느 쪽이 진짜인지 헷갈린다).
-                "assignment_id": row["assignment_id"],
-                "status": row["status"],
+                "assessment_id": row["assessment_id"],
+                "status": row["level"],
+                "stage": row["stage"],
+                "action": row["action"],
+                "recipient": row["recipient"],
+                "reasons": row["reasons"],
+                "acknowledged_by": row["acknowledged_by"],
+                "assessed_at_utc": row["assessed_at_utc"],
                 "call_sign": row["call_sign"],
                 "vessel_name": row["vessel_name"],
                 "cargo_chem_id": row["cargo_chem_id"],
                 "cargo_name": row["cargo_name"],
-                "window_start": row["window_start"],
-                "window_end": row["window_end"],
-                # 실제 입출항 시각(portmis_vessel 우선, 없으면 upa_port_call) — window_*는
-                # 배정 시점의 "계획값"이고 이건 "진짜 언제 들어오고 나갔나"다.
-                # 아직 출항 전이면 actual_departure_utc는 null.
+                # 실측 접안 근거 — 판정 방식('신고+위치'/'위치'/'신고'), 부두
+                # 대표좌표까지의 거리, 관측 시각, 그리고 그 관측의 신선도.
+                "berth_basis": row["berth_basis"],
+                "distance_m": row["distance_m"],
+                "position_at_utc": row["position_at_utc"],
+                "quality_flag": row["quality_flag"],
+                "position_age_min": row["position_age_min"],
                 "actual_arrival_utc": row["actual_arrival_utc"],
                 "actual_departure_utc": row["actual_departure_utc"],
-                # PORT-MIS가 입항 시점에 신고받은 출항 "예정" 시각 — 아직 출항 전인
-                # 배정도 "언제쯤 이 자리가 빌지" 미리 보여줄 수 있다. PORT-MIS만 주는
-                # 값이라 없으면 그냥 null(다른 소스로 대체하지 않음 — 추측 금지).
                 "departure_scheduled_utc": row["departure_scheduled_utc"],
-                "assignment_reason": row["assignment_reason"],
-                "approved_by": row["approved_by"],
-                # 구조화된 배정 근거(선정 경로/흘수여유/안전판정/기상판정/탈락후보) —
-                # assignment_reason(LLM 자유문)이 특정 요인만 강조해도 전체 근거를
-                # 여기서 확인할 수 있다(OrchestratorResult.decision_detail() 참고).
-                "decision_detail": row["decision_detail"],
+                # PORT-MIS 수집창 [어제, 오늘+3일] 밖이면 이 값이 며칠 전에서 멈춘다.
+                # 화면이 "이 입출항 정보가 얼마나 묵었나"를 표시할 수 있게 함께 내린다.
+                "portmis_collected_at": row["portmis_collected_at"],
             })
             occupied_slot_nos.setdefault(name, set()).add(row["slot_no"])
 

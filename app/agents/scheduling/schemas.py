@@ -125,7 +125,7 @@ class BerthResolution(BaseModel):
     이걸 호출해 실제 배정 가능 여부와 그 근거(trace)를 얻는다.
     """
 
-    path: str = Field(description="전용 | 대체 | 정박지대기 | 배정불가")
+    path: str = Field(description="전용 | 대체 | 정박지대기 | 제안불가")
     berth: BerthCandidate | None = Field(default=None, description="path가 전용/대체일 때만 채워짐")
     anchorage: AnchorageAssignment | None = Field(default=None, description="path가 정박지대기일 때만 채워짐")
     trace: list[str] = Field(default_factory=list, description="판단 경로와 근거(관제사용 설명)")

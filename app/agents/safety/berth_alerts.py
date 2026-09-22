@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .bulk_compatibility import build_bulk_conflicts
 from .graph_queries import (
+    find_adjacent_berth_conflicts,
     find_bulk_exceptions,
     find_bulk_group_conflicts,
     find_bulk_groups,
@@ -32,6 +33,7 @@ from .graph_queries import (
 )
 from .rule_engine import (
     compute_bulk_compatibility_floor,
+    compute_imdg_berth_adjacency_floor,
     compute_imdg_costowage_floor,
     compute_imdg_unconfirmed_floor,
     compute_risk_floor,
@@ -40,11 +42,21 @@ from .schemas import RiskLevel, max_risk_level, risk_level_rank
 
 # 같은 선석에 함께 재항 중인 화물 목록. chem_id 가 있는 것만 판정에 쓰지만,
 # 없는 것도(정체 미확인) 세어서 따로 알린다.
+#
+# [2026-09-22] wharf_name(선석 제원 마스터 정본 표기)을 함께 싣는다 — D3 인접
+#   선석 확장(_adjacent_berth_alerts)이 Neo4j `(:Berth {wharf_name})` 를 찾을 때
+#   쓴다. facility_name 은 VTS/manifest 원문이라 그래프 키와 글자가 다르다.
+#   facility_alias 는 source_name 이 유일키(idx_facility_alias_source)라 이
+#   조인으로 행이 불어나지 않는다. BERTH 가 아닌 것(호안·정박지·미해소)은
+#   wharf_name 이 NULL 로 남고, 인접 판정에서 조용히 빠진다 — 없는 선석의
+#   인접을 지어내지 않기 위해서다.
 _QUERY_BERTH_CARGO = text("""
-    SELECT facility_name, callsgn, chem_id, cargo_name, imdg_class
-    FROM mart.berth_current_cargo
-    WHERE facility_name IS NOT NULL
-    ORDER BY facility_name
+    SELECT bcc.facility_name, bcc.callsgn, bcc.chem_id, bcc.cargo_name, bcc.imdg_class,
+           CASE WHEN fa.facility_type = 'BERTH' THEN fa.wharf_name END AS wharf_name
+    FROM mart.berth_current_cargo bcc
+    LEFT JOIN mart.facility_alias fa ON fa.source_name = bcc.facility_name
+    WHERE bcc.facility_name IS NOT NULL
+    ORDER BY bcc.facility_name
 """)
 
 # 흘수 판정은 뷰가 이미 결론을 내려뒀다 — 여기서는 옮겨 적기만 한다.
@@ -55,7 +67,9 @@ _QUERY_DRAUGHT_ALERTS = text("""
     ORDER BY ukc_m NULLS LAST
 """)
 
-_LEVEL_TO_ALERT = {
+# RiskLevel -> 경고 심각도. 아래 _ASSESSMENT_LEVEL_TO_ALERT(판정 이력 어휘)와는
+# 다른 표다 — 2026-09-22 까지 둘 다 _LEVEL_TO_ALERT 라 이게 덮여 있었다.
+_RISK_TO_ALERT = {
     RiskLevel.BLOCKED: "DANGER",
     RiskLevel.DANGER: "DANGER",
     RiskLevel.CAUTION: "WARNING",
@@ -63,10 +77,13 @@ _LEVEL_TO_ALERT = {
 }
 
 
-async def _segregation_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dict]:
-    """같은 선석에 있는 화물끼리 짝을 지어 혼재금지·IMDG 격리 규칙을 돌린다."""
-    rows = (await db.execute(_QUERY_BERTH_CARGO)).mappings().all()
+async def _segregation_alerts(rows: list[dict], driver: AsyncDriver) -> list[dict]:
+    """같은 선석에 있는 화물끼리 짝을 지어 혼재금지·IMDG 격리 규칙을 돌린다.
 
+    [2026-09-22] 재항 화물 조회를 build_berth_alerts 로 올렸다 — 인접 선석
+    판정(_adjacent_berth_alerts)이 같은 행을 쓰기 때문이다. 같은 스냅샷을
+    공유해야 두 경고가 서로 다른 시점의 현황을 말하지 않는다.
+    """
     by_berth: dict[str, list[dict]] = {}
     for row in rows:
         by_berth.setdefault(row["facility_name"], []).append(dict(row))
@@ -187,7 +204,7 @@ async def _segregation_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dic
                     why = f"혼재금지({raw.get('category', '분류 미상')})"
 
                 pairs_by_berth.setdefault(berth, []).append({
-                    "level": _LEVEL_TO_ALERT[floor],
+                    "level": _RISK_TO_ALERT[floor],
                     "risk_level": floor,
                     "text": f"{target_name} ↔ {other_name} {why}",
                     # 이 조합에 실제로 걸린 배들. 화면이 경고에서 선박 상세로 갈
@@ -240,6 +257,109 @@ async def _segregation_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dic
     return alerts
 
 
+async def _adjacent_berth_alerts(rows: list[dict], driver: AsyncDriver) -> list[dict]:
+    """D3 — **인접 부두** 재항 화물과의 충돌 (9/17 회의 §3, 목표일 9/23).
+
+    위 _segregation_alerts 는 같은 부두 안만 본다. 여기는 그래프의
+    (:Berth)-[:ADJACENT_TO]->(:Berth) 를 타고 옆 부두까지 넓힌다 — 그 간선
+    120개(부두 단위 11쌍)는 그동안 백엔드가 한 번도 조회하지 않았다.
+
+    ★ 등급 근거는 MSDS 축만 쓴다.
+      IMDG Code Ch.7.2 는 단일 선박 내 적부 규정이라 부두와 부두 사이에는
+      적용하지 않는다는 것이 이 프로젝트의 기존 판단이고(rule_engine.
+      compute_imdg_berth_adjacency_floor — 항상 SAFE, 근거 MSC.1/Circ.1216),
+      D3 라고 해서 그 판단을 뒤집지 않는다. 그래서 IMDG 로만 걸린 인접 조합은
+      등급을 올리지 않고 INFO(참고)로만 올린다 — 조회는 계속 하되 판정에서만
+      빼는, 그 함수가 지시하는 그대로의 취급이다.
+
+    ★ 판정 로직을 새로 만들지 않는다(모듈 docstring 1번). 등급은 전부
+      compute_risk_floor / compute_imdg_berth_adjacency_floor 가 낸다.
+    """
+    cargo = [r for r in rows if r.get("wharf_name") and r.get("chem_id")]
+    if len(cargo) < 2:
+        return []
+
+    by_wharf: dict[str, list[dict]] = {}
+    for c in cargo:
+        by_wharf.setdefault(c["wharf_name"], []).append(c)
+
+    # (이쪽 부두·물질, 저쪽 부두·물질)은 양방향으로 한 번씩 걸린다 — 같은 사건이다.
+    seen: set[frozenset] = set()
+    alerts: list[dict] = []
+
+    for wharf, cargos in by_wharf.items():
+        for target in {c["chem_id"]: c for c in cargos}.values():
+            hits = await find_adjacent_berth_conflicts(
+                driver,
+                wharf_name=wharf,
+                target_chem_id=target["chem_id"],
+                neighbor_cargo=cargo,
+            )
+            for hit in hits:
+                pair = frozenset({
+                    (wharf, target["chem_id"]),
+                    (hit["neighbor_wharf"], hit["chem_id"]),
+                })
+                if pair in seen:
+                    continue
+                seen.add(pair)
+
+                msds = (
+                    [{"category": hit["via"]}]
+                    if hit["basis"] == "MSDS_INCOMPATIBLE"
+                    else []
+                )
+                floor = max_risk_level(
+                    compute_risk_floor(msds),
+                    # 항상 SAFE. "IMDG 를 의도적으로 뺐다"가 코드에 보이게 남긴다.
+                    compute_imdg_berth_adjacency_floor([hit]),
+                )
+                is_reference_only = floor == RiskLevel.SAFE
+
+                target_name = target["cargo_name"] or target["chem_id"]
+                dist = (
+                    f"{int(round(hit['distance_m']))}m"
+                    if hit["distance_m"] is not None
+                    else "거리 미상"
+                )
+                if is_reference_only:
+                    message = (
+                        f"{wharf}: {target_name} ↔ 인접 {hit['neighbor_wharf']}"
+                        f"({dist}) {hit['name_ko']} — IMDG 격리코드 "
+                        f"{hit['segregation_code']} (참고 — 부두 간에는 등급 근거로 "
+                        f"쓰지 않음)"
+                    )
+                else:
+                    message = (
+                        f"{wharf}: {target_name} ↔ 인접 {hit['neighbor_wharf']}"
+                        f"({dist}) {hit['name_ko']} 혼재금지({hit['via']})"
+                        f" → {floor.value}"
+                    )
+
+                callsgns = [
+                    cs
+                    for cs in (target.get("callsgn"), hit.get("callsgn"))
+                    if cs
+                ]
+                alerts.append({
+                    "level": "INFO" if is_reference_only else _RISK_TO_ALERT[floor],
+                    "type": "ADJACENT_SEGREGATION",
+                    "berth_name": wharf,
+                    "message": message,
+                    "risk_level": None if is_reference_only else floor.value,
+                    "basis": "Neo4j ADJACENT_TO 확장 탐색 (선석→인접→재항화물→충돌)",
+                    # 그래프가 만든 경로 문장. 화면·보고서가 근거를 다시 조립하지
+                    # 않게 하려고 그대로 싣는다(회의 §3 "경로 문장").
+                    "graph_path": hit["path_text"],
+                    "neighbor_berth_name": hit["neighbor_wharf"],
+                    "distance_m": hit["distance_m"],
+                    "callsgns": list(dict.fromkeys(callsgns)),
+                    "chem_ids": [target["chem_id"], hit["chem_id"]],
+                })
+
+    return alerts
+
+
 async def _draught_alerts(db: AsyncSession) -> list[dict]:
     rows = (await db.execute(_QUERY_DRAUGHT_ALERTS)).mappings().all()
     out = []
@@ -250,7 +370,7 @@ async def _draught_alerts(db: AsyncSession) -> list[dict]:
         if verdict == "CHECK":
             # 선석별 수심이 다른 부두(SK5 7~11m 등) — 가장 얕은 선석 기준으론 부족하지만
             # 깊은 선석이면 된다. VTS 기록에 선석 번호가 없어 시스템은 어느 선석인지
-            # 모르므로 '불가'가 아니라 '확인 요청'이다(mart_views.sql 5-1절 berth_range).
+            # 모르므로 '불가'가 아니라 '확인 요청'이다(mart_views.sql berth_draught_check).
             message = (f"{row['facility_name'] or '부두 미상'}: {row['callsgn']} "
                        f"접안 선석 확인 요청 — 가장 얕은 선석 기준 {ukc}, "
                        f"가장 깊은 선석({row['chart_depth_max_m']} m)이면 여유 있음")
@@ -270,45 +390,64 @@ async def _draught_alerts(db: AsyncSession) -> list[dict]:
     return out
 
 
-_QUERY_SCHEDULING_EXCLUSIONS = text("""
-    SELECT call_sign, vessel_name, decision, reason, updated_at
-    FROM scheduling_exclusion
-    ORDER BY updated_at DESC
+# [2026-09-21] scheduling_exclusion -> assessment_history 로 교체.
+#
+# 옛 표는 "자동 배정이 배정을 만들지 못한 건"의 목록이었다. 우리가 배정을 만들지
+# 않으므로 못 만든 건도 없다(방향 C). 같은 자리를 채우는 것은 판정 이력이다 —
+# 관제사가 알아야 하는 건 '배정 실패'가 아니라 **'지금 자리가 조건에 안 맞는 배'** 다.
+#
+# 배 1척당 최신 판정 1건만 본다. 이력 전체를 펼치면 같은 배가 화면에 여러 번 뜬다.
+_QUERY_ACTIVE_ASSESSMENTS = text("""
+    SELECT DISTINCT ON (call_sign)
+           call_sign, vessel_name, stage, wharf_name, level, action, recipient,
+           reasons, assessed_at_utc
+    FROM assessment_history
+    WHERE level <> '적합'
+      -- 오래된 판정은 경고가 아니라 이력이다. 그 배는 이미 떠났을 수 있다.
+      AND assessed_at_utc > now() - interval '24 hours'
+    ORDER BY call_sign, assessed_at_utc DESC
 """)
 
-# 자동 배정 흐름(arrival_watcher.py)에서 온 판정 사유는 그대로 옮겨 적는다 —
-# 여기서 새 판단을 만들지 않는다는 원칙(위 모듈 docstring 1번)은 이 경고에도
-# 똑같이 적용된다. WEATHER_BLOCKED/ALL_CANDIDATES_UNSAFE는 이미 안전·기상
-# 에이전트가 위험 판정을 내린 뒤라 DANGER, NO_ELIGIBLE_BERTH는 위험 판정과
-# 무관하게 "자리가 없다"는 운영 이슈라 WARNING으로 낮춘다.
-_EXCLUSION_LEVEL = {
-    "NO_ELIGIBLE_BERTH": "WARNING",
-    "ALL_CANDIDATES_UNSAFE": "DANGER",
-    "WEATHER_BLOCKED": "DANGER",
-}
-_EXCLUSION_LABEL = {
-    "NO_ELIGIBLE_BERTH": "적합 선석 없음",
-    "ALL_CANDIDATES_UNSAFE": "전 후보 배정 불가(안전)",
-    "WEATHER_BLOCKED": "기상 불가",
+# 판정 등급 -> 경고 심각도. '판정불가'를 WARNING 으로 두는 것이 핵심이다 —
+# 근거가 없다는 사실 자체를 관제사가 봐야 한다(회의 §4 "근거 부족을 안전과 구분").
+# 조용히 넘기면 모르는 것을 통과시킨 것과 같아진다.
+#
+# ★ [2026-09-22] 이름을 _LEVEL_TO_ALERT 에서 바꿨다 — 이 파일 위쪽의 RiskLevel용
+#   _LEVEL_TO_ALERT 와 이름이 같아 **뒤에 정의된 이 dict 가 앞엣것을 덮고 있었다**.
+#   그래서 _segregation_alerts 의 `_LEVEL_TO_ALERT[floor]` 가 실제로는 이 표를
+#   찾아갔다. RiskLevel 은 str Enum 이라 '주의'만 우연히 맞고, '위험'·'배정불가'는
+#   KeyError 였다(실측: RiskLevel.DANGER/BLOCKED 둘 다 KeyError).
+#   즉 같은 선석에 위험 이상 조합이 생기는 순간 /dashboard/alerts 가 통째로 500 이
+#   된다 — 경고 화면이 가장 필요한 바로 그 순간에. 지금 200 인 것은 재항 조합이
+#   우연히 '주의'까지만 올라가 있어서다(AssessmentLevel 은 별개 어휘라 무관).
+_ASSESSMENT_LEVEL_TO_ALERT = {
+    "부적합": "DANGER",
+    "주의": "WARNING",
+    "판정불가": "WARNING",
 }
 
 
-async def _scheduling_exclusion_alerts(db: AsyncSession) -> list[dict]:
-    """자동 배정(watch_arrivals)이 배정을 만들지 못한 건. 08_스케줄링_전면재설계_
-    자동배정_설계문서.md §5.3 3번 — 아무 조치 없이 조용히 대기 중인 배가 화면에
-    보이지 않으면 관제사가 그 존재 자체를 모른다."""
-    rows = (await db.execute(_QUERY_SCHEDULING_EXCLUSIONS)).mappings().all()
+async def _assessment_alerts(db: AsyncSession) -> list[dict]:
+    """최근 24시간 판정 중 '적합'이 아닌 것.
+
+    여기서 새 판단을 만들지 않는다(모듈 docstring 1번) — 이미 내려진 판정을
+    경고 형식으로 옮겨 적을 뿐이다.
+    """
+    rows = (await db.execute(_QUERY_ACTIVE_ASSESSMENTS)).mappings().all()
     out = []
     for row in rows:
-        label = _EXCLUSION_LABEL.get(row["decision"], row["decision"])
+        who = row["vessel_name"] or row["call_sign"]
+        where = row["wharf_name"] or "계류시설 미상"
+        head = (row["reasons"] or [""])[0]
+        # 조치안이 있으면 받을 곳까지 적는다. 우리가 실행하지 않는다는 뜻이 문장에 남는다.
+        tail = f" → {row['action']} 검토 필요({row['recipient']})" if row["action"] else ""
         out.append({
-            "level": _EXCLUSION_LEVEL.get(row["decision"], "WARNING"),
-            "type": row["decision"],
-            "berth_name": None,
-            "message": f"{row['vessel_name'] or row['call_sign']}: 자동 배정 불가 — {label}"
-                       + (f" ({row['reason']})" if row["reason"] else ""),
+            "level": _ASSESSMENT_LEVEL_TO_ALERT.get(row["level"], "WARNING"),
+            "type": f"ASSESSMENT_{row['level']}",
+            "berth_name": row["wharf_name"],
+            "message": f"[{row['stage']}] {who} @ {where}: {row['level']} — {head}{tail}",
             "risk_level": None,
-            "basis": "scheduling_exclusion(arrival_watcher 자동 배정 판정)",
+            "basis": "assessment_history (판정 이력)",
             "callsgns": [row["call_sign"]] if row["call_sign"] else [],
         })
     return out
@@ -319,10 +458,15 @@ async def build_berth_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dict
 
     경고가 0건인 것은 정상이다 — 없는 위험을 지어내지 않는다.
     """
+    # 재항 화물은 한 번만 읽어 같은 선석 판정과 인접 선석 판정(D3)이 나눠 쓴다 —
+    # 두 번 읽으면 두 경고가 서로 다른 시점의 현황을 말할 수 있다.
+    cargo_rows = [dict(r) for r in (await db.execute(_QUERY_BERTH_CARGO)).mappings().all()]
+
     alerts = (
-        await _segregation_alerts(db, driver)
+        await _segregation_alerts(cargo_rows, driver)
+        + await _adjacent_berth_alerts(cargo_rows, driver)
         + await _draught_alerts(db)
-        + await _scheduling_exclusion_alerts(db)
+        + await _assessment_alerts(db)
     )
     order = {"DANGER": 0, "WARNING": 1, "INFO": 2}
     alerts.sort(key=lambda a: (order.get(a["level"], 9), a["type"]))

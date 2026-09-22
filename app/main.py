@@ -11,6 +11,7 @@ from app.api.v1.approvals import router as approvals_router
 from app.api.v1.arrivals import router as arrivals_router
 from app.api.v1.chatbot import router as chatbot_router
 from app.api.v1.dashboard import router as dashboard_router
+from app.api.v1.hardware import router as hardware_router
 from app.api.v1.gate import router as gate_router
 from app.api.v1.gate import ws_router as gate_ws_router
 from app.api.v1.health import router as health_router
@@ -19,6 +20,7 @@ from app.api.v1.orchestrator import router as orchestrator_router
 from app.api.v1.rag import router as rag_router
 from app.api.v1.safety import router as safety_router
 from app.api.v1.scheduling import router as scheduling_router
+from app.api.v1.twin import router as twin_router
 from app.api.v1.weather import router as weather_router
 from app.config import get_settings
 from app.core.logging import configure_logging
@@ -139,8 +141,12 @@ app.include_router(gate_router, prefix="/api/v1")
 app.include_router(gate_ws_router)   # /ws/gate — vite 프록시가 /ws 를 그대로 넘긴다
 app.include_router(chatbot_router, prefix="/api/v1")
 app.include_router(rag_router, prefix="/api/v1")
+app.include_router(twin_router, prefix="/api/v1")
 app.include_router(approvals_router, prefix="/api/v1")
 app.include_router(arrivals_router, prefix="/api/v1")
+# 하드웨어 릴레이만 prefix 가 없다 — 프런트가 기다리는 경로가
+# '/ws/hardware' 라서다(useHardwareData.js:4). 그 계약을 바꾸지 않는다.
+app.include_router(hardware_router)
 
 
 @app.get("/health", summary="서비스 상태 확인")

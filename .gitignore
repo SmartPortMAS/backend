@@ -7,3 +7,12 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+
+# 임시 조회 스크립트 — 붙여 보고 지우는 용도라 남기지 않는다.
+_tmp_*
+
+# 평가·매트릭스 실행 산출물. 스크립트와 README 는 올리되 결과물은 올리지 않는다
+# (msds_embedding_large.bak.sql 10.8MB · safety_matrix_result.json 2.5MB).
+evals/results/*
+!evals/results/README.md
+scripts/safety_matrix_result.json

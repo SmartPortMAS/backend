@@ -58,6 +58,13 @@ class WeatherAssessmentRequest(BaseModel):
         "1mm/h 기준) 이상으로 즉시 반영한다. 정확한 mm 수치는 알 수 없으니 그 이상 단계"
         "(이안/호스분리)로는 자동 격상하지 않는다 — 그 판단은 관제사가 직접 한다.",
     )
+    wharf_name: str | None = Field(
+        default=None,
+        description="판정 대상 계선시설명. **파고 축의 적용 여부를 이 값이 정한다** — "
+        "우리가 가진 파고는 외해 부이(22189) 관측 하나라 방파제 안쪽 부두에는 쓸 수 "
+        "없다(rule_engine.wave_applies_to 참고). 생략하면 파고를 적용한다(하위 호환) — "
+        "즉 이 값을 안 넘기면 예전처럼 항내 부두도 외해 파고로 판정된다.",
+    )
     as_of: datetime | None = Field(
         default=None,
         description="판단 기준 시각(UTC). 생략 시 서버 현재 시각. 이 시각 이전의 "
