@@ -12,6 +12,8 @@ from app.api.v1.arrivals import router as arrivals_router
 from app.api.v1.chatbot import router as chatbot_router
 from app.api.v1.dashboard import router as dashboard_router
 from app.api.v1.hardware import router as hardware_router
+from app.api.v1.gate import router as gate_router
+from app.api.v1.gate import ws_router as gate_ws_router
 from app.api.v1.health import router as health_router
 from app.api.v1.msds import router as msds_router
 from app.api.v1.orchestrator import router as orchestrator_router
@@ -24,6 +26,7 @@ from app.config import get_settings
 from app.core.logging import configure_logging
 from app.database import AsyncSessionFactory
 from app.neo4j_client import neo4j_client
+from app.gate.bridge import bridge as gate_bridge
 from app.scheduler import create_scheduler
 
 settings = get_settings()
@@ -56,7 +59,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 앱 시작을 막지 않는다(스케줄러 자체 등록 실패만 여기서 전파됨).
     scheduler = create_scheduler()
     scheduler.start()
+    # 하역 개시 인터락 게이트 다리(MQTT ↔ /ws/gate). 브로커가 없어도 앱은 뜬다.
+    gate_bridge.start()
     yield
+    gate_bridge.stop()
     scheduler.shutdown(wait=False)
     await neo4j_client.close()
 
@@ -131,6 +137,8 @@ app.include_router(scheduling_router, prefix="/api/v1")
 app.include_router(weather_router, prefix="/api/v1")
 app.include_router(orchestrator_router, prefix="/api/v1")
 app.include_router(dashboard_router, prefix="/api/v1")
+app.include_router(gate_router, prefix="/api/v1")
+app.include_router(gate_ws_router)   # /ws/gate — vite 프록시가 /ws 를 그대로 넘긴다
 app.include_router(chatbot_router, prefix="/api/v1")
 app.include_router(rag_router, prefix="/api/v1")
 app.include_router(twin_router, prefix="/api/v1")
