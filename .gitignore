@@ -1,7 +1,7 @@
 .env
 .env.*
 !.env.example
-!.env.production.example
+!.env.prod.example
 
 __pycache__/
 *.pyc

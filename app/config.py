@@ -1,42 +1,27 @@
-import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from dotenv import dotenv_values
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# 환경 선택 — 개발과 운영은 DB·Neo4j·키가 완전히 분리되어 있다.
-#
-#   development : backend/.env             (로컬 docker compose DB·Neo4j)
-#   production  : backend/.env.production  (RDS·Aura)
-#
-# 두 파일을 겹쳐 읽지 않고 하나만 읽는다. 겹쳐 읽으면 운영 파일에 빠진 키가
-# 개발 파일 값으로 조용히 채워져, 운영 서버가 개발 DB 를 볼 수 있기 때문이다.
-#
-# ENVIRONMENT 는 파일이 아니라 **프로세스 환경변수**로 정한다(systemd 의
-# Environment=, 셸의 export). 어느 파일을 읽을지 정하는 값을 그 파일 안에 둘 수는
-# 없다. 지정하지 않으면 development.
+# 설정 파일은 기계마다 backend/.env 하나다.
+#   로컬 PC : .env 에 로컬 docker compose DB·Neo4j (ENVIRONMENT 생략 = dev)
+#   운영 EC2: .env 에 RDS·Aura 값 + ENVIRONMENT=prod
+# 로컬은 dev 만, 서버는 prod 만 돌리므로 파일 이름으로 환경을 고를 필요가 없다.
+# 운영 값은 로컬에 .env.prod 로 보관해 두고(git 제외, 코드는 읽지 않음), 배포할 때
+# 서버의 .env 에 넣는다 — .env.prod.example 참고.
 #
 # 경로는 backend 폴더 기준 절대경로다. 예전엔 env_file=".env" 상대경로라 실행
 # 위치(cwd)에 따라 다른 파일을 읽거나 못 읽었다.
 BASE_DIR = Path(__file__).resolve().parent.parent
-_ENV_FILES = {
-    "development": BASE_DIR / ".env",
-    "production": BASE_DIR / ".env.production",
-}
-
-
-def _selected_environment() -> str:
-    env = os.getenv("ENVIRONMENT", "development").strip().lower()
-    if env not in _ENV_FILES:
-        raise ValueError(f"ENVIRONMENT={env!r} — development 또는 production 이어야 합니다.")
-    return env
+ENV_FILE = BASE_DIR / ".env"
 
 
 class Settings(BaseSettings):
-    environment: Literal["development", "production"] = Field(default="development")
+    # prod 이면 운영용 검사(아래 get_settings)를 건다. 예전 이름 development/production 도
+    # 받는다 — 기존 로컬 .env 에 ENVIRONMENT=development 가 적혀 있다.
+    environment: Literal["dev", "prod"] = Field(default="dev")
     database_url: str
     neo4j_uri: str
     neo4j_user: str
@@ -82,10 +67,19 @@ class Settings(BaseSettings):
     enable_scheduler: bool = True
 
     model_config = SettingsConfigDict(
+        env_file=ENV_FILE,
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
     )
+
+    @field_validator("environment", mode="before")
+    @classmethod
+    def _accept_long_names(cls, v: object) -> object:
+        if isinstance(v, str):
+            v = v.strip().lower()
+            return {"development": "dev", "production": "prod"}.get(v, v)
+        return v
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -94,24 +88,9 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    env = _selected_environment()
-    env_file = _ENV_FILES[env]
-    if env == "production" and not env_file.exists():
-        # 운영에서 파일이 없으면 기본값·빈 값으로 뜨는 대신 바로 죽는다.
-        raise FileNotFoundError(f"운영 설정 파일이 없습니다: {env_file}")
-    # 파일 안에 ENVIRONMENT=production 을 적어 두고 환경변수는 안 준 경우 등 —
-    # 파일은 운영이라고 말하는데 실제로는 개발 파일을 읽은 상태라 막는다.
-    # Settings 검증(CORS 등)보다 먼저 봐야 오류 메시지가 진짜 원인을 가리킨다.
-    file_env = (dotenv_values(env_file).get("ENVIRONMENT") or "").strip().lower()
-    if file_env and file_env != env:
-        raise ValueError(
-            f"ENVIRONMENT 불일치 — 프로세스 환경변수는 {env!r}({env_file.name} 을 읽음)인데 "
-            f"설정 파일에는 {file_env!r} 로 적혀 있습니다. "
-            "ENVIRONMENT 는 프로세스 환경변수로 지정하세요."
-        )
-    settings = Settings(_env_file=env_file, environment=env)
+    settings = Settings()
     # pydantic 검증기 안에서 던지면 오류 메시지에 입력값 전체(DB URL 포함)가 찍히므로
     # 여기서 따로 검사한다.
-    if env == "production" and "*" in settings.cors_origin_list:
-        raise ValueError("운영(production)에서는 CORS_ORIGINS='*' 를 쓸 수 없습니다. 허용할 도메인을 적으세요.")
+    if settings.environment == "prod" and "*" in settings.cors_origin_list:
+        raise ValueError("운영(ENVIRONMENT=prod)에서는 CORS_ORIGINS='*' 를 쓸 수 없습니다. 허용할 도메인을 적으세요.")
     return settings
