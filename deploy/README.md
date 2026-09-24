@@ -98,8 +98,10 @@ cd ~/backend
 .venv/bin/python -m alembic upgrade head
 ```
 
-> backend 가 만드는 건 Alembic 소유 테이블뿐이다. `upa_*` · `mart.*` 는 data-pipeline 이 만든다
-> (`alembic/env.py` 머리 주석). 운영 DB 에 그 데이터가 들어오는 경로는 이 문서 범위 밖이다.
+> 빈 DB 에서 `upgrade head` 한 번이면 표·뷰가 전부 생긴다 — `upa_*` 5종(0028)과 `mart.*` 뷰(0029)까지.
+> 스키마는 전부 Alembic 이 만들고 data-pipeline 은 적재만 한다(2026-09-24 결정). 그래서 data-pipeline 을
+> 새 DB 에 붙이기 **전에** 이 단계가 먼저다 — 표가 없으면 로더가 "alembic upgrade head 먼저" 오류를 낸다.
+> 표는 생겨도 데이터는 비어 있다. 운영 DB 에 데이터가 들어오는 경로(data-pipeline 실행 위치)는 이 문서 범위 밖이다.
 
 ### 1-6. systemd 서비스
 

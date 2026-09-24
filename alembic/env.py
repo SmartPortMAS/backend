@@ -1,13 +1,10 @@
 """Alembic 환경 설정.
 
 [include_object — 남의 테이블을 DROP 하지 않기 위한 안전장치]
-이 DB는 스키마 소유권이 둘로 나뉜다:
-
-    backend(Alembic) 소유 : msds_chemical, msds_embedding, portmis_vessel,
-                            ais_vessel_*, weather_obs, wave_obs, tide_obs,
-                            weather_forecast, berth_weather_threshold
-    data-pipeline 소유    : upa_* 6종(로더 auto_create) + ulsan_vessel_mart,
-                            mart 스키마 뷰 전부
+2026-09-24 부터 표·뷰 구조는 전부 이 Alembic 이 만든다(data-pipeline 은 적재만).
+upa_* 5종은 0028, mart 스키마 뷰는 0029 가 raw SQL(alembic/sql/)로 만든다.
+그런데 이들은 SQLAlchemy 모델(Base.metadata)에는 **없다** — 그래서 아래 방어는
+그대로 필요하다.
 
 Alembic autogenerate는 기본적으로 "DB에는 있는데 target_metadata(=SQLAlchemy
 모델)에는 없는" 테이블/인덱스를 삭제 대상으로 판단한다. 그대로 두면
