@@ -53,23 +53,16 @@ sudo apt install -y git python3-venv python3-pip curl nginx
 
 ### 1-3. 코드 받기
 
-레포가 private 이면 서버가 GitHub 에서 pull 할 수 있어야 한다. **읽기 전용 Deploy key** 를 쓴다.
+레포는 public 이라(2026-09-24 전환) 서버에 GitHub 인증이 필요 없다. HTTPS 로 받는다.
 
 ```bash
-ssh-keygen -t ed25519 -f ~/.ssh/github_backend -N "" -C "ec2-backend-pull"
-cat ~/.ssh/github_backend.pub
-# → GitHub SmartPortMAS/backend → Settings → Deploy keys → Add (Allow write access 체크 안 함)
-
-cat >> ~/.ssh/config <<'EOF'
-Host github.com
-  IdentityFile ~/.ssh/github_backend
-  IdentitiesOnly yes
-EOF
-
-git clone git@github.com:SmartPortMAS/backend.git ~/backend
+git clone https://github.com/SmartPortMAS/backend.git ~/backend
 cd ~/backend
-git checkout main
+git checkout main      # 레포 기본 브랜치가 dev 라 clone 직후엔 dev 다
 ```
+
+> 레포를 다시 private 으로 돌리면 서버의 `git fetch` 가 실패해 배포가 멈춘다. 그때는 읽기 전용
+> Deploy key(조직 설정에서 허용 필요)나, Actions 가 서버로 push 하는 방식으로 바꿔야 한다.
 
 ### 1-4. venv · .env
 
@@ -253,7 +246,7 @@ cd ~/backend && MIGRATE=1 bash deploy/deploy.sh      # 마이그레이션 포함
 |---|---|
 | `Host key verification failed` | `EC2_KNOWN_HOSTS` 불일치 — 인스턴스를 새로 만들었거나 IP 가 바뀜 |
 | `Permission denied (publickey)` | `authorized_keys` 에 `gha_deploy.pub` 없음 / `EC2_USER` 틀림 |
-| `git fetch` 에서 권한 오류 | 서버의 Deploy key(1-3) 설정 |
+| `git fetch` 에서 권한 오류 | 레포가 private 으로 돌아감(1-3) / 서버 origin 이 SSH 주소로 돼 있음 |
 | `alembic current 실패` | RDS 보안 그룹 · `.env` 의 `DATABASE_URL` |
 | 기동 확인 실패 → 자동 복구 | `journalctl` 출력이 Actions 로그에 찍힌다. 흔한 건 `.env` 누락 키, `CORS_ORIGINS='*'` |
 
