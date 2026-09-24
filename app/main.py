@@ -57,13 +57,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 08_스케줄링_전면재설계_자동배정_설계문서.md §5.1·§5.5 — 입항 자동추천·출항
     # 자동해제 백그라운드 잡. 둘 다 실패해도 API 자체는 계속 떠 있어야 하므로
     # 앱 시작을 막지 않는다(스케줄러 자체 등록 실패만 여기서 전파됨).
-    scheduler = create_scheduler()
-    scheduler.start()
+    scheduler = create_scheduler() if settings.enable_scheduler else None
+    if scheduler is not None:
+        scheduler.start()
+    else:
+        logging.getLogger(__name__).info("ENABLE_SCHEDULER=false — 입항 판정 잡을 띄우지 않습니다")
     # 하역 개시 인터락 게이트 다리(MQTT ↔ /ws/gate). 브로커가 없어도 앱은 뜬다.
     gate_bridge.start()
     yield
     gate_bridge.stop()
-    scheduler.shutdown(wait=False)
+    if scheduler is not None:
+        scheduler.shutdown(wait=False)
     await neo4j_client.close()
 
 
@@ -124,7 +128,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origin_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -1,0 +1,70 @@
+# 운영 EC2 자동 배포 — main 에 push(= dev → main PR 머지)되면 돈다.
+#
+# 흐름: CI 검사 → SSH 로 EC2 접속 → deploy/deploy.sh 실행
+#       (git 을 이 커밋으로 맞춤 → pip install → 마이그레이션 확인 → 재시작 → /health 확인)
+#
+# 마이그레이션은 자동으로 돌리지 않는다. 운영 DB 스키마를 바꾸는 일이라 사람이 고른다:
+#   - push 로 온 배포에서 미적용 마이그레이션이 있으면 재시작하지 않고 실패한다(옛 코드가 계속 돈다).
+#   - Actions 탭 → Deploy (EC2) → Run workflow → "migrate" 체크 로 다시 돌리면 적용 후 배포한다.
+#
+# 필요한 설정(Settings → Secrets and variables → Actions)은 deploy/README.md 참고.
+name: Deploy (EC2)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      migrate:
+        description: "alembic upgrade head 실행 (운영 DB 스키마 변경)"
+        type: boolean
+        default: false
+
+# 배포가 겹치면 뒤의 것이 기다린다. 도중에 취소하면 서버가 반쯤 바뀐 상태로 남을 수 있어 취소하지 않는다.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    # 수동 실행 때 다른 브랜치를 골라도 운영에는 main 만 나간다.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # GitHub Environment. 여기에 승인자(required reviewers)를 걸면 배포 전에 승인을 받는다.
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SSH 준비
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # 호스트 키를 고정한다. ssh-keyscan 으로 그때그때 받으면 중간자를 막지 못한다.
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: 배포
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          APP_DIR: ${{ vars.EC2_APP_DIR || '/home/ubuntu/backend' }}
+          SERVICE: ${{ vars.EC2_SERVICE || 'smartport-backend' }}
+          MIGRATE: ${{ inputs.migrate && '1' || '0' }}
+          SHA: ${{ github.sha }}
+        # 스크립트는 서버의 옛 체크아웃이 아니라 지금 배포하는 커밋의 것을 stdin 으로 보낸다.
+        run: |
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "APP_DIR='$APP_DIR' SERVICE='$SERVICE' MIGRATE='$MIGRATE' SHA='$SHA' bash -s" \
+            < deploy/deploy.sh

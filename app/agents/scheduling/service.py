@@ -16,7 +16,7 @@ LLM을 쓰지 않는다 — 계획서상 스케줄링 에이전트는 Neo4j Cyph
 """
 
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 
 from neo4j import AsyncDriver
 from sqlalchemy import text
@@ -300,6 +300,28 @@ _QUERY_RESOLVE_WHARF_ALIAS = text("""
 """)
 
 
+def _tide_window(window_start: datetime, window_end: datetime) -> tuple[datetime, datetime]:
+    """조위 판정에 쓸 구간 — 시작을 **지금**으로 당긴다.
+
+    [2026-09-22] `window_start` 는 그 배가 **실제로 접안한 시각**이라 이미 붙어 있는
+    배는 과거다(실측: 9/12·9/18 접안). 그런데 `tide_forecast` 는 수집을 시작한 날부터만
+    있어서(9/20~) 과거 쪽이 비고, 그대로 두면 `fully_covered` 가 False 가 되어
+    **이미 안전하게 정박 중인 배 30척이 한꺼번에 판정불가로 떨어졌다.**
+
+    과거 구간을 판정에서 빼는 것이 맞다. 이 판정이 답하는 질문은 "이 배를 지금 이대로
+    두어도 되는가"이고, 그 답을 바꿀 수 있는 것은 **앞으로 올 저조**뿐이다. 사흘 전
+    저조는 이미 지나갔고 배는 닿지 않았다 — 되짚어 막을 수 있는 위험이 아니다.
+
+    그래서 이 판정의 뜻은 정확히 "**남은** 체류 구간의 최저 조위"다. 판정 근거 문장에
+    나가는 시각도 앞으로의 시각이므로 관제사가 읽는 뜻과 어긋나지 않는다.
+
+    입항 전 판정(구간 시작이 미래)에는 아무 영향이 없다 — `now` 가 시작보다 이르다.
+    """
+    now = datetime.now(timezone.utc)
+    start = max(window_start, now)
+    return start, max(window_end, start)
+
+
 async def build_candidate_for_wharf_name(
     db: AsyncSession,
     neo4j_driver: AsyncDriver,
@@ -354,7 +376,8 @@ async def build_candidate_for_wharf_name(
     #
     # 예보를 쓴다. 판정 대상이 미래 구간이라 관측(tide_obs, 과거만 있음)으로는
     # 잴 수 없다.
-    tide = await min_tide_in_window(db, window_start=window_start, window_end=window_end)
+    _tide_start, _tide_end = _tide_window(window_start, window_end)
+    tide = await min_tide_in_window(db, window_start=_tide_start, window_end=_tide_end)
 
     if tide is None:
         # ★ 여기서 해도 수심만으로 통과시키지 않는다. 조위를 모르면 가용수심을
@@ -363,6 +386,18 @@ async def build_candidate_for_wharf_name(
         return None, (
             f"선석 '{canonical_wharf_name}'의 체류 구간 조위 예보가 없어 "
             f"가용수심을 계산할 수 없습니다(예보 범위 밖)."
+        ), True
+
+    if not tide.fully_covered:
+        # [2026-09-22] 예보가 체류 구간을 다 덮지 못한 경우다(구간이 예보 밖으로
+        # 걸치거나 중간에 수집 구멍). 이때 tide.level_cm 은 "본 만큼의 최저"라서
+        # 실제 최저보다 **높다** — 그대로 쓰면 못 본 구간의 저조를 놓치고 통과시킨다.
+        # 접안 순간만 보다가 체류 중 최저를 놓치는 것과 같은 실패라, 같은 규칙으로
+        # 판정불가로 돌린다.
+        return None, (
+            f"선석 '{canonical_wharf_name}'의 조위 예보가 체류 구간을 다 덮지 못해 "
+            f"체류 중 최저 조위를 확정할 수 없습니다"
+            f"(예보 범위 밖이거나 수집 결측 — data-pipeline tide_forecast 확인 필요)."
         ), True
 
     tide_m = tide.level_cm / 100.0
@@ -689,9 +724,17 @@ async def suggest_alternative_berths(
     if not category:
         return [], f"화물({target_row.chem_id})의 선석 카테고리를 알 수 없어 대체안을 찾을 수 없습니다."
 
-    tide = await min_tide_in_window(db, window_start=window_start, window_end=window_end)
+    _tide_start, _tide_end = _tide_window(window_start, window_end)
+    tide = await min_tide_in_window(db, window_start=_tide_start, window_end=_tide_end)
     if tide is None:
         return [], "체류 구간 조위 예보가 없어 대체안의 가용수심을 계산할 수 없습니다."
+    if not tide.fully_covered:
+        # 대체안은 "여기라면 안전하다"는 제안이다. 못 본 구간이 있는 조위로 제안하면
+        # 지금 자리보다 나을 보장이 없는 자리를 권하게 된다(위 min_tide_in_window 주석).
+        return [], (
+            "조위 예보가 체류 구간을 다 덮지 못해 대체안의 가용수심을 확정할 수 "
+            "없습니다(예보 범위 밖이거나 수집 결측)."
+        )
     tide_m = tide.level_cm / 100.0
 
     min_depth = vessel.draught_m + draught_margin_m - tide_m
