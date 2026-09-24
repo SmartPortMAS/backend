@@ -29,6 +29,10 @@ This backend service provides the FastAPI foundation for the Smart Port multi-ag
   배포 단계에서 명시적으로 `alembic upgrade head` (서버의 `.env` 를 읽으므로 운영 DB 에 적용된다).
 - `docker-compose.dev.yml` 은 프로젝트 이름을 `smart-port-multi-agent` 로 고정한다 — 기존 로컬 데이터 볼륨 이름이다.
 
+## 운영 배포
+
+main 에 머지되면 GitHub Actions 가 EC2 에 자동 배포한다. 서버 준비·GitHub 설정은 [deploy/README.md](deploy/README.md).
+
 ## Health check
 
 - `GET /health`
