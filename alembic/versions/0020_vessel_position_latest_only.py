@@ -57,27 +57,43 @@ _NEW_IDX = "upa_vessel_position_uidx__vessel_uid"
 
 
 def upgrade() -> None:
+    # upa_vessel_position 은 이 마이그레이션을 쓸 당시 data-pipeline 로더가 만들던 표라
+    # 빈 DB(첫 운영 배포, 2026-09-24 RDS)에는 없다. 그때 무조건 DELETE 하면
+    # "relation does not exist" 로 upgrade 전체가 롤백된다. 표가 없으면 정리할 행도
+    # 없으므로 건너뛴다 — 표를 만드는 일은 이 리비전의 책임이 아니다.
+    #
     # 1) 기존 행을 선박당 최신 1건만 남긴다. 유니크 인덱스를 먼저 만들면
     #    중복 때문에 실패하므로 정리가 앞선다.
     op.execute(
+        f"""
+        DO $$
+        BEGIN
+          IF to_regclass('upa_vessel_position') IS NOT NULL THEN
+            DELETE FROM upa_vessel_position a
+            USING upa_vessel_position b
+            WHERE a.vessel_uid = b.vessel_uid
+              AND (a.received_at_utc < b.received_at_utc
+                   OR (a.received_at_utc = b.received_at_utc AND a.ctid < b.ctid));
+            DROP INDEX IF EXISTS {_OLD_IDX};
+            CREATE UNIQUE INDEX IF NOT EXISTS {_NEW_IDX} ON upa_vessel_position (vessel_uid);
+          END IF;
+        END
+        $$
         """
-        DELETE FROM upa_vessel_position a
-        USING upa_vessel_position b
-        WHERE a.vessel_uid = b.vessel_uid
-          AND (a.received_at_utc < b.received_at_utc
-               OR (a.received_at_utc = b.received_at_utc AND a.ctid < b.ctid))
-        """
-    )
-    op.execute(f"DROP INDEX IF EXISTS {_OLD_IDX}")
-    op.execute(
-        f"CREATE UNIQUE INDEX IF NOT EXISTS {_NEW_IDX} "
-        f"ON upa_vessel_position (vessel_uid)"
     )
 
 
 def downgrade() -> None:
-    op.execute(f"DROP INDEX IF EXISTS {_NEW_IDX}")
     op.execute(
-        f"CREATE UNIQUE INDEX IF NOT EXISTS {_OLD_IDX} "
-        f"ON upa_vessel_position (vessel_uid, received_at_utc)"
+        f"""
+        DO $$
+        BEGIN
+          IF to_regclass('upa_vessel_position') IS NOT NULL THEN
+            DROP INDEX IF EXISTS {_NEW_IDX};
+            CREATE UNIQUE INDEX IF NOT EXISTS {_OLD_IDX}
+              ON upa_vessel_position (vessel_uid, received_at_utc);
+          END IF;
+        END
+        $$
+        """
     )
