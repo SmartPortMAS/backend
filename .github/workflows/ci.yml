@@ -1,0 +1,66 @@
+# 정적 검사 — PR 과 dev push 에서 돌고, 배포 워크플로(deploy.yml)도 배포 전에 이걸 부른다.
+#
+# 테스트 스위트가 없다(tests/ 비어 있음). 그래서 여기서 하는 건 "테스트"가 아니라
+# 운영에서 기동 자체가 깨지는 종류의 실수를 막는 검사다:
+#   - requirements.txt 로 새로 설치했을 때 앱 import 가 되는가
+#     (로컬 venv 는 requirements 와 어긋나 있을 수 있다 — 2026-09-24 로컬 .venv 에 paho-mqtt 없음)
+#   - alembic 리비전이 한 줄(head 1개)인가 — 브랜치 두 개가 각자 마이그레이션을 추가하면
+#     head 가 둘이 되고 운영에서 `alembic upgrade head` 가 실패한다.
+# DB·Neo4j 에는 붙지 않는다. import 시점엔 연결하지 않으므로 더미 값으로 충분하다.
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUTF8: "1"
+      # 연결되지 않는 더미 값. Settings 필수 필드를 채우기 위한 것뿐이다.
+      DATABASE_URL: postgresql+asyncpg://ci:ci@127.0.0.1:1/ci
+      NEO4J_URI: bolt://127.0.0.1:1
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ci-dummy
+      # 운영 설정 검사(CORS '*' 금지)까지 통과하는지 같이 본다.
+      ENVIRONMENT: prod
+      CORS_ORIGINS: https://ci.invalid
+      ENABLE_SCHEDULER: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      # 로컬 개발 venv 와 같은 3.10. 운영 EC2 도 같은 버전을 쓴다(deploy/README.md).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 의존성 설치
+        run: pip install -r requirements.txt
+
+      - name: 문법 검사
+        run: python -m compileall -q app alembic scripts
+
+      - name: 앱 import (라우터·설정 로딩)
+        run: python -c "import app.main"
+
+      - name: alembic head 가 하나인지
+        run: |
+          heads=$(alembic heads | grep -c '(head)')
+          echo "alembic heads: $heads"
+          alembic heads
+          if [ "$heads" -ne 1 ]; then
+            echo "::error::alembic head 가 ${heads}개입니다. merge 리비전이 필요합니다."
+            exit 1
+          fi
+
+      - name: 배포 스크립트 문법
+        run: bash -n deploy/deploy.sh

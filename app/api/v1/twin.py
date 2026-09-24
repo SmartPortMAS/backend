@@ -53,6 +53,8 @@ from app.agents.weather.rule_engine import evaluate
 from app.agents.weather.schemas import WorkStatus
 from app.core.deps import get_session
 from app.neo4j_client import neo4j_client
+# 수집 구멍 판정 문턱 — 화면과 판정이 같은 곡선을 그려야 하므로 한 곳에 둔다.
+from app.services.tide import MAX_EXTREME_GAP
 
 router = APIRouter(prefix="/twin", tags=["twin"])
 
@@ -127,9 +129,17 @@ async def _tide_extremes(db: AsyncSession, start: datetime, end: datetime
 
 
 def _tide_at(extremes: list[tuple[datetime, float]], t: datetime) -> float | None:
-    """고·저조 사이를 코사인으로 잇는다 — 극치 시각에서 정확히 그 값, 사이는 반주기 곡선."""
+    """고·저조 사이를 코사인으로 잇는다 — 극치 시각에서 정확히 그 값, 사이는 반주기 곡선.
+
+    [2026-09-22] 극치 간격이 비정상으로 벌어진 구간은 **잇지 않는다**(None).
+    수집이 하루 빠지면 20~30시간 간격이 생기는데, 그걸 코사인으로 이으면 근거 없는
+    곡선이 그럴듯한 모양으로 나와 화면에서 구분이 안 된다. 문턱과 그 근거는
+    app/services/tide.py 의 `MAX_EXTREME_GAP` 에 적혀 있다 — 같은 값을 쓴다.
+    """
     for (t1, h1), (t2, h2) in zip(extremes, extremes[1:]):
         if t1 <= t <= t2 and t2 > t1:
+            if (t2 - t1) > MAX_EXTREME_GAP:
+                return None
             f = (t - t1).total_seconds() / (t2 - t1).total_seconds()
             return (h1 + h2) / 2 + (h1 - h2) / 2 * math.cos(math.pi * f)
     return None

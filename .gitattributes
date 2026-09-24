@@ -1,0 +1,4 @@
+# 리눅스에서 실행되는 파일은 윈도우 체크아웃(core.autocrlf=true)에서도 LF 로 둔다.
+# CRLF 면 셔뱅을 못 읽는다 — entrypoint.sh 로 컨테이너가 무한 재시작한 적이 있다(c77f1fd).
+*.sh      text eol=lf
+*.service text eol=lf
