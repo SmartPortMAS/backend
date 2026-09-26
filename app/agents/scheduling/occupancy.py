@@ -55,18 +55,26 @@ _QUERY_MAX_CONCURRENT_VESSELS = text("""
 # 뷰는 배 1척을 **한 구역 하나**에만 귀속시킨다(presence_zone). 그래서 반경이
 # 이웃 부두와 겹쳐도(실측 최단 간격: 용잠1/2 0m, 3/4부두 150m, UTK신항/한진신항
 # 190m) 중복 계수되지 않는다.
+#
+# [2026-09-26] vp.berth_name 은 **부두명**('S-Oil 4부두')인데 호출부는 **선석 ID**
+# ('S-Oil 4부두-1선석')를 넘긴다. 예전엔 둘을 그대로 비교해 다선석 부두는 늘 비어
+# 보였다(실측: 선석 ID 로 조회 0건, 부두명으로 조회 2개 부두 접안). berth 표로 선석 ID
+# 를 부두명에 이어 붙인다 — berth 표와 Neo4j Berth 의 (id, wharf_name) 118쌍이 일치한다.
+# 위치 판정이 부두 단위라 부두 안 어느 선석인지는 모른다 — 그 부두의 선석 전부에
+# 같은 배가 점유로 나온다.
 _QUERY_LIVE_OCCUPANTS = text("""
-    SELECT vp.berth_name AS wharf_name, vp.callsgn, vp.vessel_name,
+    SELECT b.berth_id, vp.callsgn, vp.vessel_name,
            vp.berth_dist_m AS distance_m, vp.berth_basis,
            vp.received_at_utc, vp.quality_flag, vp.position_age_min
     FROM mart.vessel_presence vp
+    JOIN berth b ON b.wharf_name = vp.berth_name
     WHERE vp.presence_zone = 'BERTH'
-      AND vp.berth_name = ANY(CAST(:berth_ids AS text[]))
+      AND b.berth_id = ANY(CAST(:berth_ids AS text[]))
       AND (
           CAST(:exclude_call_sign AS text) IS NULL
           OR upper(btrim(vp.callsgn)) <> upper(btrim(CAST(:exclude_call_sign AS text)))
       )
-    ORDER BY vp.berth_name, vp.berth_dist_m NULLS LAST
+    ORDER BY b.berth_id, vp.berth_dist_m NULLS LAST
 """)
 
 
@@ -84,7 +92,7 @@ async def find_overlapping_reservations(
     db: AsyncSession, *, berth_ids: list[str], window_start: datetime, window_end: datetime,
     exclude_call_sign: str | None = None,
 ) -> dict[str, list[dict]]:
-    """지금 그 선석에 **실제로 붙어 있는 배**. 키는 wharf_name.
+    """지금 그 선석에 **실제로 붙어 있는 배**. 키는 berth_id(입력과 같은 값).
 
     이름에 'reservations'가 남아 있지만 예약이 아니라 관측이다 — 호출부
     (scheduling/service.py 3곳)를 건드리지 않으려고 시그니처를 유지했다.
@@ -105,7 +113,7 @@ async def find_overlapping_reservations(
 
     grouped: dict[str, list[dict]] = {}
     for row in rows:
-        grouped.setdefault(row["wharf_name"], []).append(
+        grouped.setdefault(row["berth_id"], []).append(
             {
                 "vessel_name": row["vessel_name"] or row["callsgn"],
                 # 실시간 접안에는 계획 구간이 없다. 화면이 기대하는 키는 채우되

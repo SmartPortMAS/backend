@@ -274,6 +274,44 @@ async def orchestrate(
                 expected_completion_at=request.window_end,
             ),
         )
+        if berth_weather.status is not WorkStatus.NORMAL and request.assigned_wharf_name:
+            # [2026-09-26] 검증모드는 후보가 하나뿐이라, 여기서 탈락시키면 아래
+            # ALL_CANDIDATES_UNSAFE 로 떨어져 **'배정된 선석이 조건에 맞지 않는다'** 는
+            # 부적합이 된다. 선석이 아니라 기상 때문이고, 판단불가면 그마저도 아니다.
+            # 실측(assessment_history): 기상 판단불가 14건이 부적합+하역보류·입항보류로,
+            # 하역중단 25건이 선석 부적합 문장으로 기록돼 있었다.
+            if berth_weather.status is WorkStatus.UNKNOWN:
+                # 관측이 없거나 낡았다 — 근거 부족이다(회의 §4). 대체안도 찾지 않는다
+                # (위 NO_ELIGIBLE_BERTH 의 evidence_missing 분기와 같은 이유).
+                return OrchestratorResult(
+                    overall_decision=OverallDecision.WEATHER_BLOCKED,
+                    weather_assessment=berth_weather,
+                    evidence_missing=True,
+                    assignment_trace=resolution.trace,
+                    summary=_no_candidate_summary(
+                        f"'{resolved_berth.wharf_name}' 기상 관측이 없거나 오래돼 판단할 수 없습니다."
+                    ),
+                )
+            alternatives, suggestion_note = await suggest_alternative_berths(
+                db, neo4j_driver,
+                cargo=request.cargo, vessel=request.vessel,
+                window_start=request.window_start, window_end=request.window_end,
+                exclude_wharf_name=request.assigned_wharf_name,
+                draught_margin_m=request.draught_margin_m,
+                extra_cargos=request.cargos,
+            )
+            return OrchestratorResult(
+                overall_decision=OverallDecision.WEATHER_BLOCKED,
+                weather_assessment=berth_weather,
+                assignment_trace=resolution.trace,
+                suggested_alternatives=alternatives,
+                suggestion_note=suggestion_note,
+                summary=(
+                    f"'{resolved_berth.wharf_name}' 기상이 '{berth_weather.status.value}' 기준을 "
+                    f"넘었습니다: {'; '.join(berth_weather.reasons)}"
+                ),
+            )
+
         if berth_weather.status is not WorkStatus.NORMAL:
             rejected.append(
                 RejectedCandidate(

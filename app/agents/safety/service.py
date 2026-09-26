@@ -47,7 +47,7 @@ from .rule_engine import (
     compute_imdg_berth_adjacency_floor,
     compute_packing_floor,
     compute_pair_assessability,
-    compute_risk_floor,
+    compute_risk_floor_by_adjacent,
     find_packing_violation,
 )
 from .schemas import (
@@ -408,7 +408,7 @@ async def _compute_verdict(
     rule_engine_floor = max_risk_level(
         max_risk_level(
             max_risk_level(
-                compute_risk_floor(raw_conflicts),
+                compute_risk_floor_by_adjacent(raw_conflicts),
                 compute_imdg_berth_adjacency_floor(raw_imdg_conflicts),
             ),
             compute_packing_floor(packing_violation_raw),

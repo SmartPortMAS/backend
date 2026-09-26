@@ -66,6 +66,24 @@ def compute_risk_floor(conflicts: list[dict]) -> RiskLevel:
     return RiskLevel.DANGER
 
 
+def compute_risk_floor_by_adjacent(conflicts: list[dict]) -> RiskLevel:
+    """compute_risk_floor 를 **인접 화물(chem_id)마다 따로** 적용해 가장 심각한 등급.
+
+    [2026-09-26] compute_risk_floor 의 "2건 이상 → 배정불가"는 **화물쌍 하나**의
+    규칙이다. 위 실측(22,650 순서쌍)도 scripts/recompute_safety_matrix.py 가 인접
+    화물을 1개씩만 넣어 잰 값이다. 그런데 호출부가 여러 인접 화물의 충돌을 합쳐
+    넘기고 있어, 쌍마다 1건(위험)인 이웃 둘이 합쳐져 배정불가가 됐다(실측:
+    에틸렌글리콜 옆 에탄올 → 위험, 에틸렌 → 위험, 둘 다 → 배정불가).
+    """
+    by_adjacent: dict[str, list[dict]] = {}
+    for c in conflicts:
+        by_adjacent.setdefault(c["chem_id"], []).append(c)
+    floor = RiskLevel.SAFE
+    for pair_conflicts in by_adjacent.values():
+        floor = max_risk_level(floor, compute_risk_floor(pair_conflicts))
+    return floor
+
+
 # IMDG Code Chapter 7.2 격리 코드 -> RiskLevel 매핑.
 # ─────────────────────────────────────────────────────────────────────────────
 # [2026-08-23 전면 개정] IMDG 축은 "거리 판정"이 아니라 "조합 판별"로만 쓴다.

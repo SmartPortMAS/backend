@@ -73,11 +73,44 @@ _QUERY_REAL_ADJACENT_CARGO = text("""
       ON fa.source_name = bcc.facility_name AND fa.facility_type = 'BERTH'
     WHERE bcc.chem_id IS NOT NULL
       AND fa.wharf_name = ANY(CAST(:wharf_names AS text[]))
+      -- [2026-09-26] 판정 대상 배 자신의 화물은 '인접 화물'이 아니다. 같은 부두의
+      -- 선석끼리도 ADJACENT_TO 로 이어져 있어(로더 주석: 실제로 맞닿아 있어 의도한 것)
+      -- 이걸 빼지 않으면 자기 화물과 혼재 판정을 했다(실측: D8QR@S-Oil 3부두의 인접
+      -- 화물이 자기 화물 2건뿐이었다).
+      AND (
+          CAST(:exclude_call_sign AS text) IS NULL
+          OR upper(btrim(bcc.callsgn)) <> upper(btrim(CAST(:exclude_call_sign AS text)))
+      )
+""")
+
+# 이웃 부두에 지금 실제로 붙어 있는 배가 있는가 — occupancy.py 와 같은 뷰·같은 기준.
+_QUERY_OCCUPIED_WHARFS = text("""
+    SELECT DISTINCT vp.berth_name
+    FROM mart.vessel_presence vp
+    WHERE vp.presence_zone = 'BERTH'
+      AND vp.berth_name = ANY(CAST(:wharf_names AS text[]))
+      AND (
+          CAST(:exclude_call_sign AS text) IS NULL
+          OR upper(btrim(vp.callsgn)) <> upper(btrim(CAST(:exclude_call_sign AS text)))
+      )
 """)
 
 
+async def _occupied_wharfs(
+    db: AsyncSession, wharf_names: list[str], *, exclude_call_sign: str | None = None
+) -> set[str]:
+    """wharf_names 중 지금 (판정 대상 배를 빼고) 배가 붙어 있는 부두."""
+    if not wharf_names:
+        return set()
+    rows = await db.execute(
+        _QUERY_OCCUPIED_WHARFS,
+        {"wharf_names": wharf_names, "exclude_call_sign": exclude_call_sign},
+    )
+    return {r[0] for r in rows}
+
+
 async def _real_adjacent_cargo_by_wharf(
-    db: AsyncSession, wharf_names: list[str]
+    db: AsyncSession, wharf_names: list[str], *, exclude_call_sign: str | None = None
 ) -> dict[str, list[dict]]:
     """mart.berth_current_cargo에서 실제 재항 화물을 wharf_name별로 조회.
 
@@ -88,7 +121,10 @@ async def _real_adjacent_cargo_by_wharf(
     if not wharf_names:
         return {}
     rows = (
-        await db.execute(_QUERY_REAL_ADJACENT_CARGO, {"wharf_names": wharf_names})
+        await db.execute(
+            _QUERY_REAL_ADJACENT_CARGO,
+            {"wharf_names": wharf_names, "exclude_call_sign": exclude_call_sign},
+        )
     ).mappings().all()
     grouped: dict[str, list[dict]] = {}
     # 같은 선석에 같은 물질을 실은 배가 여럿이면 뷰에서 행이 여러 개 나온다
@@ -109,14 +145,16 @@ async def _real_adjacent_cargo_by_wharf(
 
 
 def _adjacent_cargos_for(
-    categories_by_neighbor: list[dict], real_cargo_by_wharf: dict[str, list[dict]]
+    categories_by_neighbor: list[dict],
+    real_cargo_by_wharf: dict[str, list[dict]],
+    occupied_wharfs: set[str],
 ) -> list[AdjacentCargo]:
     """인접 선석별 화물을 채운다.
 
     mart.berth_current_cargo(실제 재항 화물)가 있으면 그걸 쓰고, 없으면(화물
-    manifest가 아직 합성 데이터 위주라 커버리지가 낮음·재항 선박 없음·facility_alias
-    매칭 실패 등) 카테고리 대표값으로 근사한다 — category_map.py의 원래 설계를
-    완전히 버리지 않고 폴백으로 남긴 이유는, "실데이터가 없다"를 "위험이 없다"로
+    manifest가 아직 합성 데이터 위주라 커버리지가 낮음·facility_alias 매칭 실패 등)
+    그 부두에 배가 실제로 붙어 있을 때만(occupied_wharfs) 카테고리 대표값으로
+    근사한다 — category_map.py의 원래 설계를 완전히 버리지 않고 폴백으로 남긴 이유는, "실데이터가 없다"를 "위험이 없다"로
     착각하면 안전 판정을 낙관적으로 왜곡하기 때문이다. 실데이터가 있으면 그게
     항상 우선한다 — 근사값보다 신뢰도가 높다(cargo_msds ★ 안전관제 핵심 뷰 참고).
     """
@@ -132,6 +170,11 @@ def _adjacent_cargos_for(
                         distance_m=entry.get("distance_m"),
                     )
                 )
+            continue
+        # [2026-09-26] 배가 없는 부두는 폴백하지 않는다. 폴백은 "배는 있는데 화물을
+        # 모른다"를 위한 것이지, 빈 부두에 가상 화물을 세우는 용도가 아니다
+        # (실측: 온산 이웃 부두 12곳 중 빈 부두 5곳에 대표 화물이 들어가고 있었다).
+        if entry.get("adjacent_wharf_name") not in occupied_wharfs:
             continue
         for category in entry["categories"]:
             chem_id = representative_chem_id(category)
@@ -232,7 +275,12 @@ async def find_berth_candidates(
         for entry in entries
         if entry.get("adjacent_wharf_name")
     })
-    real_cargo_by_wharf = await _real_adjacent_cargo_by_wharf(db, adjacent_wharf_names)
+    real_cargo_by_wharf = await _real_adjacent_cargo_by_wharf(
+        db, adjacent_wharf_names, exclude_call_sign=request.vessel.call_sign
+    )
+    occupied_wharfs = await _occupied_wharfs(
+        db, adjacent_wharf_names, exclude_call_sign=request.vessel.call_sign
+    )
 
     candidates: list[BerthCandidate] = []
     for row in eligible:
@@ -261,7 +309,7 @@ async def find_berth_candidates(
                     for c in conflicts
                 ],
                 adjacent_cargos=_adjacent_cargos_for(
-                    adjacency_map.get(row["berth_id"], []), real_cargo_by_wharf
+                    adjacency_map.get(row["berth_id"], []), real_cargo_by_wharf, occupied_wharfs
                 ),
             )
         )
@@ -492,7 +540,12 @@ async def build_candidate_for_wharf_name(
         for entry in adjacency_map.get(berth["berth_id"], [])
         if entry.get("adjacent_wharf_name")
     })
-    real_cargo_by_wharf = await _real_adjacent_cargo_by_wharf(db, adjacent_wharf_names)
+    real_cargo_by_wharf = await _real_adjacent_cargo_by_wharf(
+        db, adjacent_wharf_names, exclude_call_sign=vessel.call_sign
+    )
+    occupied_wharfs = await _occupied_wharfs(
+        db, adjacent_wharf_names, exclude_call_sign=vessel.call_sign
+    )
 
     candidate = BerthCandidate(
         rank=1,
@@ -513,7 +566,7 @@ async def build_candidate_for_wharf_name(
             for c in conflicts
         ],
         adjacent_cargos=_adjacent_cargos_for(
-            adjacency_map.get(berth["berth_id"], []), real_cargo_by_wharf
+            adjacency_map.get(berth["berth_id"], []), real_cargo_by_wharf, occupied_wharfs
         ),
     )
     return candidate, None, False
@@ -662,7 +715,12 @@ async def resolve_berth_assignment(
             for entry in adjacency_map.get(sub["berth_id"], [])
             if entry.get("adjacent_wharf_name")
         })
-        real_cargo_by_wharf = await _real_adjacent_cargo_by_wharf(db, adjacent_wharf_names)
+        real_cargo_by_wharf = await _real_adjacent_cargo_by_wharf(
+            db, adjacent_wharf_names, exclude_call_sign=vessel.call_sign
+        )
+        occupied_wharfs = await _occupied_wharfs(
+            db, adjacent_wharf_names, exclude_call_sign=vessel.call_sign
+        )
 
         substitute_candidate = BerthCandidate(
             rank=candidate.rank,
@@ -675,7 +733,7 @@ async def resolve_berth_assignment(
             draught_margin_m=sub["depth_m"] - vessel.draught_m,
             occupancy_status=OccupancyStatus.AVAILABLE,
             adjacent_cargos=_adjacent_cargos_for(
-                adjacency_map.get(sub["berth_id"], []), real_cargo_by_wharf
+                adjacency_map.get(sub["berth_id"], []), real_cargo_by_wharf, occupied_wharfs
             ),
             latitude=sub.get("latitude"),
             longitude=sub.get("longitude"),
@@ -818,11 +876,16 @@ async def suggest_alternative_berths(
         for entry in entries
         if entry.get("adjacent_wharf_name")
     })
-    real_cargo_by_wharf = await _real_adjacent_cargo_by_wharf(db, adjacent_wharf_names)
+    real_cargo_by_wharf = await _real_adjacent_cargo_by_wharf(
+        db, adjacent_wharf_names, exclude_call_sign=vessel.call_sign
+    )
+    occupied_wharfs = await _occupied_wharfs(
+        db, adjacent_wharf_names, exclude_call_sign=vessel.call_sign
+    )
 
     candidates: list[BerthCandidate] = []
     for row in eligible:
-        occupants = live_map.get(row["wharf_name"], [])
+        occupants = live_map.get(row["berth_id"], [])
         candidates.append(
             BerthCandidate(
                 rank=0,
@@ -846,7 +909,7 @@ async def suggest_alternative_berths(
                     for c in occupants
                 ],
                 adjacent_cargos=_adjacent_cargos_for(
-                    adjacency_map.get(row["berth_id"], []), real_cargo_by_wharf
+                    adjacency_map.get(row["berth_id"], []), real_cargo_by_wharf, occupied_wharfs
                 ),
             )
         )
