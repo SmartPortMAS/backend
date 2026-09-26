@@ -186,7 +186,7 @@ def _approved_with(risk: RiskLevel) -> OrchestratorResult:
     from app.agents.safety.schemas import SafetyAssessmentResult
 
     safety = SafetyAssessmentResult.model_construct(
-        risk_level=risk, rule_engine_floor=risk, target_cargo_name="t",
+        risk_level=risk, rule_engine_floor=risk, target_cargo_name="t", conflicts=[],
     )
     return OrchestratorResult.model_construct(
         overall_decision=OverallDecision.APPROVED, weather_assessment=_weather(WorkStatus.NORMAL),

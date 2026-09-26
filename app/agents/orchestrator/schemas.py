@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from app.agents.safety.schemas import CargoRef, SafetyAssessmentResult
 from app.agents.scheduling.schemas import AnchorageAssignment, BerthCandidate, VesselSpec
+from app.agents.tools import Opinion
 from app.agents.weather.schemas import WeatherAssessmentResult
 
 
@@ -134,6 +135,20 @@ class OrchestratorResult(BaseModel):
         description="선석배정현황 팝업 전용 — 선석 스펙과 선박 매칭만 다루는 LLM 한 문장 "
         "요약(화학물질·안전판정 내용 제외). summary와 같은 LLM 호출에서 함께 받는다"
         "(호출 두 번 비용 방지). selected_berth가 없으면 None.",
+    )
+    opinions: list[Opinion] = Field(
+        default_factory=list,
+        description="검증모드에서 도구마다 낸 의견(등급 · 확인한 것 · 못 본 것). 27번 설계안 B단계",
+    )
+    conditions: list[str] = Field(
+        default_factory=list,
+        description="교차 확인으로 붙은 조건. 예: 지금은 적합이나 체류 중 기상 악화 예보 — "
+        "등급은 그대로 두고(적합) 조건만 붙인다. 그 시각이 되면 기상 게이트가 하역을 멈춘다.",
+    )
+    condition_key: str = Field(
+        default="",
+        description="판정 기록의 '변화 없음' 비교에 쓰는 조건 요약(시각 제외 — 예보가 새로 날 때마다 "
+        "시각이 흔들려도 새 행이 쌓이지 않게).",
     )
 
     def decision_detail(self) -> dict:

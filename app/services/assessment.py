@@ -18,6 +18,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.orchestrator.schemas import OrchestratorResult, OverallDecision
+from app.agents.tools import segregation_opinion
 from app.agents.safety.schemas import RiskLevel
 from app.agents.weather.schemas import WorkStatus
 from app.models.assessment_history import (
@@ -68,23 +69,6 @@ _ACTION_BY_STAGE = {
 }
 
 
-def _only_unassessed(safety) -> bool:
-    """혼재 '주의'의 근거가 충돌이 아니라 '볼 근거 없음'(미평가 쌍)뿐인가.
-
-    [2026-09-27] 인접 관계를 전체 선석으로 넓힌 뒤 적합 37척 중 혼재 '주의' 19척이
-    전부 충돌 0건 · 미평가 쌍만 있는 경우였다. 규칙 하한이 '주의'이고 MSDS·벌크·포장
-    충돌이 하나도 없을 때만 해당한다(LLM 이 올린 등급은 여기서 판단하지 않는다).
-    """
-    return (
-        safety.risk_level is RiskLevel.CAUTION
-        and safety.rule_engine_floor is RiskLevel.CAUTION
-        and bool(safety.unassessed_pairs)
-        and not safety.conflicts
-        and not safety.bulk_compatibility_conflicts
-        and not safety.packaging_violations
-    )
-
-
 def level_from_decision(result: OrchestratorResult) -> tuple[AssessmentLevel, str]:
     """오케스트레이터 귀결 → 판정 등급. 두 번째 값은 사람이 읽는 한 줄."""
     decision = result.overall_decision
@@ -101,8 +85,10 @@ def level_from_decision(result: OrchestratorResult) -> tuple[AssessmentLevel, st
         # 혼재 등급은 안전·주의·위험 중 하나다. 예전엔 이 등급을 보지 않아 위험이어도
         # '적합'으로 기록됐다(실측: 적합인데 혼재 주의 2건). 위험·주의는 '주의'로 둔다 —
         # 배정불가만 막고 나머지는 경고로 보인다는 safety/service.py 의 설계를 따른다.
+        # [2026-09-27] '확인요청'은 혼재 의견(tools.segregation_opinion)이 정한다 — 예전엔
+        # 여기서 결과를 보고 사후에 추론했다(27번 설계안 B단계).
         safety = result.safety_assessment
-        if safety is not None and _only_unassessed(safety):
+        if safety is not None and segregation_opinion(safety).level == "확인요청":
             return (
                 AssessmentLevel.NEEDS_CHECK,
                 f"배정된 선석은 조건에 맞으나 인접 화물 {len(safety.unassessed_pairs)}쌍은 "
@@ -113,6 +99,9 @@ def level_from_decision(result: OrchestratorResult) -> tuple[AssessmentLevel, st
                 AssessmentLevel.CAUTION,
                 f"배정된 선석은 조건에 맞으나 인접 화물 혼재 등급이 '{safety.risk_level.value}'입니다",
             )
+        if result.conditions:
+            # 교차 확인 조건(체류 중 기상 악화 예보 등). 등급은 적합 그대로다(결정 7-1).
+            return AssessmentLevel.FIT, "배정된 선석이 이 선박·화물 조건에 맞습니다(조건부 — 체류 중 악화 예보)"
         return AssessmentLevel.FIT, "배정된 선석이 이 선박·화물 조건에 맞습니다"
 
     if decision is OverallDecision.WEATHER_BLOCKED:
@@ -195,6 +184,14 @@ def _axes_from_result(result: OrchestratorResult) -> dict:
             ],
         }
 
+    # [2026-09-27] 도구별 의견(등급 · 확인한 것 · 못 본 것)과 교차 확인 조건. condition_key 는
+    # '변화 없음' 비교(_QUERY_LAST)에 쓴다.
+    if result.opinions:
+        axes["의견"] = [o.model_dump() for o in result.opinions]
+    if result.conditions:
+        axes["조건"] = list(result.conditions)
+    axes["condition_key"] = result.condition_key
+
     # '점유' 축은 일부러 비워 둔다.
     #   ① 우리는 선석을 점유하지 않는다(방향 C) — 우리 표의 예약을 점유라고 셀 수 없다.
     #   ② 오경보 백테스트 S2 가 점유 초과를 **정보로 강등**했다. PORT-MIS 출항 시각이
@@ -233,6 +230,7 @@ def _alternatives_detail(result: OrchestratorResult) -> dict | None:
 
 def _reasons_from_result(result: OrchestratorResult, headline: str) -> list[str]:
     reasons = [headline]
+    reasons.extend(result.conditions)
     reasons.extend(result.assignment_trace)
     reasons.extend(result.weather_assessment.reasons)
     # [2026-09-25] 화물이 둘 이상이면 화물별 혼재 등급을 한 줄로 — 대표 등급만 보면
@@ -266,7 +264,9 @@ _QUERY_LAST = text("""
                (SELECT string_agg(x->>'wharf_name', ',' ORDER BY x->>'rank')
                 FROM jsonb_array_elements(action_detail->'alternatives'->'suggested') AS x),
                ''
-           ) AS suggested_key
+           ) AS suggested_key,
+           -- 교차 확인 조건(예보 등급 등). 시각은 넣지 않은 요약이다.
+           COALESCE(axes->>'condition_key', '') AS condition_key
     FROM assessment_history
     WHERE call_sign = :call_sign
     ORDER BY assessed_at_utc DESC
@@ -275,10 +275,11 @@ _QUERY_LAST = text("""
 
 
 def _same_as_last(last, stage_value: str, level: AssessmentLevel,
-                  action_value: str | None, suggested_key: str) -> bool:
-    """직전 기록과 시점·등급·조치안·제안이 모두 같은가 — 같으면 새로 기록하지 않는다."""
+                  action_value: str | None, suggested_key: str, condition_key: str = "") -> bool:
+    """직전 기록과 시점·등급·조치안·제안·조건이 모두 같은가 — 같으면 새로 기록하지 않는다."""
     return last is not None and last["stage"] == stage_value and last["level"] == level.value \
-        and last["action"] == action_value and last["suggested_key"] == suggested_key
+        and last["action"] == action_value and last["suggested_key"] == suggested_key \
+        and last["condition_key"] == condition_key
 
 
 async def record_assessment(
@@ -296,6 +297,7 @@ async def record_assessment(
     action_detail: dict | None = None,
     input_snapshot: dict | None = None,
     suggested_key: str = "",
+    condition_key: str = "",
 ) -> bool:
     """판정 1건을 남긴다. 실제로 기록했으면 True.
 
@@ -314,7 +316,7 @@ async def record_assessment(
     action_value = action.value if action is not None else None
 
     last = (await db.execute(_QUERY_LAST, {"call_sign": call_sign})).mappings().first()
-    if _same_as_last(last, stage_value, level, action_value, suggested_key):
+    if _same_as_last(last, stage_value, level, action_value, suggested_key, condition_key):
         return False
 
     recipient = _RECIPIENT_BY_STAGE.get(stage) if (stage is not None and action is not None) else None
@@ -370,7 +372,7 @@ async def is_unchanged_from_last(
     stage_value = stage.value if stage is not None else AssessmentStage.BEFORE_ARRIVAL.value
     last = (await db.execute(_QUERY_LAST, {"call_sign": call_sign})).mappings().first()
     return _same_as_last(last, stage_value, level, action.value if action is not None else None,
-                         _suggested_key(result))
+                         _suggested_key(result), result.condition_key)
 
 
 async def record_from_orchestrator(
@@ -408,4 +410,5 @@ async def record_from_orchestrator(
         action_detail=action_detail,
         input_snapshot=input_snapshot,
         suggested_key=_suggested_key(result),
+        condition_key=result.condition_key,
     )

@@ -11,17 +11,22 @@ from app.models.assessment_history import GATE_BLOCKING_LEVELS, AssessmentLevel
 from app.services.assessment import level_from_decision
 
 
-def _result(**safety):
+def _pair(name):
+    return SimpleNamespace(adjacent_chem_id=name, adjacent_name=name, reason="MSDS 근거 없음")
+
+
+def _result(conditions=(), **safety):
     base = dict(
         risk_level=RiskLevel.CAUTION, rule_engine_floor=RiskLevel.CAUTION,
-        unassessed_pairs=["쌍1", "쌍2"], conflicts=[], bulk_compatibility_conflicts=[],
-        packaging_violations=[],
+        unassessed_pairs=[_pair("쌍1"), _pair("쌍2")], conflicts=[], bulk_compatibility_conflicts=[],
+        packaging_violations=[], cargo_verdicts=[],
     )
     base.update(safety)
     return SimpleNamespace(
         overall_decision=OverallDecision.APPROVED,
         weather_assessment=SimpleNamespace(status=WorkStatus.NORMAL),
         safety_assessment=SimpleNamespace(**base),
+        conditions=list(conditions),
     )
 
 
@@ -37,14 +42,17 @@ def test_needs_check_does_not_lock_gate():
 
 def test_real_conflict_stays_caution():
     level, _ = level_from_decision(_result(
-        risk_level=RiskLevel.DANGER, rule_engine_floor=RiskLevel.DANGER, conflicts=["황산↔가연성물질"],
+        risk_level=RiskLevel.DANGER, rule_engine_floor=RiskLevel.DANGER,
+        conflicts=[SimpleNamespace(adjacent_name="황산", shared_category="가연성물질")],
     ))
     assert level is AssessmentLevel.CAUTION
 
 
 def test_bulk_caution_stays_caution():
     # 벌크 특수가스처럼 충돌 근거가 있는 주의는 확인요청이 아니다
-    level, _ = level_from_decision(_result(bulk_compatibility_conflicts=["특수가스"]))
+    level, _ = level_from_decision(_result(
+        bulk_compatibility_conflicts=[SimpleNamespace(adjacent_name="가스", reason="특수가스")],
+    ))
     assert level is AssessmentLevel.CAUTION
 
 
@@ -54,3 +62,13 @@ def test_no_neighbors_is_fit():
     ))
     assert level is AssessmentLevel.FIT
 
+
+# ── 교차 확인 조건: 적합 그대로, 머리말에 조건부 (27번 설계안 B단계, 결정 7-1) ──
+
+def test_condition_keeps_fit_and_marks_headline():
+    level, headline = level_from_decision(_result(
+        conditions=["체류 중 09/27 18:00 부터 '하역중단' 예보"],
+        risk_level=RiskLevel.SAFE, rule_engine_floor=RiskLevel.SAFE, unassessed_pairs=[],
+    ))
+    assert level is AssessmentLevel.FIT
+    assert "조건부" in headline

@@ -25,6 +25,8 @@
 부른다 — 27번 설계안 A단계. 동작은 바꾸지 않았다(실시간 재판정 전후 비교로 확인).
 """
 
+from datetime import timedelta, timezone
+
 from neo4j import AsyncDriver
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,6 +46,33 @@ from .prompt import SYSTEM_PROMPT, build_user_prompt
 from .schemas import LLMSummary, OrchestratorRequest, OrchestratorResult, OverallDecision, RejectedCandidate
 
 MAX_CANDIDATES_TO_TRY = 3
+_KST = timezone(timedelta(hours=9))
+
+
+def _cross_check(weather: WeatherAssessmentResult) -> tuple[list[str], str]:
+    """교차 확인 — 두 의견을 함께 봐야 나오는 결론. (조건 문장들, 기록 비교용 키).
+
+    27번 설계안 3-2 의 규칙 표. 규칙을 늘릴 때는 여기에 한 줄씩 더하고 테스트를 둔다.
+
+    ① 선석 적합 + 지금 기상 정상 + 체류 중 예보 악화 → 등급은 적합 그대로, 악화 예상
+       시각을 조건으로 붙인다(결정 7-1: 새 등급을 만들지 않는다). 그 시각에 실제 관측이
+       기준을 넘으면 기상 게이트(3초 주기)가 하역을 멈춘다. 25번 점검 C4 — 6시간 뒤
+       풍속 25m/s 예보를 넣어도 아무 표시 없이 '적합'이던 문제.
+    """
+    fw = weather.forecast_warning
+    if (
+        weather.status is WorkStatus.NORMAL
+        and fw is not None
+        and fw.will_deteriorate
+        and fw.earliest_deterioration_at_utc is not None
+    ):
+        at = fw.earliest_deterioration_at_utc.astimezone(_KST)
+        return (
+            [f"체류 중 {at:%m/%d %H:%M} 부터 '{fw.worst_status.value}' 예보 — "
+             f"그 시각 관측이 기준을 넘으면 기상 게이트가 하역을 멈춥니다"],
+            f"예보:{fw.worst_status.value}",
+        )
+    return [], ""
 
 
 async def _llm_summary(
@@ -105,6 +134,8 @@ async def orchestrate(
     # 카테고리를 계산하지 않으므로(이미 실제 배정된 선석을 확인만 하는 용도라
     # 의도적으로 미필터) None으로 두고 게이트를 건너뛴다 — 탐색모드만 채운다.
     cargo_category: str | None = None
+    # 검증모드에서 도구마다 낸 의견(B단계). 탐색모드는 D단계에서 정리할 경로라 채우지 않는다.
+    opinions: list[tools.Opinion] = []
 
     if request.assigned_wharf_name:
         # 검증모드 — top-3 재탐색 대신 이미 정해진 선석 하나만 확인한다.
@@ -120,6 +151,7 @@ async def orchestrate(
         candidate, reason, evidence_missing = (
             berth_check.candidate, berth_check.reason, berth_check.evidence_missing
         )
+        opinions.append(tools.berth_opinion(berth_check))
         if candidate is None:
             # 배정된 시설이 **실제로** 안 맞는 경우에만 대체안을 찾는다(회의 §3 조치안).
             # 근거 부족(표기 미해소·조위 예보 없음)이면 찾지 않는다 — 어디가
@@ -143,6 +175,7 @@ async def orchestrate(
                 suggested_alternatives=alternatives,
                 suggestion_note=note,
                 summary=_no_candidate_summary(reason or "사전배정 선석을 확인할 수 없습니다."),
+                opinions=opinions,
             )
         candidates_to_try = [candidate]
     else:
@@ -267,6 +300,8 @@ async def orchestrate(
             berth_group=resolved_berth.berth_group,
             as_of=request.weather_as_of,
         )
+        if request.assigned_wharf_name:
+            opinions.append(tools.weather_opinion(berth_weather))
         if berth_weather.status is not WorkStatus.NORMAL and request.assigned_wharf_name:
             # [2026-09-26] 검증모드는 후보가 하나뿐이라, 여기서 탈락시키면 아래
             # ALL_CANDIDATES_UNSAFE 로 떨어져 **'배정된 선석이 조건에 맞지 않는다'** 는
@@ -284,6 +319,7 @@ async def orchestrate(
                     summary=_no_candidate_summary(
                         f"'{resolved_berth.wharf_name}' 기상 관측이 없거나 오래돼 판단할 수 없습니다."
                     ),
+                    opinions=opinions,
                 )
             suggestion = await tools.suggest_alternatives(
                 db, neo4j_driver,
@@ -303,6 +339,7 @@ async def orchestrate(
                     f"'{resolved_berth.wharf_name}' 기상이 '{berth_weather.status.value}' 기준을 "
                     f"넘었습니다: {'; '.join(berth_weather.reasons)}"
                 ),
+                opinions=opinions,
             )
 
         if berth_weather.status is not WorkStatus.NORMAL:
@@ -327,8 +364,11 @@ async def orchestrate(
             cargos=request.cargos,
             adjacent_cargos=resolved_berth.adjacent_cargos,
         )
+        if request.assigned_wharf_name:
+            opinions.append(tools.segregation_opinion(safety_result))
 
         if safety_result.risk_level != RiskLevel.BLOCKED:
+            conditions, condition_key = _cross_check(berth_weather)
             llm_result = await _llm_summary(
                 llm_client,
                 selected_berth=resolved_berth,
@@ -354,6 +394,9 @@ async def orchestrate(
                 assignment_changed=(request.assigned_wharf_name is not None and resolution.path == "대체"),
                 summary=llm_result.summary,
                 berth_match_summary=llm_result.berth_match_summary,
+                opinions=opinions,
+                conditions=conditions,
+                condition_key=condition_key,
             )
 
         rejected.append(
@@ -399,4 +442,5 @@ async def orchestrate(
         summary=llm_result.summary,
         # berth_match_summary는 안 담는다 — 선택된 선석이 없어 "매칭"을 말할 대상
         # 자체가 없다.
+        opinions=opinions,
     )
