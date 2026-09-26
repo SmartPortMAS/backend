@@ -9,7 +9,7 @@ CargoRef/AdjacentCargo는 안전관제 에이전트(app.agents.safety.schemas)�
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 from app.agents.safety.schemas import AdjacentCargo, CargoRef
 
@@ -34,26 +34,6 @@ class VesselSpec(BaseModel):
         "제외하는 데 쓴다 — 이 값이 없으면 추천을 받은 배가 재판정 때 자기 예약에 "
         "막혀 영원히 승인할 수 없다(2026-08-21 실측).",
     )
-
-
-class SchedulingRequest(BaseModel):
-    vessel: VesselSpec
-    cargo: CargoRef
-    additional_cargos: list[CargoRef] = Field(
-        default_factory=list,
-        description="[2026-09-25] 같은 입항에 함께 실은 나머지 화물. 있으면 **모든 화물의 "
-        "카테고리를 취급하는 선석만** 후보가 된다(한 입항 건의 화물은 한 선석에서 하역한다고 "
-        "가정 — PORT-MIS 가 입항 건당 계선시설을 하나만 준다). 비우면 cargo 하나만(하위 호환).",
-    )
-    window_start: datetime = Field(description="희망 접안 시작 시각(UTC)")
-    window_end: datetime = Field(description="희망 접안 종료(출항 예정) 시각(UTC)")
-    draught_margin_m: float = Field(default=1.0, ge=0, description="수심 대비 흘수 안전 여유(m)")
-
-    @model_validator(mode="after")
-    def _window_must_be_ordered(self) -> "SchedulingRequest":
-        if self.window_end <= self.window_start:
-            raise ValueError("window_end는 window_start보다 이후여야 합니다.")
-        return self
 
 
 class ConflictingPortCall(BaseModel):
@@ -102,36 +82,3 @@ class BerthCandidate(BaseModel):
         description="선석 하역능력(upa_berth_facility.unload_capacity). 단위·산출기준 미확인이라 "
         "소프트 타이브레이커로만 쓴다(§5.2.1-B) — 결측이면 순위에서만 불리하고 후보에서 제외되지 않는다.",
     )
-
-
-class SchedulingResult(BaseModel):
-    target_cargo_name: str
-    cargo_category: str
-    candidates: list[BerthCandidate]
-    total_eligible_count: int = Field(description="수심·화물 적합성만 통과한 선석 총 개수(점유 포함)")
-
-
-class AnchorageAssignment(BaseModel):
-    """정박지 대기 배정 (온산 MVP 이식: build_anchorage_assignment.py의 assign_anchorage 모델).
-
-    전용 선석이 점유 중이고 대체 가능한 선석도 없을 때(단독선석 등) 도달하는 최종 상태.
-    """
-
-    anchorage_id: str
-    name: str
-    tonnage_rule: str | None = None
-    latitude: float | None = None
-    longitude: float | None = None
-
-
-class BerthResolution(BaseModel):
-    """전용 선석이 점유 중일 때의 '전용 -> 대체 -> 정박지 대기' 3단계 배정 결과.
-
-    scheduling.service.resolve_berth_assignment가 만든다. 오케스트레이터가 후보별로
-    이걸 호출해 실제 배정 가능 여부와 그 근거(trace)를 얻는다.
-    """
-
-    path: str = Field(description="전용 | 대체 | 정박지대기 | 제안불가")
-    berth: BerthCandidate | None = Field(default=None, description="path가 전용/대체일 때만 채워짐")
-    anchorage: AnchorageAssignment | None = Field(default=None, description="path가 정박지대기일 때만 채워짐")
-    trace: list[str] = Field(default_factory=list, description="판단 경로와 근거(관제사용 설명)")

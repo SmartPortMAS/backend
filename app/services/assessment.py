@@ -134,11 +134,6 @@ def level_from_decision(result: OrchestratorResult) -> tuple[AssessmentLevel, st
         # 이 배에 안 맞는다"** 는 뜻이다. 대상이 한 곳뿐이기 때문이다.
         return AssessmentLevel.UNFIT, "배정된 선석이 이 선박·화물 조건에 맞지 않습니다"
 
-    if decision is OverallDecision.WAITING_ANCHORAGE:
-        # 검증모드에서는 원래 나오지 않는 귀결이다(대상이 선석 하나로 고정).
-        # 방어적으로 둔다 — 나오면 의견일 뿐 우리가 정박지로 보내지 않는다.
-        return AssessmentLevel.CAUTION, "지금 선석보다 정박지 대기가 적절해 보입니다"
-
     return AssessmentLevel.UNKNOWN, f"판정 결과를 해석할 수 없습니다({decision.value})"
 
 
@@ -250,8 +245,6 @@ def _reasons_from_result(result: OrchestratorResult, headline: str) -> list[str]
         reasons.append(f"대체 선석 제안: {names} — 제안이며 배정이 아닙니다")
     elif result.suggestion_note:
         reasons.append(f"대체 선석을 제안하지 못했습니다: {result.suggestion_note}")
-    if result.assignment_changed:
-        reasons.append("배정된 선석과 다른 선석이 더 적합해 보입니다 — 의견이며 배정 변경이 아닙니다")
     # 중복 제거하되 순서는 유지한다(관제사가 읽는 순서가 근거의 우선순위다).
     seen: set[str] = set()
     return [r for r in reasons if r and not (r in seen or seen.add(r))]

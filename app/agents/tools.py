@@ -15,8 +15,6 @@
   check_berth         선석 — 정해진 선석 하나의 가용수심·흘수 여유·이웃 화물(검증모드)
   check_segregation   혼재 — 이웃 화물과의 규칙 하한 + 설명(LLM)
   suggest_alternatives 대체안 — 배정이 아니라 제안
-  find_candidates     [탐색모드] 카테고리 기준 후보 top-N   — D단계에서 정리 예정
-  resolve_assignment  [탐색모드] 점유 시 대체·정박지 재탐색 — D단계에서 정리 예정
   where_is            운영 — 이 배는 지금 어디에 있고 무엇을 실었나, 최근 판정(C단계)
   who_is_at           운영 — 이 부두와 인접 부두에 붙은 배·화물·최근 판정(C단계)
 
@@ -40,19 +38,8 @@ from app.agents.safety.schemas import (
     SafetyAssessmentResult,
 )
 from app.agents.safety.service import assess_safety
-from app.agents.scheduling.schemas import (
-    BerthCandidate,
-    BerthResolution,
-    SchedulingRequest,
-    SchedulingResult,
-    VesselSpec,
-)
-from app.agents.scheduling.service import (
-    build_candidate_for_wharf_name,
-    find_berth_candidates,
-    resolve_berth_assignment,
-    suggest_alternative_berths,
-)
+from app.agents.scheduling.schemas import BerthCandidate, VesselSpec
+from app.agents.scheduling.service import build_candidate_for_wharf_name, suggest_alternative_berths
 from app.agents.weather.schemas import WeatherAssessmentRequest, WeatherAssessmentResult, WorkStatus
 from app.agents.weather.service import assess_weather
 from app.llm.base import LLMClient
@@ -125,7 +112,7 @@ async def check_berth(
     vessel: VesselSpec,
     window_start: datetime,
     window_end: datetime,
-    draught_margin_m: float = 1.0,
+    draught_margin_m: float | None = None,
 ) -> BerthCheck:
     """정해진 선석 하나가 이 배에 맞는가(검증모드). 이웃 화물도 함께 채운다."""
     candidate, reason, evidence_missing = await build_candidate_for_wharf_name(
@@ -170,7 +157,7 @@ async def suggest_alternatives(
     window_start: datetime,
     window_end: datetime,
     exclude_wharf_name: str | None,
-    draught_margin_m: float = 1.0,
+    draught_margin_m: float | None = None,
 ) -> Alternatives:
     """지금 선석이 맞지 않을 때 관제사에게 보일 대체 선석(가까운 순). 배정하지 않는다."""
     candidates, note = await suggest_alternative_berths(
@@ -185,35 +172,6 @@ async def suggest_alternatives(
         extra_cargos=cargos,
     )
     return Alternatives(candidates=candidates, note=note)
-
-
-async def find_candidates(
-    db: AsyncSession, neo4j_driver: AsyncDriver, request: SchedulingRequest,
-) -> SchedulingResult:
-    """[탐색모드] 화물 카테고리·수심 기준 후보 선석. 배정 가정 경로라 D단계에서 정리한다."""
-    return await find_berth_candidates(db, neo4j_driver, request)
-
-
-async def resolve_assignment(
-    db: AsyncSession,
-    neo4j_driver: AsyncDriver,
-    *,
-    candidate: BerthCandidate,
-    vessel: VesselSpec,
-    window_start: datetime,
-    window_end: datetime,
-    category: str | None,
-) -> BerthResolution:
-    """[탐색모드] 점유 시 전용 → 대체 → 정박지 재탐색. 배정 경로라 D단계에서 정리한다."""
-    return await resolve_berth_assignment(
-        db,
-        neo4j_driver,
-        candidate=candidate,
-        vessel=vessel,
-        window_start=window_start,
-        window_end=window_end,
-        category=category,
-    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
