@@ -1,12 +1,13 @@
-"""챗봇 LLM 프롬프트 — (1) 질문 분류·물질명 추출, (2) 최종 답변 생성.
+"""챗봇 LLM 프롬프트 — (1) 질문 분류·물질명·부두·선박명 추출, (2) 후속 도구 선택(운영 질문),
+(3) 최종 답변 생성.
 
-두 프롬프트 모두 구조화 출력(app.llm.base.LLMClient.generate_structured)을 쓰므로
+세 프롬프트 모두 구조화 출력(app.llm.base.LLMClient.generate_structured)을 쓰므로
 "JSON으로만 응답하라" 같은 지시는 넣지 않는다 — 스키마가 이미 강제한다.
 """
 
 from app.agents.safety.schemas import SafetyAssessmentResult
 
-from .schemas import ChemicalProfile, GraphEvidence, RetrievedChunk
+from .schemas import ChemicalProfile, GraphEvidence, OperationalEvidence, RetrievedChunk
 
 PLANNER_SYSTEM_PROMPT = """\
 당신은 울산항 액체화물 안전관제 챗봇의 질문 분석기입니다.
@@ -27,7 +28,11 @@ PLANNER_SYSTEM_PROMPT = """\
    "톨루엔이 바다에 유출되면 어류에 어떤 영향이 있나요?", "아세톤 폐기는 어떻게 하나요?")
 - safety_general: 특정 물질을 하나도 지목하지 않은 일반 안전 질문.
   (예: "인화성 액체 하역 시 공통 주의사항은?")
-- out_of_scope: 화학물질 안전과 무관한 질문. (예: "오늘 날씨 어때?", "선석 예약해줘")
+- operations: 지금 항만 현황을 묻는 질문 — 어느 배가 어느 부두에 붙어 있는지, 이 배가
+  어디 있는지, 옆(인접) 부두에 무슨 화물이 있는지, 이 배의 판정 결과가 어떤지.
+  (예: "SK3부두에 지금 붙은 배는?", "LAGA8 어디 있어?", "S-Oil 2부두 옆 부두 화물은?",
+   "BUENA SUERTE 화물이랑 옆 부두 화물 같이 둬도 돼?")
+- out_of_scope: 화학물질 안전·항만 현황과 무관한 질문. (예: "오늘 점심 뭐 먹지?", "선석 예약해줘")
   ★ 물질명이 등장하고 그 물질의 성질·영향·처리·규제를 묻고 있다면 out_of_scope가
     아닙니다. 해양 생태 영향이나 법령 조항을 묻더라도 MSDS에 실린 정보이므로
     chemical_info입니다.
@@ -39,8 +44,18 @@ PLANNER_SYSTEM_PROMPT = """\
    추출하지 마세요.
 3. 물질이 하나도 없으면 빈 배열로 두세요.
 
+[부두·선박명 추출 규칙]
+1. berths에는 질문에 나온 부두·선석명을, vessels에는 선박명이나 호출부호를 표기 그대로
+   넣으세요. ("S-OIL2부두"를 "S-Oil 2부두"로 고치지 말 것 — 다음 단계가 맞춥니다.)
+2. 없으면 빈 배열로 두세요.
+3. asks_segregation은 화물끼리 같이·인접해 둬도 되는지(혼재 가부)를 묻는 질문이면 true입니다.
+   ("옆 부두 화물이랑 같이 둬도 돼?", "벤젠과 가솔린 같이 하역해도 되나?")
+
 [분류 판정 순서 — 위에서부터 적용]
-1. 화학물질 안전과 무관한 질문이면 out_of_scope.
+0. 부두·선석명이나 선박명(호출부호)이 나오고 지금의 위치·접안·화물·판정을 묻거나,
+   "옆 부두/인접 선석"의 화물을 묻는다면 operations. 화물 두 개의 혼재를 묻더라도
+   그 화물이 특정 배나 부두에 실린 것으로 지목되면 operations입니다.
+1. 화학물질 안전·항만 현황과 무관한 질문이면 out_of_scope.
 2. 구체적인 물질명이 하나도 없으면 safety_general.
 3. 물질명이 둘 이상이고 "같이/함께/인접/동시에/한 배에" 같은 표현이 있으면
    incompatibility_check.
@@ -55,6 +70,27 @@ PLANNER_SYSTEM_PROMPT = """\
 
 def build_planner_prompt(question: str) -> str:
     return f"[사용자 질문]\n{question}"
+
+
+FOLLOWUP_SYSTEM_PROMPT = """\
+당신은 울산항 관제 챗봇의 도구 선택기입니다. 사용자 질문과 지금까지 모은 항만 현황을
+보고, 답하는 데 **꼭 필요한** 추가 도구만 고르세요(최대 3개). 필요 없으면 빈 배열입니다.
+
+[도구]
+(혼재 판정은 여기서 고르지 않습니다 — 필요하면 시스템이 따로 부릅니다.)
+- incompatible_list: 화물 1개와 혼재금지인 물질 목록입니다.
+- msds_search: 화물의 MSDS 원문(인화점·응급조치·취급 등)을 찾습니다. query에 찾을 내용을 쓰세요.
+- who_is_at: 부두 1개에 지금 붙은 배와 인접 부두 현황입니다(이미 조회한 부두는 다시 부르지 마세요).
+- where_is: 선박 1척의 현재 위치입니다(이미 조회한 배는 다시 부르지 마세요).
+
+[규칙]
+1. 화물명·부두명·선박명은 현황에 적힌 표기 그대로 쓰세요. 지어내지 마세요.
+2. 현황만으로 답할 수 있으면 아무 도구도 고르지 마세요.
+"""
+
+
+def build_followup_prompt(question: str, evidence_text: str) -> str:
+    return f"[사용자 질문]\n{question}\n\n[지금까지 모은 항만 현황]\n{evidence_text}"
 
 
 ANSWER_SYSTEM_PROMPT = """\
@@ -76,6 +112,8 @@ ANSWER_SYSTEM_PROMPT = """\
    충돌이 적힌 축을 인용하세요 — 한 축이 "충돌 없음"이어도 다른 축이 등급을 정했을 수 있습니다.
 5. 수치(인화점, 끓는점 등)는 근거에 적힌 값과 단위를 그대로 인용하세요. 환산·반올림
    하지 마세요.
+6. [근거 · 항만 운영 현황]이 있으면 배 이름·부두·화물·판정 등급·시각을 적힌 그대로
+   인용하세요. 현황에 없는 배나 화물을 말하지 마세요. 시각은 한국시간(KST)입니다.
 
 [답변 형식]
 - 결론을 첫 줄에 한 문장으로 제시하세요. 위험 판정이 있으면 등급을 먼저 밝히세요.
@@ -231,6 +269,12 @@ def _format_chunks(chunks: list[RetrievedChunk]) -> str:
     )
 
 
+def format_operational(evidence: list[OperationalEvidence]) -> str:
+    return "\n".join(
+        f"■ {e.title}\n" + "\n".join(f"  - {line}" for line in e.lines) for e in evidence
+    )
+
+
 def build_answer_prompt(
     *,
     question: str,
@@ -239,8 +283,12 @@ def build_answer_prompt(
     chunks: list[RetrievedChunk],
     unresolved: list[str],
     incomplete_pairwise: bool = False,
+    operational: list[OperationalEvidence] | None = None,
 ) -> str:
     sections = [f"[사용자 질문]\n{question}"]
+
+    if operational:
+        sections.append("[근거 · 항만 운영 현황]\n" + format_operational(operational))
 
     if unresolved:
         sections.append(

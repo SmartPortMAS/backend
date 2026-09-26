@@ -17,6 +17,8 @@
   suggest_alternatives 대체안 — 배정이 아니라 제안
   find_candidates     [탐색모드] 카테고리 기준 후보 top-N   — D단계에서 정리 예정
   resolve_assignment  [탐색모드] 점유 시 대체·정박지 재탐색 — D단계에서 정리 예정
+  where_is            운영 — 이 배는 지금 어디에 있고 무엇을 실었나, 최근 판정(C단계)
+  who_is_at           운영 — 이 부두와 인접 부두에 붙은 배·화물·최근 판정(C단계)
 
 도구 결과는 berth_opinion · weather_opinion · segregation_opinion 으로 의견(Opinion:
 등급 · 확인한 것 · 못 본 것)이 된다(B단계). 혼재 '확인요청'은 segregation_opinion 이 정한다.
@@ -27,6 +29,7 @@ from typing import Literal
 
 from neo4j import AsyncDriver
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.safety.schemas import (
@@ -301,4 +304,127 @@ def segregation_opinion(s: SafetyAssessmentResult) -> Opinion:
         checked=[f"화물 {len(s.cargo_verdicts) or 1}종 × 이웃 화물, 규칙 하한 '{s.rule_engine_floor.value}'"],
         missing=[f"{p.adjacent_name}: {p.reason}" for p in s.unassessed_pairs[:5]]
         + ([f"외 {n_pairs - 5}종"] if n_pairs > 5 else []),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 운영 도구 — 지금 어느 배가 어디에 있고 무엇을 실었나 (C단계, 챗봇이 부른다)
+#
+# 판정 잡과 같은 뷰(mart.vessel_presence · vessel_current_call · cargo_msds)와 같은
+# 인접 그래프(ADJACENT_TO)를 읽는다 — 챗봇이 판정 잡과 다른 사실을 말하지 않게.
+# ─────────────────────────────────────────────────────────────────────────────
+class VesselNow(BaseModel):
+    call_sign: str | None
+    vessel_name: str | None
+    zone: str = Field(description="BERTH(접안) | ANCHORAGE(정박지) | STOPPED | UNDERWAY")
+    place: str | None = Field(default=None, description="접안 부두 또는 정박지 이름")
+    speed_kn: float | None = None
+    position_at_utc: datetime | None = None
+    cargos: list[str] = Field(default_factory=list, description="현재 입항 건의 화물(합성)")
+    chem_ids: list[str] = Field(default_factory=list)
+    latest_level: str | None = Field(default=None, description="가장 최근 판정 등급")
+    latest_reason: str | None = None
+    latest_at_utc: datetime | None = None
+
+
+class BerthNow(BaseModel):
+    wharf_name: str
+    vessels: list[VesselNow] = Field(default_factory=list)
+    neighbors: list["NeighborNow"] = Field(default_factory=list)
+
+
+class NeighborNow(BaseModel):
+    wharf_name: str
+    distance_m: float | None = None
+    vessels: list[VesselNow] = Field(default_factory=list)
+
+
+BerthNow.model_rebuild()
+
+_SQL_PRESENCE = """
+    SELECT vp.callsgn, vp.vessel_name, vp.presence_zone, vp.berth_name, vp.anchorage_name,
+           vp.sog, vp.received_at_utc,
+           ARRAY(SELECT DISTINCT coalesce(cm.msds_name_ko, cm.cargo_name_raw)
+                 FROM mart.vessel_current_call vc
+                 JOIN mart.cargo_msds cm ON cm.port_call_key = vc.port_call_key
+                 WHERE vc.callsgn = upper(btrim(vp.callsgn))) AS cargos,
+           ARRAY(SELECT DISTINCT cm.chem_id
+                 FROM mart.vessel_current_call vc
+                 JOIN mart.cargo_msds cm ON cm.port_call_key = vc.port_call_key
+                 WHERE vc.callsgn = upper(btrim(vp.callsgn)) AND cm.chem_id IS NOT NULL) AS chem_ids,
+           ah.level, ah.reasons[1] AS reason, ah.assessed_at_utc
+    FROM mart.vessel_presence vp
+    LEFT JOIN LATERAL (
+        SELECT level, reasons, assessed_at_utc FROM assessment_history a
+        WHERE a.call_sign = upper(btrim(vp.callsgn))
+        ORDER BY assessed_at_utc DESC LIMIT 1
+    ) ah ON true
+"""
+
+
+def _vessel_now(row) -> VesselNow:
+    return VesselNow(
+        call_sign=row["callsgn"], vessel_name=row["vessel_name"], zone=row["presence_zone"],
+        place=row["berth_name"] or row["anchorage_name"],
+        speed_kn=float(row["sog"]) if row["sog"] is not None else None,
+        position_at_utc=row["received_at_utc"],
+        cargos=[c for c in row["cargos"] if c], chem_ids=list(row["chem_ids"]),
+        latest_level=row["level"], latest_reason=row["reason"], latest_at_utc=row["assessed_at_utc"],
+    )
+
+
+def _norm_place(name: str) -> str:
+    return "".join(name.lower().split()).replace("-", "")
+
+
+async def where_is(db: AsyncSession, *, query: str) -> list[VesselNow]:
+    """호출부호 또는 선박명(일부)으로 배를 찾아 지금 위치·화물·최근 판정을 돌려준다."""
+    rows = (await db.execute(text(_SQL_PRESENCE + """
+        WHERE upper(btrim(vp.callsgn)) = upper(btrim(:q))
+           OR replace(upper(vp.vessel_name), ' ', '') LIKE '%' || replace(upper(:q), ' ', '') || '%'
+        ORDER BY vp.received_at_utc DESC
+        LIMIT 5
+    """), {"q": query})).mappings().all()
+    return [_vessel_now(r) for r in rows]
+
+
+async def who_is_at(db: AsyncSession, neo4j_driver: AsyncDriver, *, wharf: str) -> BerthNow | None:
+    """부두에 지금 붙어 있는 배와, 인접 부두(ADJACENT_TO)에 붙어 있는 배를 돌려준다.
+
+    부두 이름은 표기가 흔들리므로(S-OIL2부두 · S-Oil 2부두) 공백·하이픈·대소문자를
+    무시하고 그래프의 부두명과 맞춘다. 못 찾으면 None.
+    """
+    async with neo4j_driver.session() as s:
+        names = [r["w"] for r in await (await s.run(
+            "MATCH (b:Berth) WHERE b.wharf_name IS NOT NULL RETURN DISTINCT b.wharf_name AS w"
+        )).data()]
+    key = _norm_place(wharf)
+    matched = next((n for n in names if _norm_place(n) == key), None) \
+        or next((n for n in names if key in _norm_place(n)), None)
+    if matched is None:
+        return None
+
+    async with neo4j_driver.session() as s:
+        neighbor_rows = await (await s.run("""
+            MATCH (b:Berth {wharf_name: $w})-[r:ADJACENT_TO]->(n:Berth)
+            WHERE n.wharf_name <> $w
+            RETURN n.wharf_name AS wharf, min(r.distance_m) AS distance_m
+            ORDER BY distance_m
+        """, w=matched)).data()
+
+    wanted = [matched] + [r["wharf"] for r in neighbor_rows]
+    rows = (await db.execute(text(_SQL_PRESENCE + """
+        WHERE vp.presence_zone = 'BERTH' AND vp.berth_name = ANY(:w)
+    """), {"w": wanted})).mappings().all()
+    by_wharf: dict[str, list[VesselNow]] = {}
+    for r in rows:
+        by_wharf.setdefault(r["berth_name"], []).append(_vessel_now(r))
+
+    return BerthNow(
+        wharf_name=matched,
+        vessels=by_wharf.get(matched, []),
+        neighbors=[
+            NeighborNow(wharf_name=r["wharf"], distance_m=r["distance_m"], vessels=by_wharf.get(r["wharf"], []))
+            for r in neighbor_rows
+        ],
     )

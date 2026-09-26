@@ -11,6 +11,12 @@
   4) LLM 2회 호출로 근거 기반 답변 생성 (LLMAnswer)
   5) 근거의 종류로 confidence 산정 (LLM이 스스로 매기게 하지 않는다)
 
+[2026-09-27] 운영 질문(operations — 지금 어느 배가 어디에, 무엇을 싣고, 판정은) 경로를
+더했다(27번 설계안 C단계). 도구 계층(app/agents/tools.py)의 where_is · who_is_at 로 현황을
+모으고, LLM 이 후속 도구(MSDS 검색·혼재금지 목록 등)를 최대 3개 고른다(도구 호출 합계 4회).
+혼재를 묻는 질문이면(플래너의 asks_segregation) 코드가 판정 잡과 같은 방식(대상 배 화물 vs 같은
+부두·인접 부두 배 화물)으로 혼재 판정을 부른다 — 필수 근거를 모델에 맡기지 않는다.
+
 혼재 판정을 자체 구현하지 않고 app/agents/safety에 위임하는 이유: 규칙엔진 하한,
 IMDG 격리코드→위험등급 환산, LLM 하향 판정 방지 보정이 이미 거기 있고, 챗봇과
 대시보드가 같은 질문에 다른 답을 내면 안 되기 때문이다.
@@ -18,6 +24,7 @@ IMDG 격리코드→위험등급 환산, LLM 하향 판정 방지 보정이 이�
 
 import asyncio
 import logging
+from datetime import timedelta, timezone
 
 from neo4j import AsyncDriver
 from sqlalchemy import select
@@ -31,6 +38,7 @@ from app.agents.safety.schemas import (
     risk_level_rank,
 )
 from app.agents.safety.service import assess_safety
+from app.agents import tools
 from app.core.exceptions import AppError
 from app.database import AsyncSessionFactory
 from app.llm.base import LLMClient
@@ -40,9 +48,12 @@ from app.models import MsdsChemical
 from . import graph_queries
 from .prompt import (
     ANSWER_SYSTEM_PROMPT,
+    FOLLOWUP_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT,
     build_answer_prompt,
+    build_followup_prompt,
     build_planner_prompt,
+    format_operational,
 )
 from .retrieval import IDENTITY_STRONG_THRESHOLD, resolve_chemical_names, search_context
 from .schemas import (
@@ -51,11 +62,13 @@ from .schemas import (
     ChemicalMatch,
     ChemicalProfile,
     Confidence,
+    FollowUpPlan,
     GraphEvidence,
     IncompatibleCategoryGroup,
     Intent,
     LLMAnswer,
     MatchMethod,
+    OperationalEvidence,
     QueryPlan,
     RagQueryRequest,
     RetrievedChunk,
@@ -68,9 +81,12 @@ logger = logging.getLogger(__name__)
 _VIRTUAL_BERTH = "질문에서 지정한 인접 화물"
 
 OUT_OF_SCOPE_ANSWER = (
-    "이 챗봇은 울산항 액체화물의 MSDS 안전 정보와 혼재금지 판정만 답변할 수 있습니다. "
-    "화학물질 안전과 관련된 질문을 해주세요."
+    "이 챗봇은 울산항 액체화물의 MSDS 안전 정보, 혼재금지 판정, 부두·선박 현황만 답변할 수 "
+    "있습니다. 화학물질 안전이나 항만 현황과 관련된 질문을 해주세요."
 )
+
+# 운영 질문에서 한 답변이 부를 수 있는 도구 수(현황 조회 + 후속 선택 + 코드 강제 판정 합계).
+MAX_TOOL_CALLS = 4
 
 
 async def answer_question(
@@ -99,6 +115,11 @@ async def answer_question(
             schema=QueryPlan,
         )
         logger.info("chatbot plan: intent=%s chemicals=%s", plan.intent, plan.chemicals)
+
+        if plan.intent is Intent.OPERATIONS or plan.berths or plan.vessels:
+            return await _answer_operations(
+                db, neo4j_driver, llm_client, embedding_client, request.question, plan,
+            )
 
         if plan.intent is Intent.OUT_OF_SCOPE:
             return ChatResponse(
@@ -178,6 +199,208 @@ async def answer_question(
         retrieved_chunks=chunks,
         sources=_build_sources(resolved, chunks),
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 운영 질문 (27번 설계안 C단계)
+# ─────────────────────────────────────────────────────────────────────────────
+_ZONE_KO = {"BERTH": "접안", "ANCHORAGE": "정박지", "STOPPED": "정지", "UNDERWAY": "항해"}
+_KST = timezone(timedelta(hours=9))
+
+
+def _vessel_line(v: tools.VesselNow) -> str:
+    where = f"{_ZONE_KO.get(v.zone, v.zone)} {v.place}" if v.place else _ZONE_KO.get(v.zone, v.zone)
+    judged = (
+        f"최근 판정 '{v.latest_level}'"
+        + (f" ({v.latest_at_utc.astimezone(_KST):%m/%d %H:%M})" if v.latest_at_utc else "")
+        + (f" — {v.latest_reason}" if v.latest_reason else "")
+        if v.latest_level else "판정 기록 없음"
+    )
+    speed = f", 속력 {v.speed_kn:g}kn" if v.speed_kn is not None else ""
+    return (
+        f"{v.vessel_name or '(선명 미상)'}({v.call_sign or '호출부호 미상'}) — {where}{speed}, "
+        f"화물: {', '.join(v.cargos) or '없음'}, {judged}"
+    )
+
+
+def _berth_evidence(b: tools.BerthNow) -> OperationalEvidence:
+    lines = [f"[{b.wharf_name}] " + _vessel_line(v) for v in b.vessels] or [
+        f"[{b.wharf_name}] 지금 접안한 배 없음"
+    ]
+    for n in b.neighbors:
+        dist = f" · {n.distance_m:.0f}m" if n.distance_m is not None else ""
+        if n.vessels:
+            lines += [f"[인접 {n.wharf_name}{dist}] " + _vessel_line(v) for v in n.vessels]
+        else:
+            lines.append(f"[인접 {n.wharf_name}{dist}] 접안한 배 없음")
+    if not b.neighbors:
+        lines.append("인접 부두 정보 없음(500m 안에 다른 부두가 없거나 좌표 없음)")
+    return OperationalEvidence(title=f"부두 현황: {b.wharf_name}", lines=lines)
+
+
+async def _answer_operations(
+    db: AsyncSession,
+    neo4j_driver: AsyncDriver,
+    llm_client: LLMClient,
+    embedding_client: EmbeddingClient,
+    question: str,
+    plan: QueryPlan,
+) -> ChatResponse:
+    evidence: list[OperationalEvidence] = []
+    tools_used: list[str] = []
+    seen_vessels: set[str] = set()
+    seen_berths: set[str] = set()
+    focal: tools.VesselNow | None = None
+    berth_now: tools.BerthNow | None = None
+
+    async def _where_is(q: str) -> None:
+        nonlocal focal
+        if q in seen_vessels or len(tools_used) >= MAX_TOOL_CALLS:
+            return
+        seen_vessels.add(q)
+        found = await tools.where_is(db, query=q)
+        tools_used.append("where_is")
+        evidence.append(OperationalEvidence(
+            title=f"선박 현황: {q}",
+            lines=[_vessel_line(v) for v in found] or ["지금 항내 위치 자료에서 찾지 못함"],
+        ))
+        if found and focal is None:
+            focal = found[0]
+
+    async def _who_is_at(w: str) -> None:
+        nonlocal berth_now
+        if w in seen_berths or len(tools_used) >= MAX_TOOL_CALLS:
+            return
+        seen_berths.add(w)
+        found = await tools.who_is_at(db, neo4j_driver, wharf=w)
+        tools_used.append("who_is_at")
+        if found is None:
+            evidence.append(OperationalEvidence(title=f"부두 현황: {w}", lines=["부두 이름을 찾지 못함"]))
+            return
+        seen_berths.add(found.wharf_name)
+        evidence.append(_berth_evidence(found))
+        if berth_now is None:
+            berth_now = found
+
+    for v in plan.vessels[:2]:
+        await _where_is(v)
+    for w in plan.berths[:2]:
+        await _who_is_at(w)
+    # 혼재를 물었는데 배만 지목됐으면, 그 배가 붙은 부두의 이웃 현황이 판정 입력이다.
+    if plan.asks_segregation and berth_now is None and focal is not None \
+            and focal.zone == "BERTH" and focal.place:
+        await _who_is_at(focal.place)
+
+    # 후속 도구 — 현황을 본 LLM 이 고른다(남은 예산 안에서).
+    groups: list[IncompatibleCategoryGroup] = []
+    chunks: list[RetrievedChunk] = []
+    resolved: list[ChemicalMatch] = []
+    if evidence and len(tools_used) < MAX_TOOL_CALLS:
+        follow = await llm_client.generate_structured(
+            system_prompt=FOLLOWUP_SYSTEM_PROMPT,
+            user_prompt=build_followup_prompt(question, format_operational(evidence)),
+            schema=FollowUpPlan,
+        )
+        logger.info("chatbot followup: %s", [(c.tool, c.targets) for c in follow.calls])
+        for call in follow.calls[:3]:
+            if len(tools_used) >= MAX_TOOL_CALLS:
+                break
+            if call.tool == "where_is" and call.targets:
+                await _where_is(call.targets[0])
+            elif call.tool == "who_is_at" and call.targets:
+                await _who_is_at(call.targets[0])
+            elif call.tool in ("incompatible_list", "msds_search"):
+                matches, _, _ = await resolve_chemical_names(db, embedding_client, call.targets)
+                resolved += [m for m in matches if m.chem_id not in {r.chem_id for r in resolved}]
+                tools_used.append(call.tool)
+                if call.tool == "incompatible_list" and matches:
+                    groups += await build_incompatible_groups(neo4j_driver, matches[0].chem_id)
+                elif call.tool == "msds_search":
+                    chunks += await search_context(
+                        db, embedding_client, call.query or question, top_k=4,
+                        chem_ids=[m.chem_id for m in matches] or None,
+                    )
+
+    # 혼재 판정 — 필수 근거라 코드가 부른다(모델 선택에 맡기지 않는다).
+    assessment: SafetyAssessmentResult | None = None
+    if plan.asks_segregation:
+        assessment = await _operational_segregation(
+            db, neo4j_driver, llm_client, embedding_client, focal, berth_now, plan.chemicals, evidence,
+        )
+        if assessment is not None:
+            tools_used.append("segregation_check")
+
+    profiles = await _build_profiles(db, neo4j_driver, resolved) if resolved else []
+    graph_evidence = GraphEvidence(profiles=profiles, incompatible_groups=groups)
+    llm_answer = await llm_client.generate_structured(
+        system_prompt=ANSWER_SYSTEM_PROMPT,
+        user_prompt=build_answer_prompt(
+            question=question, graph_evidence=graph_evidence, assessment=assessment,
+            chunks=chunks, unresolved=[], operational=evidence,
+        ),
+        schema=LLMAnswer,
+    )
+    found_any = focal is not None or berth_now is not None
+    return ChatResponse(
+        answer=_enforce_assessment_level(llm_answer.answer, assessment, llm_answer.conclusion_level),
+        intent=Intent.OPERATIONS,
+        confidence=(
+            Confidence.LOW if llm_answer.data_insufficient or not found_any else Confidence.HIGH
+        ),
+        chemicals_resolved=resolved,
+        safety_actions=llm_answer.safety_actions,
+        graph_evidence=graph_evidence,
+        safety_assessment=assessment,
+        retrieved_chunks=chunks,
+        sources=_build_sources(resolved, chunks) + [e.title for e in evidence],
+        operational_evidence=evidence,
+        tools_used=tools_used,
+    )
+
+
+async def _operational_segregation(
+    db: AsyncSession,
+    neo4j_driver: AsyncDriver,
+    llm_client: LLMClient,
+    embedding_client: EmbeddingClient,
+    focal: tools.VesselNow | None,
+    berth_now: tools.BerthNow | None,
+    pair_names: list[str],
+    evidence: list[OperationalEvidence],
+) -> SafetyAssessmentResult | None:
+    """운영 질문의 혼재 판정.
+
+    배·부두가 특정되면 판정 잡과 같은 모양으로 본다 — 대상 배의 화물 vs 같은 부두의 다른
+    배와 인접 부두 배들의 화물(check_segregation 한 번). 특정되지 않고 화물명만 있으면
+    물질 질문과 같은 쌍 판정으로 간다.
+    """
+    if berth_now is not None:
+        at_berth = [v for v in berth_now.vessels if v.chem_ids]
+        target = focal if (focal is not None and focal.chem_ids) else (at_berth[0] if at_berth else None)
+        if target is not None:
+            adjacent = [
+                AdjacentCargo(berth_name=berth_now.wharf_name, cargo=CargoRef(chem_id=c))
+                for v in at_berth if v.call_sign != target.call_sign for c in v.chem_ids
+            ] + [
+                AdjacentCargo(berth_name=n.wharf_name, cargo=CargoRef(chem_id=c), distance_m=n.distance_m)
+                for n in berth_now.neighbors for v in n.vessels for c in v.chem_ids
+            ]
+            if not adjacent:
+                evidence.append(OperationalEvidence(
+                    title="혼재 판정", lines=["같은 부두·인접 부두에 화물을 실은 배가 없어 판정할 대상이 없음"],
+                ))
+                return None
+            return await tools.check_segregation(
+                db, neo4j_driver, llm_client,
+                cargo=CargoRef(chem_id=target.chem_ids[0]),
+                cargos=[CargoRef(chem_id=c) for c in target.chem_ids[1:]],
+                adjacent_cargos=adjacent,
+            )
+    if len(pair_names) >= 2:
+        matches, _, _ = await resolve_chemical_names(db, embedding_client, pair_names)
+        if len(matches) >= 2:
+            return await _delegate_to_safety_agent(db, neo4j_driver, llm_client, matches)
+    return None
 
 
 def _adjust_intent(intent: Intent, resolved: list[ChemicalMatch]) -> Intent:
