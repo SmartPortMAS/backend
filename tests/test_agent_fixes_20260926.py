@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import text
 
 from app.agents.orchestrator import service as orch
+from app.agents.tools import Alternatives, BerthCheck
 from app.agents.orchestrator.schemas import OrchestratorRequest, OrchestratorResult, OverallDecision
 from app.agents.safety.schemas import AdjacentCargo, CargoRef, RiskLevel, SafetyAssessmentRequest
 from app.agents.safety.service import assess_verdict
@@ -56,13 +57,13 @@ def _verify_request() -> OrchestratorRequest:
 @pytest.mark.asyncio
 async def test_1_weather_unknown_is_evidence_missing_not_unfit(monkeypatch):
     async def fake_candidate(*a, **k):
-        return _candidate(), None, False
+        return BerthCheck(candidate=_candidate())
 
-    async def fake_weather(db, req):
+    async def fake_weather(db, **k):
         return _weather(WorkStatus.UNKNOWN)
 
-    monkeypatch.setattr(orch, "build_candidate_for_wharf_name", fake_candidate)
-    monkeypatch.setattr(orch, "assess_weather", fake_weather)
+    monkeypatch.setattr(orch.tools, "check_berth", fake_candidate)
+    monkeypatch.setattr(orch.tools, "check_weather", fake_weather)
 
     result = await orch.orchestrate(None, None, _NoLLM(), _verify_request())
     level, _ = level_from_decision(result)
@@ -73,17 +74,17 @@ async def test_1_weather_unknown_is_evidence_missing_not_unfit(monkeypatch):
 @pytest.mark.asyncio
 async def test_1_weather_stop_is_weather_blocked(monkeypatch):
     async def fake_candidate(*a, **k):
-        return _candidate(), None, False
+        return BerthCheck(candidate=_candidate())
 
-    async def fake_weather(db, req):
+    async def fake_weather(db, **k):
         return _weather(WorkStatus.STOP)
 
     async def fake_alternatives(*a, **k):
-        return [], "테스트"
+        return Alternatives(note="테스트")
 
-    monkeypatch.setattr(orch, "build_candidate_for_wharf_name", fake_candidate)
-    monkeypatch.setattr(orch, "assess_weather", fake_weather)
-    monkeypatch.setattr(orch, "suggest_alternative_berths", fake_alternatives)
+    monkeypatch.setattr(orch.tools, "check_berth", fake_candidate)
+    monkeypatch.setattr(orch.tools, "check_weather", fake_weather)
+    monkeypatch.setattr(orch.tools, "suggest_alternatives", fake_alternatives)
 
     result = await orch.orchestrate(None, None, _NoLLM(), _verify_request())
     level, headline = level_from_decision(result)

@@ -20,13 +20,16 @@
 4. 승인가능/전후보배정불가 케이스만 LLM으로 관제사용 종합 의견을 작성한다
    (적합선석없음/정박지대기는 이미 결론이 명확해 LLM 호출 없이 결정적 문장을
    쓴다).
+
+[2026-09-27] 에이전트 서비스를 직접 부르지 않고 도구 계층(app/agents/tools.py)을
+부른다 — 27번 설계안 A단계. 동작은 바꾸지 않았다(실시간 재판정 전후 비교로 확인).
 """
 
 from neo4j import AsyncDriver
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.safety.schemas import RiskLevel, SafetyAssessmentRequest, SafetyAssessmentResult
-from app.agents.safety.service import assess_safety
+from app.agents import tools
+from app.agents.safety.schemas import RiskLevel, SafetyAssessmentResult
 from app.agents.scheduling.schemas import (
     BerthCandidate,
     BerthResolution,
@@ -34,14 +37,7 @@ from app.agents.scheduling.schemas import (
     SchedulingRequest,
     VesselSpec,
 )
-from app.agents.scheduling.service import (
-    build_candidate_for_wharf_name,
-    find_berth_candidates,
-    resolve_berth_assignment,
-    suggest_alternative_berths,
-)
-from app.agents.weather.schemas import WeatherAssessmentRequest, WeatherAssessmentResult, WorkStatus
-from app.agents.weather.service import assess_weather
+from app.agents.weather.schemas import WeatherAssessmentResult, WorkStatus
 from app.llm.base import LLMClient
 
 from .prompt import SYSTEM_PROMPT, build_user_prompt
@@ -100,12 +96,8 @@ async def orchestrate(
     # 없는 후보를 위한 폴백, 그리고 후보 없음/전체탈락 응답의 weather_assessment
     # 필드를 채우는 용도로만 쓰인다. 통과/차단 판정은 아래 루프에서 각 후보의
     # 선석별 임계값으로 한다.
-    weather_result = await assess_weather(
-        db,
-        WeatherAssessmentRequest(
-            as_of=request.weather_as_of,
-            expected_completion_at=request.window_end,
-        ),
+    weather_result = await tools.check_weather(
+        db, window_end=request.window_end, as_of=request.weather_as_of,
     )
 
     # 대체(SUBSTITUTABLE_WITH) 후보의 화물 적합성 게이트용(resolve_berth_assignment
@@ -116,7 +108,7 @@ async def orchestrate(
 
     if request.assigned_wharf_name:
         # 검증모드 — top-3 재탐색 대신 이미 정해진 선석 하나만 확인한다.
-        candidate, reason, evidence_missing = await build_candidate_for_wharf_name(
+        berth_check = await tools.check_berth(
             db,
             neo4j_driver,
             wharf_name=request.assigned_wharf_name,
@@ -125,6 +117,9 @@ async def orchestrate(
             window_end=request.window_end,
             draught_margin_m=request.draught_margin_m,
         )
+        candidate, reason, evidence_missing = (
+            berth_check.candidate, berth_check.reason, berth_check.evidence_missing
+        )
         if candidate is None:
             # 배정된 시설이 **실제로** 안 맞는 경우에만 대체안을 찾는다(회의 §3 조치안).
             # 근거 부족(표기 미해소·조위 예보 없음)이면 찾지 않는다 — 어디가
@@ -132,14 +127,14 @@ async def orchestrate(
             alternatives: list[BerthCandidate] = []
             note = None
             if not evidence_missing:
-                alternatives, note = await suggest_alternative_berths(
+                suggestion = await tools.suggest_alternatives(
                     db, neo4j_driver,
-                    cargo=request.cargo, vessel=request.vessel,
+                    cargo=request.cargo, cargos=request.cargos, vessel=request.vessel,
                     window_start=request.window_start, window_end=request.window_end,
                     exclude_wharf_name=request.assigned_wharf_name,
                     draught_margin_m=request.draught_margin_m,
-                    extra_cargos=request.cargos,
                 )
+                alternatives, note = suggestion.candidates, suggestion.note
             return OrchestratorResult(
                 overall_decision=OverallDecision.NO_ELIGIBLE_BERTH,
                 weather_assessment=weather_result,
@@ -152,7 +147,7 @@ async def orchestrate(
         candidates_to_try = [candidate]
     else:
         # 탐색모드(하위 호환) — 카테고리 기준 top-3를 새로 탐색한다.
-        scheduling_result = await find_berth_candidates(
+        scheduling_result = await tools.find_candidates(
             db,
             neo4j_driver,
             SchedulingRequest(
@@ -218,7 +213,7 @@ async def orchestrate(
                 ],
             )
         else:
-            resolution = await resolve_berth_assignment(
+            resolution = await tools.resolve_assignment(
                 db,
                 neo4j_driver,
                 candidate=candidate,
@@ -265,14 +260,12 @@ async def orchestrate(
         #
         # berth_group=None 을 넘기면 임계값은 전역 기본을 쓰되 wharf_name 은
         # 전달되므로, 파고 적용 여부만 이 선석 기준으로 옳게 결정된다.
-        berth_weather = await assess_weather(
+        berth_weather = await tools.check_weather(
             db,
-            WeatherAssessmentRequest(
-                berth_group=resolved_berth.berth_group,
-                wharf_name=resolved_berth.wharf_name,
-                as_of=request.weather_as_of,
-                expected_completion_at=request.window_end,
-            ),
+            window_end=request.window_end,
+            wharf_name=resolved_berth.wharf_name,
+            berth_group=resolved_berth.berth_group,
+            as_of=request.weather_as_of,
         )
         if berth_weather.status is not WorkStatus.NORMAL and request.assigned_wharf_name:
             # [2026-09-26] 검증모드는 후보가 하나뿐이라, 여기서 탈락시키면 아래
@@ -292,14 +285,14 @@ async def orchestrate(
                         f"'{resolved_berth.wharf_name}' 기상 관측이 없거나 오래돼 판단할 수 없습니다."
                     ),
                 )
-            alternatives, suggestion_note = await suggest_alternative_berths(
+            suggestion = await tools.suggest_alternatives(
                 db, neo4j_driver,
-                cargo=request.cargo, vessel=request.vessel,
+                cargo=request.cargo, cargos=request.cargos, vessel=request.vessel,
                 window_start=request.window_start, window_end=request.window_end,
                 exclude_wharf_name=request.assigned_wharf_name,
                 draught_margin_m=request.draught_margin_m,
-                extra_cargos=request.cargos,
             )
+            alternatives, suggestion_note = suggestion.candidates, suggestion.note
             return OrchestratorResult(
                 overall_decision=OverallDecision.WEATHER_BLOCKED,
                 weather_assessment=berth_weather,
@@ -326,14 +319,13 @@ async def orchestrate(
             )
             continue
 
-        safety_result = await assess_safety(
+        safety_result = await tools.check_segregation(
             db,
             neo4j_driver,
             llm_client,
-            SafetyAssessmentRequest(
-                target_cargo=request.cargo, target_cargos=request.cargos,
-                adjacent_cargos=resolved_berth.adjacent_cargos,
-            ),
+            cargo=request.cargo,
+            cargos=request.cargos,
+            adjacent_cargos=resolved_berth.adjacent_cargos,
         )
 
         if safety_result.risk_level != RiskLevel.BLOCKED:
@@ -389,14 +381,14 @@ async def orchestrate(
     alternatives: list[BerthCandidate] = []
     suggestion_note = None
     if request.assigned_wharf_name:
-        alternatives, suggestion_note = await suggest_alternative_berths(
+        suggestion = await tools.suggest_alternatives(
             db, neo4j_driver,
-            cargo=request.cargo, vessel=request.vessel,
+            cargo=request.cargo, cargos=request.cargos, vessel=request.vessel,
             window_start=request.window_start, window_end=request.window_end,
             exclude_wharf_name=request.assigned_wharf_name,
             draught_margin_m=request.draught_margin_m,
-            extra_cargos=request.cargos,
         )
+        alternatives, suggestion_note = suggestion.candidates, suggestion.note
 
     return OrchestratorResult(
         overall_decision=OverallDecision.ALL_CANDIDATES_UNSAFE,
