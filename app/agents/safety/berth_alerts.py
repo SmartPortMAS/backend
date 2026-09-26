@@ -438,6 +438,8 @@ _ASSESSMENT_LEVEL_TO_ALERT = {
     "부적합": "DANGER",
     "주의": "WARNING",
     "판정불가": "WARNING",
+    # 충돌은 없고 이웃 화물 혼재 근거가 없었다(AssessmentLevel.NEEDS_CHECK) — 알리되 경고는 아니다
+    "확인요청": "INFO",
 }
 
 
