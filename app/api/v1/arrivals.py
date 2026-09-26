@@ -62,6 +62,15 @@ _QUERY_UPCOMING = text("""
         WHERE draught > 0 AND received_at_utc > now() - interval '30 days' AND callsgn IS NOT NULL
         ORDER BY upper(btrim(callsgn)), received_at_utc DESC
     ),
+    -- 화물: 재항 신고 위험물 ↔ MSDS 매칭(mart.cargo_msds). 화면에서 바로 판정을 요청할 때
+    -- 오케스트레이터가 요구하는 chem_id 를 여기서 준다(watch_arrivals 와 같은 출처).
+    cargo AS (
+        SELECT DISTINCT ON (upper(btrim(callsgn))) upper(btrim(callsgn)) AS cs,
+               chem_id, cas_no, COALESCE(msds_name_ko, cargo_name_raw) AS cargo_name, is_synthetic
+        FROM mart.cargo_msds
+        WHERE nullif(btrim(callsgn), '') IS NOT NULL
+        ORDER BY upper(btrim(callsgn)), (chem_id IS NOT NULL) DESC, msds_matched DESC NULLS LAST
+    ),
     spec AS (
         SELECT DISTINCT ON (upper(btrim(callsgn))) upper(btrim(callsgn)) AS cs, draught_m
         FROM vessel_spec
@@ -77,6 +86,7 @@ _QUERY_UPCOMING = text("""
            COALESCE(d.draught, s.draught_m) AS draught_m,
            CASE WHEN d.draught IS NOT NULL THEN '실측' WHEN s.draught_m IS NOT NULL THEN '제원최대' END AS draught_basis,
            d.received_at_utc AS draught_at_utc,
+           c.chem_id, c.cas_no, c.cargo_name, c.is_synthetic AS cargo_is_synthetic,
            a.collected_at_utc
     FROM arr a
     LEFT JOIN fac f ON f.source_name = a.arrival_facility_nm
@@ -84,6 +94,7 @@ _QUERY_UPCOMING = text("""
     LEFT JOIN pos p ON p.cs = upper(btrim(a.callsgn))
     LEFT JOIN draught d ON d.cs = upper(btrim(a.callsgn))
     LEFT JOIN spec s ON s.cs = upper(btrim(a.callsgn))
+    LEFT JOIN cargo c ON c.cs = upper(btrim(a.callsgn))
     ORDER BY a.arrival_at_utc
 """)
 
@@ -93,7 +104,7 @@ _QUERY_LATEST_ASSESSMENT = text("""
     SELECT DISTINCT ON (call_sign) call_sign, stage, level, reasons, action, recipient,
            changed_from, assessed_at_utc
     FROM assessment_history
-    WHERE call_sign = ANY(CAST(:call_signs AS text[]))
+    WHERE upper(btrim(call_sign)) = ANY(CAST(:call_signs AS text[]))
     ORDER BY call_sign, assessed_at_utc DESC
 """)
 
@@ -128,9 +139,9 @@ async def get_upcoming_arrivals(
     assessments: dict[str, dict] = {}
     has_history = bool((await db.execute(_QUERY_HAS_HISTORY)).scalar())
     if rows and has_history:
-        call_signs = sorted({r["call_sign"] for r in rows if r["call_sign"]})
+        call_signs = sorted({r["call_sign"].strip().upper() for r in rows if r["call_sign"]})
         for a in (await db.execute(_QUERY_LATEST_ASSESSMENT, {"call_signs": call_signs})).mappings().all():
-            assessments[a["call_sign"]] = dict(a)
+            assessments[a["call_sign"].strip().upper()] = dict(a)
 
     now = datetime.now(timezone.utc)
     items = []
@@ -138,7 +149,7 @@ async def get_upcoming_arrivals(
         depth, draught = r.get("depth_m"), r.get("draught_m")
         r["chart_margin_m"] = round(float(depth) - float(draught), 2) if depth is not None and draught is not None else None
         r["stage"] = _stage(r, now)
-        r["assessment"] = assessments.get(r["call_sign"])
+        r["assessment"] = assessments.get((r["call_sign"] or "").strip().upper())
         items.append(r)
 
     return {
