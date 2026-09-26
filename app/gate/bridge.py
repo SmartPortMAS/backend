@@ -115,6 +115,9 @@ class GateBridge:
         self._status: dict[str, tuple[dict, float]] = {}      # gate_id -> (파이 status, 받은 시각 monotonic)
         self._interlock: dict[str, dict] = {}                 # gate_id -> 마지막 발행
         self._demo: dict = {}                                 # {"wind_ms", "wave_m", "set_at_utc"}
+        # 시연 판정 — 게이트별 {"level", "reason", "set_at_utc"}. 판정 이력(assessment_history)에는
+        # 쓰지 않는다: 운영 DB 의 판정 기록·확인 대기 목록을 시연값으로 오염시키지 않기 위해서다.
+        self._demo_verdict: dict[str, dict] = {}
         self._groups: dict[str, str | None] = {}              # gate_id -> berth_group (Neo4j, 한 번만)
         self._thresholds: dict[str, dict] = {}
         self._assess: dict[str, list[dict]] = {}              # 선석 -> 붙어 있는 배와 최신 하역중 판정
@@ -194,6 +197,22 @@ class GateBridge:
                 self._demo = {"wind_ms": wind_ms, "wave_m": wave_m,
                               "set_at_utc": datetime.now(timezone.utc).isoformat()}
 
+    def set_demo_verdict(self, gate_id: str | None, level: str | None, reason: str | None = None) -> None:
+        """시연 판정 — 그 게이트 선석의 '하역중 최신 판정'을 이 값으로 본다(규칙은 실제와 같다).
+
+        실제 흐름: 하역 중 판정이 부적합·판정불가로 바뀌면 터미널은 하역을 멈춘다. 시연장에서는
+        그 판정 변화를 기다릴 수 없어, 판정 값만 넣고 잠금 규칙(GATE_BLOCKING_LEVELS)은 그대로 쓴다.
+        gate_id 가 None 이면 모든 게이트. level 이 None 이면 해제(실측 판정으로 복귀).
+        """
+        targets = list(self.berth_of) if gate_id is None else [gate_id]
+        with self._lock:
+            for gid in targets:
+                if level is None:
+                    self._demo_verdict.pop(gid, None)
+                else:
+                    self._demo_verdict[gid] = {"level": level, "reason": (reason or "").strip()[:80],
+                                               "set_at_utc": datetime.now(timezone.utc).isoformat()}
+
     # ── 판정 → interlock ──────────────────────────────────────────────────
     async def _berth_group(self, gate_id: str, berth: str) -> str | None:
         if gate_id in self._groups:
@@ -238,6 +257,7 @@ class GateBridge:
         now = datetime.now(timezone.utc)
         with self._lock:
             demo = dict(self._demo)
+            demo_verdict = {k: dict(v) for k, v in self._demo_verdict.items()}
         async with AsyncSessionFactory() as db:
             wx = (await db.execute(_Q_WEATHER_NOW)).mappings().first() or {}
             try:
@@ -264,7 +284,14 @@ class GateBridge:
                     wave_height_m=wave, wave_is_stale=wave_stale, threshold=th,
                 )
                 weather_lock = status is not WorkStatus.NORMAL
-                blocking = [v for v in self._assess.get(berth, []) if v["blocking"]]
+                dv = demo_verdict.get(gate_id)
+                if dv:
+                    # 시연 판정이 있으면 실측 판정 대신 쓴다. 적합·주의면 판정 잠금 없음.
+                    blocking = ([{"vessel_name": "[시연]", "call_sign": "", "level": dv["level"],
+                                  "reasons": [dv["reason"]] if dv["reason"] else [], "blocking": True}]
+                                if dv["level"] in _BLOCKING else [])
+                else:
+                    blocking = [v for v in self._assess.get(berth, []) if v["blocking"]]
                 state = "LOCKED" if (weather_lock or blocking) else "UNLOCKED"
                 reason, reason_ko = "", []
                 if weather_lock:
@@ -285,7 +312,9 @@ class GateBridge:
                     payload["reason_ko"] = " / ".join(reason_ko)
                 with self._lock:
                     prev = self._interlock.get(gate_id)
-                changed = prev is None or prev["payload"].get("state") != state or prev["payload"].get("reason") != reason
+                changed = (prev is None or prev["payload"].get("state") != state
+                           or prev["payload"].get("reason") != payload.get("reason", "")
+                           or prev["payload"].get("reason_ko") != payload.get("reason_ko"))
                 due = prev is None or time.monotonic() - prev["sent_mono"] > REPUBLISH_SEC
                 if changed or due:
                     ok = self._publish(f"gate/{gate_id}/interlock", payload, retain=True)
@@ -293,7 +322,8 @@ class GateBridge:
                         self._interlock[gate_id] = {
                             "payload": payload, "status": status.value, "reasons": reasons,
                             "lock_by": {"weather": weather_lock, "assessment": bool(blocking)},
-                            "wind_ms": wind, "wave_m": wave, "demo": bool(demo),
+                            "wind_ms": wind, "wave_m": wave, "demo": bool(demo) or bool(dv),
+                            "demo_verdict": dv,
                             "sent_at_utc": now.isoformat(), "sent_mono": time.monotonic(), "published": ok,
                         }
                     if changed:
@@ -317,6 +347,7 @@ class GateBridge:
             status = dict(self._status)
             interlock = dict(self._interlock)
             demo = dict(self._demo)
+            demo_verdict = {k: dict(v) for k, v in self._demo_verdict.items()}
         assess = dict(self._assess)
         gates = []
         for i, (gate_id, berth) in enumerate(self.berth_of.items()):
@@ -338,6 +369,8 @@ class GateBridge:
                 },
                 # 지금 이 선석에 붙어 있는 배와 최신 하역중 판정 (없으면 빈 목록 — 기상만 적용)
                 "vessels": assess.get(berth, []),
+                # 시연 판정 — 있으면 위 실측 판정 대신 잠금 판단에 쓰는 중
+                "demo_verdict": demo_verdict.get(gate_id),
                 "status": st,                       # 파이가 보낸 그대로 (interlock·valve·denied·last_result…)
                 "offline": at is None or (now_mono - at) > OFFLINE_AFTER_SEC,
                 "status_age_sec": age,
@@ -345,6 +378,7 @@ class GateBridge:
         return {
             "broker": {"host": self.host, "port": self.port, "connected": self.connected, "error": self._last_error},
             "demo": demo or None,
+            "demo_verdict": demo_verdict or None,
             "assessment_connected": self._assess_connected,
             "gates": gates,
             "ts_utc": datetime.now(timezone.utc).isoformat(),

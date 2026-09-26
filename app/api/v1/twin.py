@@ -210,12 +210,74 @@ _Q_TIDE_OBS = text("""
     ORDER BY observed_at_utc
 """)
 
+# [2026-09-24] 정밀 검토 화면(Omniverse)에 "이 배/선석의 최신 판정"과 "게이트 상태"를 같이
+# 보여준다. 기상·흘수 전망만 있으면 판정 체계·게이트와 따로 노는 화면이 된다.
+_Q_HAS_ASSESSMENT = text("SELECT to_regclass('public.assessment_history') IS NOT NULL")
+_Q_LATEST_ASSESSMENT_BY_CS = text("""
+    SELECT call_sign, vessel_name, stage, wharf_name, level, reasons, action, recipient,
+           changed_from, assessed_at_utc, acknowledged_by
+    FROM assessment_history
+    WHERE upper(btrim(call_sign)) = upper(btrim(:cs))
+    ORDER BY assessed_at_utc DESC
+    LIMIT 1
+""")
+_Q_LATEST_ASSESSMENT_BY_WHARF = text("""
+    SELECT call_sign, vessel_name, stage, wharf_name, level, reasons, action, recipient,
+           changed_from, assessed_at_utc, acknowledged_by
+    FROM assessment_history
+    WHERE wharf_name = :wharf
+    ORDER BY assessed_at_utc DESC
+    LIMIT 1
+""")
+
 _Q_PRESENCE = text("""
     SELECT presence_zone, berth_name, berth_basis, vessel_name, received_at_utc
     FROM mart.vessel_presence
     WHERE callsgn = upper(btrim(:cs))
     LIMIT 1
 """)
+
+
+async def _latest_assessment(db: AsyncSession, *, call_sign: str | None, wharf: str) -> dict | None:
+    """배를 지목했으면 그 배의 최신 판정, 선석만 지목했으면 그 선석의 최신 판정. 표가 없으면 None."""
+    if not (await db.execute(_Q_HAS_ASSESSMENT)).scalar():
+        return None
+    row = None
+    if call_sign:
+        row = (await db.execute(_Q_LATEST_ASSESSMENT_BY_CS, {"cs": call_sign})).mappings().first()
+    if row is None:
+        row = (await db.execute(_Q_LATEST_ASSESSMENT_BY_WHARF, {"wharf": wharf})).mappings().first()
+    if row is None:
+        return None
+    out = {k: _iso(v) for k, v in row.items()}
+    out["reasons"] = list(row["reasons"] or [])[:3]
+    out["for"] = "vessel" if (call_sign and row["call_sign"] and
+                             row["call_sign"].strip().upper() == call_sign.strip().upper()) else "berth"
+    return out
+
+
+def _gate_for(wharf: str) -> dict | None:
+    """이 선석에 실물 게이트가 붙어 있으면 지금 잠금 상태. 게이트 다리가 없는 빌드면 None."""
+    try:
+        from app.gate.bridge import bridge  # noqa: PLC0415 — 게이트 PR 이 없는 main 에서도 앱은 떠야 한다
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        snap = bridge.snapshot()
+    except Exception:  # noqa: BLE001
+        return None
+    for g in snap.get("gates", []):
+        if g.get("berth") == wharf:
+            il = g.get("interlock") or {}
+            st = g.get("status") or {}
+            return {
+                "gate_id": g.get("gate_id"), "label": g.get("label"),
+                "state": il.get("state"), "reason_ko": il.get("reason_ko"), "lock_by": il.get("lock_by"),
+                "device_interlock": st.get("interlock"), "valve": st.get("valve"),
+                "simulate": bool(st.get("simulate")), "offline": bool(g.get("offline")),
+                "demo": bool(snap.get("demo")),
+            }
+    return None
 
 
 async def _resolve_berth(db: AsyncSession, name: str | None) -> str | None:
@@ -388,9 +450,15 @@ async def get_outlook(
         if first_change is None and lv != "적합":
             first_change = point
 
+    assessment = await _latest_assessment(db, call_sign=call_sign, wharf=wharf)
+    gate = _gate_for(wharf)
+
     return {
         "berth": wharf,
         "berth_group": group,
+        # 판정 체계·게이트와 잇는 두 항목 (2026-09-24). 없으면 None — 화면은 그 줄을 비운다.
+        "assessment": assessment,
+        "gate": gate,
         "thresholds": None if threshold is None else {
             "stop_wind_ms": threshold.stop_wind_ms, "stop_wave_m": threshold.stop_wave_m,
             "unberth_wind_ms": threshold.unberth_wind_ms, "unberth_wave_m": threshold.unberth_wave_m,
