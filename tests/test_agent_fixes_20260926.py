@@ -165,12 +165,14 @@ def test_4_floor_is_per_adjacent_pair():
 
 @pytest.mark.asyncio
 async def test_4_real_case_two_neighbors_stay_danger(db, neo4j):
-    # 에틸렌글리콜 vs 에탄올 / 에틸렌 — 각각 단독이면 '위험'(2026-09-26 실측)
+    # 황산 vs 가솔린 / 톨루엔 — 각각 단독이면 '위험'(MSDS 가연성물질 기피, 2026-09-27 실측).
+    # [2026-09-27] 예전 예시(에틸렌글리콜 vs 에탄올·에틸렌)의 '위험'은 MSDS 상투 문구가
+    # 만든 가짜 충돌이라 그래프 정리(msds_neo4j_loader.prune_incompatible_noise)로 사라졌다.
     req = SafetyAssessmentRequest(
-        target_cargo=CargoRef(chem_id="001093"),
+        target_cargo=CargoRef(chem_id="001049"),
         adjacent_cargos=[
-            AdjacentCargo(berth_name="이웃1", cargo=CargoRef(chem_id="000034")),
-            AdjacentCargo(berth_name="이웃2", cargo=CargoRef(chem_id="000045")),
+            AdjacentCargo(berth_name="이웃1", cargo=CargoRef(chem_id="016420")),
+            AdjacentCargo(berth_name="이웃2", cargo=CargoRef(chem_id="001032")),
         ],
     )
     v = await assess_verdict(db, neo4j, req)
