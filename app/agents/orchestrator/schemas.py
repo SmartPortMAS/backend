@@ -46,6 +46,12 @@ class OverallDecision(str, Enum):
 class OrchestratorRequest(BaseModel):
     vessel: VesselSpec
     cargo: CargoRef
+    cargos: list[CargoRef] = Field(
+        default_factory=list,
+        description="[2026-09-25] 같은 입항 건에 함께 실은 나머지 화물. 안전 판정은 화물마다 "
+        "돌려 가장 위험한 쪽을 대표로 삼고, 탐색모드 선석은 모든 화물 카테고리를 취급하는 "
+        "곳만 남긴다. 비우면 cargo 하나만(하위 호환).",
+    )
     window_start: datetime = Field(description="희망 접안 시작 시각(UTC)")
     window_end: datetime = Field(
         description="희망 접안 종료(출항 예정) 시각(UTC). 기상분석 에이전트의 "

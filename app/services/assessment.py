@@ -145,6 +145,18 @@ def _axes_from_result(result: OrchestratorResult) -> dict:
             "risk_level": s.risk_level.value,
             "conflict_count": len(s.conflicts) + len(s.imdg_conflicts),
             "key_hazards": list(s.key_hazards[:5]),
+            # [2026-09-25] 한 입항 건의 화물마다 따로 판정한 결과. 대표 등급은 가장
+            # 위험한 화물의 것이다(is_governing).
+            "cargos": [
+                {
+                    "name": v.target_cargo_name,
+                    "chem_id": v.chem_id,
+                    "risk_level": v.risk_level.value,
+                    "conflict_count": v.conflict_count + v.bulk_conflict_count,
+                    "governing": v.is_governing,
+                }
+                for v in s.cargo_verdicts
+            ],
         }
 
     # '점유' 축은 일부러 비워 둔다.
@@ -187,6 +199,15 @@ def _reasons_from_result(result: OrchestratorResult, headline: str) -> list[str]
     reasons = [headline]
     reasons.extend(result.assignment_trace)
     reasons.extend(result.weather_assessment.reasons)
+    # [2026-09-25] 화물이 둘 이상이면 화물별 혼재 등급을 한 줄로 — 대표 등급만 보면
+    # 어느 화물 때문에 그 등급인지 알 수 없다.
+    verdicts = result.safety_assessment.cargo_verdicts if result.safety_assessment else []
+    if len(verdicts) > 1:
+        parts = ", ".join(
+            f"{v.target_cargo_name} {v.risk_level.value}{' (대표)' if v.is_governing else ''}"
+            for v in verdicts
+        )
+        reasons.append(f"화물 {len(verdicts)}종 혼재 판정: {parts}")
     if result.suggested_alternatives:
         names = ", ".join(
             f"{c.wharf_name}(여유 {c.draught_margin_m:.1f}m)"

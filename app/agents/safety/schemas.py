@@ -91,7 +91,41 @@ class SafetyAssessmentRequest(BaseModel):
     기상×안전 조합 판단은 각 에이전트 결과를 받는 상위 오케스트레이터에서 처리한다."""
 
     target_cargo: CargoRef
+    target_cargos: list[CargoRef] = Field(
+        default_factory=list,
+        description="[2026-09-25] 같은 배가 이번 입항에 함께 실은 나머지 화물. 화물마다 인접 "
+        "화물과 대조하고, 가장 위험한 화물의 판정이 응답의 최상위 등급·근거가 된다. "
+        "비우면 target_cargo 하나만 본다(하위 호환).",
+    )
     adjacent_cargos: list[AdjacentCargo] = Field(default_factory=list)
+
+    def all_targets(self) -> list[CargoRef]:
+        """target_cargo + target_cargos (같은 식별자는 한 번만)."""
+        seen: set[tuple[str | None, str | None]] = set()
+        out: list[CargoRef] = []
+        for c in [self.target_cargo, *self.target_cargos]:
+            key = (c.chem_id, c.cas_no)
+            if key not in seen:
+                seen.add(key)
+                out.append(c)
+        return out
+
+
+class CargoVerdictSummary(BaseModel):
+    """판정 대상 배가 실은 화물 하나에 대한 판정 요약 (2026-09-25).
+
+    최상위 응답은 가장 위험한 화물 기준이다. 나머지 화물이 무엇이었고 각각 몇 등급이었는지는
+    이 목록으로만 알 수 있다 — 관제사가 "어느 화물 때문에 이 등급인가"를 보게 한다.
+    """
+
+    target_cargo_name: str
+    chem_id: str
+    risk_level: RiskLevel
+    conflict_count: int = 0
+    bulk_conflict_count: int = 0
+    packaging_violation_count: int = 0
+    unassessed_count: int = 0
+    is_governing: bool = Field(default=False, description="최상위 등급을 결정한 화물이면 True")
 
 
 class IncompatibleConflict(BaseModel):
@@ -229,6 +263,9 @@ class SafetyVerdict(BaseModel):
     unassessed_pairs: list[UnassessedPair] = Field(default_factory=list)
     msds_sections_used: list[str] = Field(default_factory=list)
     imdg_classes: dict[str, str] = Field(default_factory=dict)
+    cargo_verdicts: list[CargoVerdictSummary] = Field(
+        default_factory=list, description="화물별 판정 요약. 화물이 하나면 원소도 하나다."
+    )
 
 
 class SafetyAssessmentResult(BaseModel):
@@ -274,4 +311,8 @@ class SafetyAssessmentResult(BaseModel):
         "'공인 규정상 X(격리 불필요, 두 Class 모두 알려짐)'와 '이 Class 조합이 그래프에 "
         "안 실려서 모름'을 구분해 보여주는 데 쓴다. 값이 없는 chem_id는 HAS_IMDG_CLASS "
         "관계 자체가 없다는 뜻이다.",
+    )
+    cargo_verdicts: list[CargoVerdictSummary] = Field(
+        default_factory=list,
+        description="[2026-09-25] 화물별 판정 요약. 최상위 필드는 is_governing=True 인 화물 기준이다.",
     )

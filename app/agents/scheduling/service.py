@@ -147,6 +147,42 @@ def _adjacent_cargos_for(
     return adjacent_cargos
 
 
+async def _eligible_for_all_cargos(
+    db: AsyncSession,
+    neo4j_driver: AsyncDriver,
+    *,
+    primary_category: str,
+    extra_cargos: list[CargoRef],
+    min_depth: float,
+    dwt_t: float | None,
+) -> tuple[list[dict], str | None, str]:
+    """주 화물 카테고리의 적합 선석 중 **추가 화물 카테고리도 모두 취급하는** 선석만.
+
+    [2026-09-25] 한 배가 여러 화물을 싣게 되면서 넣었다. 카테고리를 모르는 추가
+    화물이 있으면 걸러낼 근거가 없으므로 이유를 돌려주고 후보를 비운다 — 모르는 걸
+    '어디든 된다'로 밀지 않는다.
+    """
+    eligible = await find_eligible_berths(
+        neo4j_driver, category=primary_category, min_depth=min_depth, dwt_t=dwt_t,
+    )
+    categories = {primary_category}
+    for extra in extra_cargos:
+        row = await resolve_cargo(db, extra)
+        cat = await get_chemical_category(neo4j_driver, row.chem_id)
+        if not cat:
+            return [], f"함께 실은 화물({row.chem_id})의 선석 카테고리를 알 수 없습니다.", primary_category
+        categories.add(cat)
+    for cat in categories - {primary_category}:
+        allowed = {
+            r["berth_id"]
+            for r in await find_eligible_berths(neo4j_driver, category=cat, min_depth=min_depth, dwt_t=dwt_t)
+        }
+        eligible = [r for r in eligible if r["berth_id"] in allowed]
+    # 안내 문구용 — 주 화물 카테고리를 앞에, 나머지는 이름순.
+    label = "·".join([primary_category, *sorted(categories - {primary_category})])
+    return eligible, None, label
+
+
 async def find_berth_candidates(
     db: AsyncSession,
     neo4j_driver: AsyncDriver,
@@ -159,8 +195,9 @@ async def find_berth_candidates(
         raise CargoCategoryUnknownError(target_row.chem_id)
 
     min_depth = request.vessel.draught_m + request.draught_margin_m
-    eligible = await find_eligible_berths(
-        neo4j_driver, category=category, min_depth=min_depth, dwt_t=request.vessel.dwt_t,
+    eligible, _reason, _label = await _eligible_for_all_cargos(
+        db, neo4j_driver, primary_category=category, extra_cargos=request.additional_cargos,
+        min_depth=min_depth, dwt_t=request.vessel.dwt_t,
     )
 
     if not eligible:
@@ -708,6 +745,7 @@ async def suggest_alternative_berths(
     exclude_wharf_name: str | None = None,
     draught_margin_m: float = 1.0,
     limit: int = 3,
+    extra_cargos: list[CargoRef] | None = None,
 ) -> tuple[list[BerthCandidate], str | None]:
     """배정된 시설이 부적합할 때 내놓을 대체 선석 후보.
 
@@ -738,9 +776,12 @@ async def suggest_alternative_berths(
     tide_m = tide.level_cm / 100.0
 
     min_depth = vessel.draught_m + draught_margin_m - tide_m
-    eligible = await find_eligible_berths(
-        neo4j_driver, category=category, min_depth=min_depth, dwt_t=vessel.dwt_t,
+    eligible, extra_reason, category_label = await _eligible_for_all_cargos(
+        db, neo4j_driver, primary_category=category, extra_cargos=list(extra_cargos or []),
+        min_depth=min_depth, dwt_t=vessel.dwt_t,
     )
+    if extra_reason:
+        return [], extra_reason
 
     # 같은 계선시설이 Berth 노드로 여러 개 있다(실측: 'S-Oil 2부두' 3개, 'S-Oil 4부두' 2개).
     # 마스터에 선석번호 구분 없이 중복 적재된 것이라, 그대로 두면 **같은 부두가 대체안
@@ -759,7 +800,7 @@ async def suggest_alternative_berths(
 
     if not eligible:
         return [], (
-            f"'{category}'를 취급하면서 가용수심 조건(해도 {min_depth:.2f}m 이상)을 "
+            f"'{category_label}'를 모두 취급하면서 가용수심 조건(해도 {min_depth:.2f}m 이상)을 "
             f"만족하는 다른 선석이 없습니다."
         )
 

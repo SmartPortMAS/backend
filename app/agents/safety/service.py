@@ -53,6 +53,8 @@ from .rule_engine import (
 from .schemas import (
     AdjacentCargo,
     BulkCompatibilityConflict,
+    CargoRef,
+    CargoVerdictSummary,
     ImdgSegregationConflict,
     ImdgUnconfirmedPair,
     IncompatibleConflict,
@@ -60,6 +62,7 @@ from .schemas import (
     PackagingViolation,
     RiskLevel,
     SafetyAssessmentRequest,
+    risk_level_rank,
     SafetyAssessmentResult,
     SafetyVerdict,
     UnassessedPair,
@@ -149,13 +152,56 @@ class _Verdict:
     hazard_summary: dict[str, list[str]]
 
 
+async def _compute_verdicts(
+    db: AsyncSession,
+    neo4j_driver: AsyncDriver,
+    request: SafetyAssessmentRequest,
+) -> tuple[_Verdict, list[CargoVerdictSummary]]:
+    """배가 실은 화물마다 판정하고, 가장 위험한 화물의 판정을 대표로 돌려준다.
+
+    [2026-09-25] 전에는 target_cargo 하나만 봤다. 입항 판정이 그 배의 화물 여러 개 중
+    ORDER BY 없는 LIMIT 1 로 하나를 골랐기 때문에, 메탄올이 옆 배 화물과 충돌해도
+    벤젠이 뽑히면 '안전'이 나왔다. 이제 화물마다 같은 판정 함수를 돌린다(화물당
+    실측 약 45ms). 등급이 같으면 요청 순서상 앞 화물을 대표로 쓴다.
+    """
+    verdicts: list[_Verdict] = []
+    seen_chem: set[str] = set()
+    for cargo in request.all_targets():
+        verdict = await _compute_verdict(db, neo4j_driver, request, target_cargo=cargo)
+        # 같은 물질이 다른 키(cas_no 만 / chem_id)로 두 번 올 수 있다 — 해석된 chem_id 로 한 번만.
+        if verdict.target_row.chem_id in seen_chem:
+            continue
+        seen_chem.add(verdict.target_row.chem_id)
+        verdicts.append(verdict)
+    governing = max(
+        enumerate(verdicts), key=lambda iv: (risk_level_rank(iv[1].rule_engine_floor), -iv[0])
+    )[1]
+    summaries = [
+        CargoVerdictSummary(
+            target_cargo_name=_cargo_display_name(v.target_row),
+            chem_id=v.target_row.chem_id,
+            risk_level=v.rule_engine_floor,
+            conflict_count=len(v.conflicts),
+            bulk_conflict_count=len(v.bulk_compatibility_conflicts),
+            packaging_violation_count=len(v.packaging_violations),
+            unassessed_count=len(v.unassessed_pairs),
+            is_governing=v is governing,
+        )
+        for v in verdicts
+    ]
+    return governing, summaries
+
+
 async def _compute_verdict(
     db: AsyncSession,
     neo4j_driver: AsyncDriver,
     request: SafetyAssessmentRequest,
+    *,
+    target_cargo: CargoRef | None = None,
 ) -> _Verdict:
-    """LLM을 부르지 않고 등급과 근거를 확정한다."""
-    target_row = await resolve_cargo(db, request.target_cargo)
+    """화물 하나에 대해 LLM을 부르지 않고 등급과 근거를 확정한다."""
+    target_cargo = target_cargo or request.target_cargo
+    target_row = await resolve_cargo(db, target_cargo)
 
     # [2026-08-23] 인접 화물 해석을 배치로 바꿨다. 이전에는 리스트 컴프리헨션
     # 안에서 화물마다 순차 await 했는데, 실제 스케줄링 응답의 인접 화물이 9종까지
@@ -245,7 +291,7 @@ async def _compute_verdict(
     ]
 
     packing_violation_raw = find_packing_violation(
-        target_row.packing_group, request.target_cargo.unload_method_name
+        target_row.packing_group, target_cargo.unload_method_name
     )
     packaging_violations = (
         [PackagingViolation(**packing_violation_raw)] if packing_violation_raw else []
@@ -400,7 +446,7 @@ async def assess_verdict(
     /safety/assess가 돌려주는 risk_level과 **항상 같다** — 실측으로도 격상률이
     0%다(48회). 먼저 보여준 등급이 뒤집히지 않으므로 조기 표시가 안전하다.
     """
-    v = await _compute_verdict(db, neo4j_driver, request)
+    v, summaries = await _compute_verdicts(db, neo4j_driver, request)
     return SafetyVerdict(
         target_cargo_name=_cargo_display_name(v.target_row),
         risk_level=v.rule_engine_floor,
@@ -413,6 +459,7 @@ async def assess_verdict(
         unassessed_pairs=v.unassessed_pairs,
         msds_sections_used=list(v.hazard_summary.keys()),
         imdg_classes=v.imdg_classes,
+        cargo_verdicts=summaries,
     )
 
 
@@ -422,8 +469,12 @@ async def assess_safety(
     llm_client: LLMClient,
     request: SafetyAssessmentRequest,
 ) -> SafetyAssessmentResult:
-    """판정 + LLM 서술. 응답 형태는 종전과 동일하다."""
-    v = await _compute_verdict(db, neo4j_driver, request)
+    """판정 + LLM 서술. 응답 형태는 종전과 같고 cargo_verdicts 만 늘었다.
+
+    LLM 서술은 대표(가장 위험한) 화물 하나에 대해서만 만든다 — 화물마다 부르면
+    호출 비용이 화물 수만큼 늘어난다. 나머지 화물의 등급은 cargo_verdicts 로 보인다.
+    """
+    v, summaries = await _compute_verdicts(db, neo4j_driver, request)
 
     llm_result = await llm_client.generate_structured(
         system_prompt=SYSTEM_PROMPT,
@@ -472,4 +523,5 @@ async def assess_safety(
         rule_engine_floor=v.rule_engine_floor,
         msds_sections_used=list(v.hazard_summary.keys()),
         imdg_classes=v.imdg_classes,
+        cargo_verdicts=summaries,
     )

@@ -31,7 +31,8 @@ _QUERY_UPCOMING = text("""
         SELECT pv.callsgn, pv.vessel_name, pv.ship_kind_nm, pv.nationality_nm, pv.gross_tonnage,
                pv.agency_name, pv.prev_port_nm, pv.entry_purpose_nm,
                pv.arrival_at_utc, pv.departure_sched_utc, pv.arrival_report_type,
-               pv.arrival_facility_cd, pv.arrival_facility_nm, pv.collected_at_utc
+               pv.arrival_facility_cd, pv.arrival_facility_nm, pv.collected_at_utc,
+               pv.entry_year, pv.entry_count
         FROM portmis_vessel pv
         WHERE pv.is_liquid_cargo_vessel
           AND pv.arrival_at_utc BETWEEN now() - make_interval(hours => :past_hours)
@@ -77,13 +78,26 @@ _QUERY_UPCOMING = text("""
            COALESCE(d.draught, s.draught_m) AS draught_m,
            CASE WHEN d.draught IS NOT NULL THEN '실측' WHEN s.draught_m IS NOT NULL THEN '제원최대' END AS draught_basis,
            d.received_at_utc AS draught_at_utc,
-           a.collected_at_utc
+           a.collected_at_utc,
+           cg.cargos
     FROM arr a
     LEFT JOIN fac f ON f.source_name = a.arrival_facility_nm
     LEFT JOIN berth b ON b.wharf_name = f.wharf_name
     LEFT JOIN pos p ON p.cs = upper(btrim(a.callsgn))
     LEFT JOIN draught d ON d.cs = upper(btrim(a.callsgn))
     LEFT JOIN spec s ON s.cs = upper(btrim(a.callsgn))
+    -- [2026-09-25] 이 입항 건(콜사인·입항연도·입항횟수)에 단 화물 전부. 입항 후
+    -- 위치 화면(mart.vessel_current_call 경유)과 같은 키라 같은 화물이 나온다.
+    LEFT JOIN LATERAL (
+        SELECT json_agg(json_build_object(
+                   'name', coalesce(cm.msds_name_ko, cm.cargo_name_raw),
+                   'un_no', cm.dg_un_no, 'chem_id', cm.chem_id
+               ) ORDER BY cm.bl_no) AS cargos
+        FROM mart.cargo_msds cm
+        WHERE a.entry_year IS NOT NULL AND a.entry_count IS NOT NULL
+          AND cm.port_call_key = upper(btrim(a.callsgn)) || '_' || a.entry_year::text
+                                 || '_' || lpad(a.entry_count::text, 3, '0')
+    ) cg ON true
     ORDER BY a.arrival_at_utc
 """)
 

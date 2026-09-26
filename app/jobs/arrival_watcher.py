@@ -112,11 +112,16 @@ _QUERY_ASSESSMENT_TARGETS = text("""
         lv.distance_m AS moored_distance_m,
         pm.collected_at_utc AS portmis_collected_at,
         pm.arrival_report_type,
-        (
-            SELECT cm.chem_id FROM mart.cargo_msds cm
-            WHERE cm.callsgn = dc.callsgn AND cm.chem_id IS NOT NULL
-            LIMIT 1
-        ) AS chem_id,
+        -- [0030] 화물은 콜사인이 아니라 지금의 입항 건으로 찾는다(재입항 배의 지난
+        -- 항차 화물이 섞이지 않게). 한 입항 건에 여러 화물 → 목록. 입항 건을 못 정한
+        -- 배는 빈 목록 → 판정불가.
+        ARRAY(
+            SELECT DISTINCT ON (cm.chem_id) cm.chem_id
+            FROM mart.vessel_current_call vc
+            JOIN mart.cargo_msds cm ON cm.port_call_key = vc.port_call_key
+            WHERE vc.callsgn = upper(btrim(dc.callsgn)) AND cm.chem_id IS NOT NULL
+            ORDER BY cm.chem_id, cm.bl_no
+        ) AS chem_ids,
         (
             SELECT bds.median_hours
             FROM mart.facility_alias fa
@@ -195,6 +200,7 @@ def _snapshot(row: dict, *, source: str, target: str | None) -> dict:
         "nav_status_code": row.get("nav_status_code"),
         "draught_m": float(row["draught_m"]) if row.get("draught_m") is not None else None,
         "arrival_at_utc": _iso(row.get("arrival_at_utc")),
+        "chem_ids": list(row.get("chem_ids") or []),
     }
 
 
@@ -236,8 +242,8 @@ async def watch_arrivals() -> None:
             blocker = "계류시설을 특정할 수 없습니다(PORT-MIS 정박지·미배정, AIS 접안 미탐지)"
         elif stage is None:
             blocker = "AIS 항해상태가 없어 지금 어느 시점인지 판단할 수 없습니다"
-        elif not row.get("chem_id"):
-            blocker = "적재 화물을 식별할 수 없습니다(MSDS 매칭 없음)"
+        elif not row.get("chem_ids"):
+            blocker = "적재 화물을 식별할 수 없습니다(현재 입항 건 미확정 또는 MSDS 매칭 없음)"
         elif not row.get("draught_m") or float(row["draught_m"]) <= 0:
             blocker = "흘수 정보가 없어 수심 여유를 계산할 수 없습니다"
 
@@ -272,7 +278,8 @@ async def watch_arrivals() -> None:
                 draught_m=row["draught_m"], dwt_t=None, name_hint=row.get("vessel_name"),
                 call_sign=callsgn,
             ),
-            cargo=CargoRef(chem_id=row["chem_id"]),
+            cargo=CargoRef(chem_id=row["chem_ids"][0]),
+            cargos=[CargoRef(chem_id=c) for c in row["chem_ids"][1:]],
             window_start=window_start,
             window_end=window_end,
             # 검증모드 고정 — 이 시설 하나만 확인한다. None 을 넘기면 오케스트레이터가

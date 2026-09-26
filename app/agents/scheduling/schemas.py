@@ -39,6 +39,12 @@ class VesselSpec(BaseModel):
 class SchedulingRequest(BaseModel):
     vessel: VesselSpec
     cargo: CargoRef
+    additional_cargos: list[CargoRef] = Field(
+        default_factory=list,
+        description="[2026-09-25] 같은 입항에 함께 실은 나머지 화물. 있으면 **모든 화물의 "
+        "카테고리를 취급하는 선석만** 후보가 된다(한 입항 건의 화물은 한 선석에서 하역한다고 "
+        "가정 — PORT-MIS 가 입항 건당 계선시설을 하나만 준다). 비우면 cargo 하나만(하위 호환).",
+    )
     window_start: datetime = Field(description="희망 접안 시작 시각(UTC)")
     window_end: datetime = Field(description="희망 접안 종료(출항 예정) 시각(UTC)")
     draught_margin_m: float = Field(default=1.0, ge=0, description="수심 대비 흘수 안전 여유(m)")

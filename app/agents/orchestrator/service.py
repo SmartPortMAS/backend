@@ -138,6 +138,7 @@ async def orchestrate(
                     window_start=request.window_start, window_end=request.window_end,
                     exclude_wharf_name=request.assigned_wharf_name,
                     draught_margin_m=request.draught_margin_m,
+                    extra_cargos=request.cargos,
                 )
             return OrchestratorResult(
                 overall_decision=OverallDecision.NO_ELIGIBLE_BERTH,
@@ -157,6 +158,7 @@ async def orchestrate(
             SchedulingRequest(
                 vessel=request.vessel,
                 cargo=request.cargo,
+                additional_cargos=request.cargos,
                 window_start=request.window_start,
                 window_end=request.window_end,
                 draught_margin_m=request.draught_margin_m,
@@ -290,7 +292,10 @@ async def orchestrate(
             db,
             neo4j_driver,
             llm_client,
-            SafetyAssessmentRequest(target_cargo=request.cargo, adjacent_cargos=resolved_berth.adjacent_cargos),
+            SafetyAssessmentRequest(
+                target_cargo=request.cargo, target_cargos=request.cargos,
+                adjacent_cargos=resolved_berth.adjacent_cargos,
+            ),
         )
 
         if safety_result.risk_level != RiskLevel.BLOCKED:
@@ -352,6 +357,7 @@ async def orchestrate(
             window_start=request.window_start, window_end=request.window_end,
             exclude_wharf_name=request.assigned_wharf_name,
             draught_margin_m=request.draught_margin_m,
+            extra_cargos=request.cargos,
         )
 
     return OrchestratorResult(
