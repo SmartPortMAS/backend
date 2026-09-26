@@ -135,6 +135,11 @@ class LLMAnswer(BaseModel):
     data_insufficient: bool = Field(
         description="제공된 근거만으로 질문에 답할 수 없으면 true"
     )
+    conclusion_level: str | None = Field(
+        default=None,
+        description="답변이 결론으로 내린 혼재 위험등급(안전|주의|위험|배정불가). "
+        "[안전관제 에이전트 판정]이 없거나 등급을 말하지 않았으면 null",
+    )
 
 
 class CargoHint(BaseModel):

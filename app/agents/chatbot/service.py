@@ -158,7 +158,8 @@ async def answer_question(
 
     return ChatResponse(
         answer=_prepend_unjudged_notice(
-            llm_answer.answer, unresolved, incomplete_pairwise, near_misses
+            _enforce_assessment_level(llm_answer.answer, assessment, llm_answer.conclusion_level),
+            unresolved, incomplete_pairwise, near_misses,
         ),
         intent=intent,
         confidence=_compute_confidence(
@@ -206,6 +207,27 @@ def _suggestion_line(
         return ""
     parts = ", ".join(f"'{raw}' → **{name}**" for raw, name in hits)
     return f"혹시 {parts}을(를) 찾으셨나요? 맞다면 그 이름으로 다시 물어봐 주세요."
+
+
+def _enforce_assessment_level(
+    answer: str, assessment: SafetyAssessmentResult | None, conclusion_level: str | None,
+) -> str:
+    """답변의 결론 등급이 판정 등급과 다르면(또는 결론이 없으면) 판정 등급을 코드가 앞에 붙인다.
+
+    [2026-09-27] 프롬프트 4번 규칙("risk_level을 그대로 결론으로")은 부탁일 뿐이다.
+    황산+가성소다처럼 판정은 배정불가인데 답변이 "판단 불가"로 나온 사례가 있었다.
+    _prepend_unjudged_notice 와 같은 원칙 — 결론은 근거(판정 결과)에서 기계적으로 만든다.
+    """
+    if assessment is None:
+        return answer
+    level = assessment.risk_level.value
+    if (conclusion_level or "").strip() == level:
+        return answer
+    logger.warning("chatbot: 답변 결론 등급 %r 이 판정 등급 %r 과 달라 교정", conclusion_level, level)
+    return (
+        f"**혼재 판정: {level}** (규칙 판정 결과이며, 아래 설명과 표현이 다르면 이 등급이 우선합니다)\n\n"
+        + answer
+    )
 
 
 def _prepend_unjudged_notice(
