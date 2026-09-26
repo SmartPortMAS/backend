@@ -71,8 +71,9 @@ ANSWER_SYSTEM_PROMPT = """\
    이를 "혼재금지 관계가 없다" 또는 "안전하다"로 절대 해석하지 마세요.
    반드시 "지식그래프에 관계 정보가 없어 판정할 수 없다"고 명시하세요.
 4. [안전관제 에이전트 판정]이 주어졌다면 그 risk_level을 그대로 답변의 결론으로
-   쓰세요. 임의로 등급을 올리거나 내리지 마세요. 그 판정은 규칙엔진 하한과 IMDG
-   공인 격리표로 보정된 값입니다.
+   쓰세요. 임의로 등급을 올리거나 내리지 마세요. 그 판정은 규칙엔진 하한(MSDS
+   혼재금지·벌크 호환성그룹·포장기준·판정가능성)으로 보정된 값입니다. 근거로는
+   충돌이 적힌 축을 인용하세요 — 한 축이 "충돌 없음"이어도 다른 축이 등급을 정했을 수 있습니다.
 5. 수치(인화점, 끓는점 등)는 근거에 적힌 값과 단위를 그대로 인용하세요. 환산·반올림
    하지 마세요.
 
@@ -198,6 +199,23 @@ def _format_assessment(result: SafetyAssessmentResult) -> str:
             )
     else:
         lines.append("  - [IMDG 공인 격리표] 충돌 없음")
+    # [2026-09-27] 벌크 호환성그룹 축. 판정(rule_engine_floor)은 이 축으로 '배정불가'가
+    # 되는데 근거 목록에 없어서, 황산+가성소다처럼 등급은 배정불가인데 근거는 모두
+    # "충돌 없음"인 입력이 모델에 들어갔고 답변이 "판단 불가"로 나왔다.
+    if result.bulk_compatibility_conflicts:
+        for c in result.bulk_compatibility_conflicts:
+            lines.append(
+                f"  - [벌크 호환성그룹(USCG 46 CFR 150 참고)] {c.adjacent_name}({c.adjacent_chem_id}) "
+                f"그룹 {c.adjacent_group}({c.adjacent_group_name}) vs 대상 그룹 "
+                f"{c.target_group}({c.target_group_name}) — {c.reason}"
+            )
+    else:
+        lines.append("  - [벌크 호환성그룹(USCG 46 CFR 150 참고)] 충돌 없음")
+    if result.unassessed_pairs:
+        lines.append(
+            f"  - [판정 근거 부족] {len(result.unassessed_pairs)}쌍은 MSDS 혼재금지 근거가 없어 "
+            "확인하지 못했습니다(충돌이 없다는 뜻이 아닙니다)"
+        )
     if result.checklist:
         lines.append("  - 안전 체크리스트: " + " / ".join(result.checklist))
     return "\n".join(lines)
