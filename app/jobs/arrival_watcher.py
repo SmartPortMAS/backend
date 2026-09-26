@@ -97,20 +97,28 @@ _QUERY_ASSESSMENT_TARGETS = text("""
         FROM mart.vessel_presence
         WHERE nullif(btrim(callsgn), '') IS NOT NULL
     ),
+    -- [2026-09-27] 입항 건의 입항시각·신고 계류시설·출항 신고를 PORT-MIS(10분 주기)에서
+    --   읽는다. 예전엔 mart.dashboard_current(→ port_call_overview → upa_port_call)에서
+    --   읽었는데, upa_port_call 은 하루 1번 수집되는 VTS 이력이고 한 입항 건의 이벤트
+    --   (입항·이안·이선·접안) 중 첫 행을 골라 '최초 입항 선석'이 나왔다. 실측(9/27):
+    --   부두에 붙은 33척 중 9척이 실제로 있지 않은 부두로 판정됐다.
+    --   창은 mart.vessel_current_call 과 같다(입항시각 <= now()+12h 중 최근 건).
     pm AS (
         SELECT DISTINCT ON (upper(btrim(callsgn))) upper(btrim(callsgn)) AS cs,
-               collected_at_utc, arrival_report_type
+               collected_at_utc, arrival_report_type,
+               arrival_at_utc, departure_at_utc, arrival_facility_nm
         FROM portmis_vessel
         WHERE nullif(btrim(callsgn), '') IS NOT NULL
-        ORDER BY upper(btrim(callsgn)), arrival_at_utc DESC NULLS LAST
+          AND arrival_at_utc <= now() + interval '12 hours'
+        ORDER BY upper(btrim(callsgn)), arrival_at_utc DESC
     )
     SELECT
         dc.callsgn, dc.vessel_name, dc.imo_no, dc.draught AS draught_m,
-        dc.arrival_at_utc, dc.nav_status_code, dc.received_at_utc AS position_at_utc,
-        -- PORT-MIS 공식 배정 계선시설. '정박지-E1' 같은 정박지 배정도 여기로 온다.
-        dc.facility_name AS assigned_facility_name,
-        -- 그 배정 기록에 출항까지 신고돼 있으면 지난 입항의 기록이다(_target_wharf).
-        dc.departure_at_utc AS assigned_departure_at_utc,
+        pm.arrival_at_utc, dc.nav_status_code, dc.received_at_utc AS position_at_utc,
+        -- PORT-MIS 신고 계류시설. '정박지-E1' 같은 정박지 신고도 여기로 온다.
+        pm.arrival_facility_nm AS assigned_facility_name,
+        -- PORT-MIS 출항 신고 시각. 미리 신고되는 예정 시각이라 지났을 때만 끝난 입항이다.
+        pm.departure_at_utc AS assigned_departure_at_utc,
         lv.wharf_name AS moored_wharf_name,
         lv.distance_m AS moored_distance_m,
         pm.collected_at_utc AS portmis_collected_at,
@@ -125,11 +133,16 @@ _QUERY_ASSESSMENT_TARGETS = text("""
             WHERE vc.callsgn = upper(btrim(dc.callsgn)) AND cm.chem_id IS NOT NULL
             ORDER BY cm.chem_id, cm.bl_no
         ) AS chem_ids,
+        -- 판정할 선석(_target_wharf 와 같은 순서: 실제 접안 부두 → PORT-MIS 신고)의 재항 중앙값
         (
             SELECT bds.median_hours
-            FROM mart.facility_alias fa
-            JOIN mart.berth_dwell_stats bds ON bds.wharf_name = fa.wharf_name
-            WHERE fa.source_name = dc.facility_name AND fa.facility_type = 'BERTH'
+            FROM mart.berth_dwell_stats bds
+            WHERE bds.wharf_name = COALESCE(
+                lv.wharf_name,
+                (SELECT fa.wharf_name FROM mart.facility_alias fa
+                 WHERE fa.source_name = pm.arrival_facility_nm AND fa.facility_type = 'BERTH'
+                 LIMIT 1)
+            )
             LIMIT 1
         ) AS median_dwell_hours
     FROM mart.dashboard_current dc
@@ -138,15 +151,15 @@ _QUERY_ASSESSMENT_TARGETS = text("""
     LEFT JOIN present pr ON pr.cs = upper(btrim(dc.callsgn))
     WHERE dc.is_liquid_cargo_vessel
       AND (
-            -- (가) PORT-MIS 가 선석을 적어 둔 배 (정박지 배정은 대상이 아니다)
+            -- (가) PORT-MIS 가 선석을 신고한 배 (정박지 신고는 대상이 아니다)
             (
-                dc.arrival_at_utc IS NOT NULL
-                AND dc.departure_at_utc IS NULL
-                AND nullif(btrim(dc.facility_name), '') IS NOT NULL
-                AND dc.facility_name NOT LIKE '%정박지%'
+                pm.arrival_at_utc IS NOT NULL
+                AND (pm.departure_at_utc IS NULL OR pm.departure_at_utc > now())
+                AND nullif(btrim(pm.arrival_facility_nm), '') IS NOT NULL
+                AND pm.arrival_facility_nm NOT LIKE '%정박지%'
                 AND (
                     pr.cs IS NOT NULL
-                    OR dc.arrival_at_utc > now() - make_interval(hours => :grace_hours)
+                    OR pm.arrival_at_utc > now() - make_interval(hours => :grace_hours)
                 )
             )
             -- (나) AIS 가 실제로 부두에 붙어 있다고 말하는 배.
@@ -154,28 +167,30 @@ _QUERY_ASSESSMENT_TARGETS = text("""
             --      '지금 붙어 있다'가 관측이고 그게 판정 대상이다.
             OR lv.wharf_name IS NOT NULL
           )
-    ORDER BY dc.arrival_at_utc ASC NULLS LAST
+    ORDER BY pm.arrival_at_utc ASC NULLS LAST
 """)
 
 
 def _target_wharf(row: dict) -> tuple[str | None, str]:
     """검증할 계류시설과 그 출처.
 
-    PORT-MIS 배정을 먼저 본다 — 그게 공식 기록이고, AIS 는 아직 이동 중일 수 있다.
-    PORT-MIS 가 정박지거나 비어 있으면 AIS 실측으로 내려간다.
+    [2026-09-27] 실제로 붙어 있는 부두(mart.vessel_presence 의 BERTH)를 먼저 본다.
+    예전엔 신고 선석을 먼저 봤다 — "AIS 는 아직 이동 중일 수 있다"는 이유였는데,
+    BERTH 는 정지한 배만 잡으므로 이동 중인 배는 여기 오지 않는다. 반대로 신고 선석은
+    이선을 따라가지 못한다. 실측(9/27): 신고 선석으로 판정한 9척이 0.8~9.4km 떨어진
+    다른 부두에 멈춰 있었고, 그중 4척은 VTS 이선·접안 이벤트가 실제 위치와 같았다.
 
-    [2026-09-22] 그 배정 기록에 출항까지 신고돼 있으면 지난 입항의 기록이다 — 이번
-    입항은 아직 PORT-MIS 에 없거나 수집창 밖이다. 그때는 실제로 붙어 있는 자리를 본다.
-    실측: SUN BIRDIE 는 지금 정일1부두(107 m)에 붙어 있는데 7/25 입·출항 기록의
-    '정일스톨트헤븐울산신항3부두'로 하역중 판정을 받았다.
+    아직 붙지 않은 배(입항 전·묘박)는 PORT-MIS 신고 계류시설로 사전 검토한다.
+    정박지 신고이거나 출항 예정 시각이 지난 신고는 쓰지 않는다.
     """
-    assigned = (row.get("assigned_facility_name") or "").strip()
-    closed = row.get("assigned_departure_at_utc") is not None
-    if assigned and "정박지" not in assigned and not closed:
-        return assigned, "PORT-MIS"
     moored = (row.get("moored_wharf_name") or "").strip()
     if moored:
         return moored, "AIS"
+    assigned = (row.get("assigned_facility_name") or "").strip()
+    departure = row.get("assigned_departure_at_utc")
+    closed = departure is not None and departure <= datetime.now(timezone.utc)
+    if assigned and "정박지" not in assigned and not closed:
+        return assigned, "PORT-MIS"
     return None, "없음"
 
 

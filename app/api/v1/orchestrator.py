@@ -118,11 +118,22 @@ class AssessAndRecordRequest(OrchestratorRequest):
 
 # 시점(stage)은 AIS 항해상태로만 정한다 — 프런트가 보낸 값을 믿지 않고 여기서 읽는다.
 # PORT-MIS 를 쓰지 않는 이유는 app/models/assessment_history.py::AssessmentStage 참고.
+# [2026-09-27] facility_name 은 PORT-MIS(10분 주기) 신고 계류시설이다. 예전엔
+# dashboard_current.facility_name(= 하루 1번 수집되는 VTS 이력의 첫 행)을 읽어
+# 스냅샷의 portmis_facility 칸에 VTS 선석이 남았다(arrival_watcher 와 같은 문제).
 _QUERY_LIVE_STATE = text("""
-    SELECT nav_status_code, received_at_utc, facility_name, draught
-    FROM mart.dashboard_current
-    WHERE callsgn = :call_sign
-    ORDER BY received_at_utc DESC NULLS LAST
+    SELECT dc.nav_status_code, dc.received_at_utc, pm.arrival_facility_nm AS facility_name, dc.draught
+    FROM mart.dashboard_current dc
+    LEFT JOIN LATERAL (
+        SELECT p.arrival_facility_nm
+        FROM portmis_vessel p
+        WHERE upper(btrim(p.callsgn)) = upper(btrim(dc.callsgn))
+          AND p.arrival_at_utc <= now() + interval '12 hours'
+        ORDER BY p.arrival_at_utc DESC
+        LIMIT 1
+    ) pm ON true
+    WHERE dc.callsgn = :call_sign
+    ORDER BY dc.received_at_utc DESC NULLS LAST
     LIMIT 1
 """)
 
