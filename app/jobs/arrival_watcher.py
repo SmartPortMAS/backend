@@ -40,15 +40,18 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 
-from app.agents.orchestrator.schemas import OrchestratorRequest
+from app.agents.orchestrator.schemas import OrchestratorRequest, OrchestratorResult
 from app.agents.orchestrator.service import orchestrate
 from app.agents.safety.schemas import CargoRef
 from app.agents.scheduling.schemas import VesselSpec
 from app.database import AsyncSessionFactory
+from app.llm.base import LLMClient
 from app.llm.factory import get_llm_client
-from app.models.assessment_history import AssessmentLevel
+from app.llm.null_client import NullLLMClient
+from app.models.assessment_history import AssessmentLevel, AssessmentStage
 from app.neo4j_client import neo4j_client
 from app.services.assessment import (
+    is_unchanged_from_last,
     record_assessment,
     record_from_orchestrator,
     stage_from_nav_status,
@@ -204,6 +207,29 @@ def _snapshot(row: dict, *, source: str, target: str | None) -> dict:
     }
 
 
+async def judge_with_llm_on_change(
+    db,
+    neo4j_driver,
+    llm_client: LLMClient,
+    request: OrchestratorRequest,
+    *,
+    call_sign: str,
+    stage: AssessmentStage | None,
+) -> OrchestratorResult | None:
+    """판정하되 LLM 은 결과가 바뀔 때만 부른다. 바뀌지 않았으면 None.
+
+    [2026-09-26] 같은 배를 10분마다 다시 판정하는 건 게이트 인터락이 변화(기상·이웃 화물·
+    시점)를 제때 받게 하려는 것이다. 그런데 기록은 결과가 바뀔 때만 남고(record_assessment),
+    LLM 은 문장만 쓴다 — 기록하지 않는 회차의 LLM 문장은 버려졌다(배당 2회 × 56척 × 10분).
+    그래서 LLM 없이 먼저 판정해 변화를 가리고, 바뀌었을 때만 LLM 을 붙여 다시 판정한다.
+    규칙 판정은 한 척 1초 안팎이라 두 번 돌아도 부담이 작다.
+    """
+    result = await orchestrate(db, neo4j_driver, NullLLMClient(), request)
+    if await is_unchanged_from_last(db, call_sign=call_sign, stage=stage, result=result):
+        return None
+    return await orchestrate(db, neo4j_driver, llm_client, request)
+
+
 async def watch_arrivals() -> None:
     """검증 대상을 순회하며 판정을 `assessment_history` 에 남긴다."""
     llm_client = get_llm_client()
@@ -293,9 +319,16 @@ async def watch_arrivals() -> None:
 
         async with AsyncSessionFactory() as db:
             try:
-                result = await orchestrate(db, neo4j_client.driver, llm_client, request)
+                result = await judge_with_llm_on_change(
+                    db, neo4j_client.driver, llm_client, request, call_sign=callsgn, stage=stage,
+                )
             except Exception:
                 logger.exception("watch_arrivals: %s 오케스트레이터 호출 실패", callsgn)
+                continue
+
+            if result is None:
+                skipped += 1
+                logger.info("watch_arrivals: %s -> 변화 없음(LLM·기록 생략)", callsgn)
                 continue
 
             wrote = await record_from_orchestrator(

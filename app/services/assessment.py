@@ -251,6 +251,13 @@ _QUERY_LAST = text("""
 """)
 
 
+def _same_as_last(last, stage_value: str, level: AssessmentLevel,
+                  action_value: str | None, suggested_key: str) -> bool:
+    """직전 기록과 시점·등급·조치안·제안이 모두 같은가 — 같으면 새로 기록하지 않는다."""
+    return last is not None and last["stage"] == stage_value and last["level"] == level.value \
+        and last["action"] == action_value and last["suggested_key"] == suggested_key
+
+
 async def record_assessment(
     db: AsyncSession,
     *,
@@ -284,8 +291,7 @@ async def record_assessment(
     action_value = action.value if action is not None else None
 
     last = (await db.execute(_QUERY_LAST, {"call_sign": call_sign})).mappings().first()
-    if last is not None and last["stage"] == stage_value and last["level"] == level.value \
-            and last["action"] == action_value and last["suggested_key"] == suggested_key:
+    if _same_as_last(last, stage_value, level, action_value, suggested_key):
         return False
 
     recipient = _RECIPIENT_BY_STAGE.get(stage) if (stage is not None and action is not None) else None
@@ -308,6 +314,42 @@ async def record_assessment(
     return True
 
 
+def _action_for(level: AssessmentLevel, stage: AssessmentStage | None) -> AssessmentAction | None:
+    # 조치안은 **판정이 섰고 그 판정이 '적합'이 아닐 때만** 붙는다.
+    # 받는 곳은 시점이 정한다(회의 §3).
+    #
+    # '판정불가'에는 조치안을 달지 않는다. 근거가 없어서 판단을 못 한 건인데
+    # "대체 선석을 검토하라"고 권하면 근거 없는 조언이 된다 — 실제로 필요한 건
+    # 배를 옮기는 게 아니라 **빠진 근거를 채우는 것**이다(표기 미해소면 별칭 사전,
+    # 흘수 미상이면 선박제원). 등급 자체가 그 사실을 이미 말하고 있다.
+    actionable = level in (AssessmentLevel.UNFIT, AssessmentLevel.CAUTION)
+    return _ACTION_BY_STAGE.get(stage) if (actionable and stage is not None) else None
+
+
+def _suggested_key(result: OrchestratorResult) -> str:
+    return ",".join(c.wharf_name for c in sorted(result.suggested_alternatives, key=lambda x: x.rank))
+
+
+async def is_unchanged_from_last(
+    db: AsyncSession,
+    *,
+    call_sign: str,
+    stage: AssessmentStage | None,
+    result: OrchestratorResult,
+) -> bool:
+    """이 결과를 record_from_orchestrator 에 넘기면 '변화 없음'으로 기록이 생략되는가.
+
+    판정 잡이 LLM 을 부르기 전에 쓴다(2026-09-26). 기록 여부를 가르는 값(시점·등급·
+    조치안·제안)은 전부 규칙으로 정해지므로 LLM 없이 계산한 결과로 판단할 수 있다.
+    """
+    level, _ = level_from_decision(result)
+    action = _action_for(level, stage)
+    stage_value = stage.value if stage is not None else AssessmentStage.BEFORE_ARRIVAL.value
+    last = (await db.execute(_QUERY_LAST, {"call_sign": call_sign})).mappings().first()
+    return _same_as_last(last, stage_value, level, action.value if action is not None else None,
+                         _suggested_key(result))
+
+
 async def record_from_orchestrator(
     db: AsyncSession,
     *,
@@ -320,16 +362,7 @@ async def record_from_orchestrator(
 ) -> bool:
     """오케스트레이터 결과를 그대로 판정 1건으로 옮긴다."""
     level, headline = level_from_decision(result)
-
-    # 조치안은 **판정이 섰고 그 판정이 '적합'이 아닐 때만** 붙는다.
-    # 받는 곳은 시점이 정한다(회의 §3).
-    #
-    # '판정불가'에는 조치안을 달지 않는다. 근거가 없어서 판단을 못 한 건인데
-    # "대체 선석을 검토하라"고 권하면 근거 없는 조언이 된다 — 실제로 필요한 건
-    # 배를 옮기는 게 아니라 **빠진 근거를 채우는 것**이다(표기 미해소면 별칭 사전,
-    # 흘수 미상이면 선박제원). 등급 자체가 그 사실을 이미 말하고 있다.
-    actionable = level in (AssessmentLevel.UNFIT, AssessmentLevel.CAUTION)
-    action = _ACTION_BY_STAGE.get(stage) if (actionable and stage is not None) else None
+    action = _action_for(level, stage)
 
     action_detail = None
     if action is not None:
@@ -351,7 +384,5 @@ async def record_from_orchestrator(
         action=action,
         action_detail=action_detail,
         input_snapshot=input_snapshot,
-        suggested_key=",".join(
-            c.wharf_name for c in sorted(result.suggested_alternatives, key=lambda x: x.rank)
-        ),
+        suggested_key=_suggested_key(result),
     )
