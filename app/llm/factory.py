@@ -30,6 +30,28 @@ def get_llm_client() -> LLMClient:
 
 
 @lru_cache
+def get_chatbot_llm_client() -> LLMClient:
+    """챗봇용 LLMClient. settings.chatbot_llm_model 이 있으면 그 모델, 없으면 llm_model.
+
+    provider 는 get_llm_client 와 같다 — 챗봇만 다른 provider 를 쓸 이유가 아직 없다.
+    """
+    settings = get_settings()
+    model = settings.chatbot_llm_model or settings.llm_model
+
+    if settings.llm_provider == "gemini":
+        if not settings.gemini_api_key:
+            raise RuntimeError("GEMINI_API_KEY가 설정되지 않았습니다 (.env 확인).")
+        return GeminiClient(api_key=settings.gemini_api_key, model=model)
+
+    if settings.llm_provider == "openai":
+        if not settings.openai_api_key:
+            raise RuntimeError("OPENAI_API_KEY가 설정되지 않았습니다 (.env 확인).")
+        return OpenAiClient(api_key=settings.openai_api_key, model=model)
+
+    raise ValueError(f"지원하지 않는 llm_provider: {settings.llm_provider}")
+
+
+@lru_cache
 def get_embedding_client() -> EmbeddingClient:
     """settings.embedding_provider 값에 따라 EmbeddingClient 구현체를 고른다.
 

@@ -2,6 +2,8 @@
 
 from enum import Enum
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.agents.safety.schemas import SafetyAssessmentResult
@@ -14,7 +16,8 @@ class Intent(str, Enum):
     INCOMPATIBLE_LIST = "incompatible_list"  # 특정 화물과 혼재금지인 화물 목록
     CHEMICAL_INFO = "chemical_info"  # 특정 화물의 MSDS 정보
     SAFETY_GENERAL = "safety_general"  # 특정 물질에 매이지 않은 일반 안전 질문
-    OUT_OF_SCOPE = "out_of_scope"  # 화학물질 안전과 무관한 질문
+    OPERATIONS = "operations"  # 지금 부두·선박 현황(어느 배가 어디에, 무엇을 싣고, 판정은) — 2026-09-27
+    OUT_OF_SCOPE = "out_of_scope"  # 화학물질 안전·항만 운영과 무관한 질문
 
 
 class MatchMethod(str, Enum):
@@ -45,6 +48,49 @@ class QueryPlan(BaseModel):
         description="질문에 등장한 화학물질명 원문 그대로 (한글/영문/약칭/CAS번호 포함)",
     )
     reasoning: str = Field(description="분류 근거 한 문장")
+    berths: list[str] = Field(
+        default_factory=list, description="질문에 등장한 부두·선석명 원문 그대로 (예: 'SK3부두')",
+    )
+    vessels: list[str] = Field(
+        default_factory=list, description="질문에 등장한 선박명 또는 호출부호 원문 그대로",
+    )
+    asks_segregation: bool = Field(
+        default=False,
+        description="화물끼리 같이·인접해 둬도 되는지(혼재) 묻는 질문이면 true. "
+        "운영 질문에서 이 값이 true 면 코드가 혼재 판정을 반드시 부른다",
+    )
+
+
+# 혼재 판정(segregation_check)은 후속 도구에 없다 — 필수 근거라 코드가 plan.asks_segregation 으로
+# 부른다. 2026-09-27 평가셋: "D8AG 판정 결과 알려줘"에 모델이 판정을 새로 돌려, 기록된 판정
+# ('주의')과 다른 등급('안전')을 답했다.
+ToolName = Literal["who_is_at", "where_is", "incompatible_list", "msds_search"]
+
+
+class ToolCall(BaseModel):
+    """챗봇 후속 도구 호출 하나 (27번 설계안 C단계)."""
+
+    tool: ToolName
+    targets: list[str] = Field(
+        default_factory=list,
+        description="who_is_at=부두명 1개, where_is=선박명/호출부호 1개, "
+        "incompatible_list=화물명 1개, msds_search=화물명(없으면 빈 배열)",
+    )
+    query: str | None = Field(default=None, description="msds_search 에서만 쓰는 검색 문장")
+
+
+class FollowUpPlan(BaseModel):
+    """운영 근거를 본 뒤 LLM 이 고르는 후속 도구 호출(최대 3개). 필요 없으면 빈 배열."""
+
+    calls: list[ToolCall] = Field(default_factory=list)
+    reasoning: str = Field(description="이 도구들을 고른 이유 한 문장")
+
+
+class OperationalEvidence(BaseModel):
+    """운영 도구(who_is_at · where_is) 결과를 답변 근거로 옮긴 것."""
+
+    title: str = Field(description="예: '부두 현황: S-Oil 2부두'")
+    lines: list[str] = Field(default_factory=list)
 
 
 class ChemicalMatch(BaseModel):
@@ -134,6 +180,11 @@ class LLMAnswer(BaseModel):
     )
     data_insufficient: bool = Field(
         description="제공된 근거만으로 질문에 답할 수 없으면 true"
+    )
+    conclusion_level: str | None = Field(
+        default=None,
+        description="답변이 결론으로 내린 혼재 위험등급(안전|주의|위험|배정불가). "
+        "[안전관제 에이전트 판정]이 없거나 등급을 말하지 않았으면 null",
     )
 
 
@@ -330,6 +381,12 @@ class ChatResponse(BaseModel):
     )
     sources: list[str] = Field(
         default_factory=list, description="근거 출처 표기용 (예: 'MSDS 벤젠 / CAS 71-43-2')"
+    )
+    operational_evidence: list[OperationalEvidence] = Field(
+        default_factory=list, description="운영 도구(부두·선박 현황) 결과 — 2026-09-27"
+    )
+    tools_used: list[str] = Field(
+        default_factory=list, description="이 답변을 위해 부른 도구(호출 순서대로)"
     )
 
 

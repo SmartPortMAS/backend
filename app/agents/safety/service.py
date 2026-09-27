@@ -47,12 +47,14 @@ from .rule_engine import (
     compute_imdg_berth_adjacency_floor,
     compute_packing_floor,
     compute_pair_assessability,
-    compute_risk_floor,
+    compute_risk_floor_by_adjacent,
     find_packing_violation,
 )
 from .schemas import (
     AdjacentCargo,
     BulkCompatibilityConflict,
+    CargoRef,
+    CargoVerdictSummary,
     ImdgSegregationConflict,
     ImdgUnconfirmedPair,
     IncompatibleConflict,
@@ -60,6 +62,7 @@ from .schemas import (
     PackagingViolation,
     RiskLevel,
     SafetyAssessmentRequest,
+    risk_level_rank,
     SafetyAssessmentResult,
     SafetyVerdict,
     UnassessedPair,
@@ -96,6 +99,27 @@ def _assessability_reason(
     if not target_classes:
         missing.append(f"'{target_name}'이 어느 혼재금지 부류에도 분류되지 않음")
     return " / ".join(missing) if missing else "판정 근거 일부 결측"
+
+
+def _bulk_chart_applies(group: tuple[int, str, str] | None) -> bool:
+    """46 CFR Part 150 그룹 차트로 판정할 수 있는 그룹인가 — 그룹이 있고 특수물질(0)이 아니다."""
+    return group is not None and group[1] != "special"
+
+
+def _bulk_group_gap(
+    *,
+    target_name: str,
+    adjacent_name: str,
+    target_group: tuple[int, str, str] | None,
+    adjacent_group: tuple[int, str, str] | None,
+) -> str:
+    """벌크 그룹 쪽에서 무엇이 비어 판정 근거가 MSDS로 넘어왔는지 적는다."""
+    missing = [
+        f"'{name}'은 46 CFR Part 150 호환성 그룹 " + ("미등재" if group is None else "특수물질(차트 비적용)")
+        for name, group in ((target_name, target_group), (adjacent_name, adjacent_group))
+        if not _bulk_chart_applies(group)
+    ]
+    return " / ".join(missing)
 
 
 async def _resolve_adjacent_cargos(
@@ -147,15 +171,59 @@ class _Verdict:
     rule_engine_floor: RiskLevel
     imdg_classes: dict[str, str]
     hazard_summary: dict[str, list[str]]
+    unload_method_name: str | None = None  # 포장 검사를 했는지 LLM 입력에 적는다
+
+
+async def _compute_verdicts(
+    db: AsyncSession,
+    neo4j_driver: AsyncDriver,
+    request: SafetyAssessmentRequest,
+) -> tuple[_Verdict, list[CargoVerdictSummary]]:
+    """배가 실은 화물마다 판정하고, 가장 위험한 화물의 판정을 대표로 돌려준다.
+
+    [2026-09-25] 전에는 target_cargo 하나만 봤다. 입항 판정이 그 배의 화물 여러 개 중
+    ORDER BY 없는 LIMIT 1 로 하나를 골랐기 때문에, 메탄올이 옆 배 화물과 충돌해도
+    벤젠이 뽑히면 '안전'이 나왔다. 이제 화물마다 같은 판정 함수를 돌린다(화물당
+    실측 약 45ms). 등급이 같으면 요청 순서상 앞 화물을 대표로 쓴다.
+    """
+    verdicts: list[_Verdict] = []
+    seen_chem: set[str] = set()
+    for cargo in request.all_targets():
+        verdict = await _compute_verdict(db, neo4j_driver, request, target_cargo=cargo)
+        # 같은 물질이 다른 키(cas_no 만 / chem_id)로 두 번 올 수 있다 — 해석된 chem_id 로 한 번만.
+        if verdict.target_row.chem_id in seen_chem:
+            continue
+        seen_chem.add(verdict.target_row.chem_id)
+        verdicts.append(verdict)
+    governing = max(
+        enumerate(verdicts), key=lambda iv: (risk_level_rank(iv[1].rule_engine_floor), -iv[0])
+    )[1]
+    summaries = [
+        CargoVerdictSummary(
+            target_cargo_name=_cargo_display_name(v.target_row),
+            chem_id=v.target_row.chem_id,
+            risk_level=v.rule_engine_floor,
+            conflict_count=len(v.conflicts),
+            bulk_conflict_count=len(v.bulk_compatibility_conflicts),
+            packaging_violation_count=len(v.packaging_violations),
+            unassessed_count=len(v.unassessed_pairs),
+            is_governing=v is governing,
+        )
+        for v in verdicts
+    ]
+    return governing, summaries
 
 
 async def _compute_verdict(
     db: AsyncSession,
     neo4j_driver: AsyncDriver,
     request: SafetyAssessmentRequest,
+    *,
+    target_cargo: CargoRef | None = None,
 ) -> _Verdict:
-    """LLM을 부르지 않고 등급과 근거를 확정한다."""
-    target_row = await resolve_cargo(db, request.target_cargo)
+    """화물 하나에 대해 LLM을 부르지 않고 등급과 근거를 확정한다."""
+    target_cargo = target_cargo or request.target_cargo
+    target_row = await resolve_cargo(db, target_cargo)
 
     # [2026-08-23] 인접 화물 해석을 배치로 바꿨다. 이전에는 리스트 컴프리헨션
     # 안에서 화물마다 순차 await 했는데, 실제 스케줄링 응답의 인접 화물이 9종까지
@@ -245,7 +313,7 @@ async def _compute_verdict(
     ]
 
     packing_violation_raw = find_packing_violation(
-        target_row.packing_group, request.target_cargo.unload_method_name
+        target_row.packing_group, target_cargo.unload_method_name
     )
     packaging_violations = (
         [PackagingViolation(**packing_violation_raw)] if packing_violation_raw else []
@@ -325,11 +393,24 @@ async def _compute_verdict(
     # 판정 가능성 축 (2026-08-23 추가) — "충돌 없음"이 "안전 확인"인지 "볼 근거가
     # 없었음"인지 가른다. 후자는 최소 주의로 격상해 관제사에게 드러낸다.
     # 근거와 실측치는 rule_engine.compute_pair_assessability 주석 참고.
+    #
+    # [2026-09-27] 벌크 호환성 그룹을 판정 가능성의 1차 근거로 올렸다.
+    # MSDS 축은 KOSHA 10항 '피해야 할 물질'(J08)에 기댄다. 원문 직접 호출로 확인하니
+    # 151종 중 91종이 '자료없음', 26종이 "가연성 물질, 환원성 물질" 같은 상투 문구라
+    # MSDS만으로는 대부분의 쌍이 '볼 근거 없음'이 된다. 반면 46 CFR Part 150은
+    # 두 화물의 그룹을 알면 Figure 1(그룹 차트)과 Appendix I(개별 예외)로 그 쌍의
+    # 호환 여부가 규정상 정해진다 — 인접 탱크 기준이라 인접 선석보다 엄격하다.
+    # 그래서 양쪽 그룹이 모두 확인되고 둘 다 특수물질(0번, 차트 비적용)이 아니면
+    # '판정함'으로 본다. MSDS 충돌은 이와 별개로 계속 등급을 올린다(명시된 위험은 그대로).
     target_avoids, target_classes = facts.get(target_row.chem_id, (set(), set()))
+    target_bulk_group = groups_by_chem_id.get(target_row.chem_id)
 
     unassessed_pairs: list[UnassessedPair] = []
     worst_assessability = Assessability.FULL
     for berth_name, _distance_m, row in adjacent_resolved:
+        adj_bulk_group = groups_by_chem_id.get(row.chem_id)
+        if _bulk_chart_applies(target_bulk_group) and _bulk_chart_applies(adj_bulk_group):
+            continue
         adj_avoids, adj_classes = facts.get(row.chem_id, (set(), set()))
         assessability = compute_pair_assessability(
             target_avoids=target_avoids,
@@ -348,7 +429,12 @@ async def _compute_verdict(
                 adjacent_chem_id=row.chem_id,
                 adjacent_name=row.name_ko or row.chem_id,
                 assessability=assessability.value,
-                reason=_assessability_reason(
+                reason=_bulk_group_gap(
+                    target_name=_cargo_display_name(target_row),
+                    adjacent_name=row.name_ko or row.chem_id,
+                    target_group=target_bulk_group,
+                    adjacent_group=adj_bulk_group,
+                ) + " / " + _assessability_reason(
                     target_name=_cargo_display_name(target_row),
                     adjacent_name=row.name_ko or row.chem_id,
                     target_avoids=target_avoids & live_categories,
@@ -362,7 +448,7 @@ async def _compute_verdict(
     rule_engine_floor = max_risk_level(
         max_risk_level(
             max_risk_level(
-                compute_risk_floor(raw_conflicts),
+                compute_risk_floor_by_adjacent(raw_conflicts),
                 compute_imdg_berth_adjacency_floor(raw_imdg_conflicts),
             ),
             compute_packing_floor(packing_violation_raw),
@@ -385,6 +471,7 @@ async def _compute_verdict(
         rule_engine_floor=rule_engine_floor,
         imdg_classes=imdg_classes,
         hazard_summary=hazard_summary,
+        unload_method_name=target_cargo.unload_method_name,
     )
 
 
@@ -400,7 +487,7 @@ async def assess_verdict(
     /safety/assess가 돌려주는 risk_level과 **항상 같다** — 실측으로도 격상률이
     0%다(48회). 먼저 보여준 등급이 뒤집히지 않으므로 조기 표시가 안전하다.
     """
-    v = await _compute_verdict(db, neo4j_driver, request)
+    v, summaries = await _compute_verdicts(db, neo4j_driver, request)
     return SafetyVerdict(
         target_cargo_name=_cargo_display_name(v.target_row),
         risk_level=v.rule_engine_floor,
@@ -413,7 +500,41 @@ async def assess_verdict(
         unassessed_pairs=v.unassessed_pairs,
         msds_sections_used=list(v.hazard_summary.keys()),
         imdg_classes=v.imdg_classes,
+        cargo_verdicts=summaries,
     )
+
+
+def _checked_facts(v: _Verdict, adjacent_count: int) -> str:
+    """무엇을 검사했고 결과가 무엇인지 — 코드가 확정하는 첫 문장.
+
+    [2026-09-27] LLM 에 맡기면 이웃 0건·하역방식 미신고인 판정에서도 "인접 선석 충돌
+    없음으로 확인", "포장·하역방식 검증이 이루어졌으며", "기본 조치는 이행 중"처럼 하지
+    않은 검사를 했다고 썼다(입력 문구를 바로잡은 뒤에도 재현). 챗봇 결론 등급과 같은
+    원칙으로, 검사 사실은 근거에서 기계적으로 만든다. 여러 화물을 실은 배면 대표 화물
+    기준이다(나머지 화물 등급은 cargo_verdicts).
+    """
+    name = _cargo_display_name(v.target_row)
+    parts: list[str] = []
+    if adjacent_count == 0:
+        parts.append("인접 선석에 비교할 화물이 없어 혼재 검사 대상이 없었습니다")
+    else:
+        n_conf = len({c.adjacent_chem_id for c in v.conflicts}
+                     | {c.adjacent_chem_id for c in v.bulk_compatibility_conflicts})
+        if n_conf:
+            parts.append(f"인접 화물 중 {n_conf}종과 충돌이 있습니다"
+                         f"(MSDS {len(v.conflicts)}건 · 46 CFR 150 {len(v.bulk_compatibility_conflicts)}건)")
+        else:
+            parts.append(f"인접 화물 {adjacent_count}건과 MSDS·46 CFR 150 기준 충돌이 없습니다")
+        n_un = len({p.adjacent_chem_id for p in v.unassessed_pairs})
+        if n_un:
+            parts.append(f"그중 {n_un}종은 판정 근거가 없어 확인이 필요합니다")
+    if v.packaging_violations:
+        parts.append("포장·하역방식 부적합이 있습니다")
+    elif not v.unload_method_name:
+        parts.append("포장·하역방식은 하역방식이 신고되지 않아 검사하지 않았습니다")
+    else:
+        parts.append("포장·하역방식 부적합은 없습니다")
+    return f"[혼재 판정 {v.rule_engine_floor.value} · {name} 기준] " + ". ".join(parts) + "."
 
 
 async def assess_safety(
@@ -422,8 +543,12 @@ async def assess_safety(
     llm_client: LLMClient,
     request: SafetyAssessmentRequest,
 ) -> SafetyAssessmentResult:
-    """판정 + LLM 서술. 응답 형태는 종전과 동일하다."""
-    v = await _compute_verdict(db, neo4j_driver, request)
+    """판정 + LLM 서술. 응답 형태는 종전과 같고 cargo_verdicts 만 늘었다.
+
+    LLM 서술은 대표(가장 위험한) 화물 하나에 대해서만 만든다 — 화물마다 부르면
+    호출 비용이 화물 수만큼 늘어난다. 나머지 화물의 등급은 cargo_verdicts 로 보인다.
+    """
+    v, summaries = await _compute_verdicts(db, neo4j_driver, request)
 
     llm_result = await llm_client.generate_structured(
         system_prompt=SYSTEM_PROMPT,
@@ -435,6 +560,8 @@ async def assess_safety(
             packaging_violations=v.packaging_violations,
             unassessed_pairs=v.unassessed_pairs,
             rule_engine_floor=v.rule_engine_floor,
+            adjacent_count=len(request.adjacent_cargos),
+            unload_method_name=v.unload_method_name,
         ),
         schema=LLMAssessment,
     )
@@ -459,7 +586,7 @@ async def assess_safety(
             llm_result.checklist, v.target_row.un_no, v.target_row.cas_no,
         ),
         key_hazards=llm_result.key_hazards,
-        reasoning=llm_result.reasoning,
+        reasoning=_checked_facts(v, len(request.adjacent_cargos)) + "\n" + llm_result.reasoning,
         conflicts=v.conflicts,
         # IMDG 항목은 **참고 정보**로 응답에 남긴다 — 판정 근거와 LLM 프롬프트
         # 에서는 빠졌지만, 관제사가 "이 조합이 국제 규정상 선내 격리 대상인가"를
@@ -472,4 +599,5 @@ async def assess_safety(
         rule_engine_floor=v.rule_engine_floor,
         msds_sections_used=list(v.hazard_summary.keys()),
         imdg_classes=v.imdg_classes,
+        cargo_verdicts=summaries,
     )

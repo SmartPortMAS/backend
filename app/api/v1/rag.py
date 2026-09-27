@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.chatbot.citations import build_citations
 from app.agents.chatbot.schemas import RagAssessment, RagQueryRequest, RagQueryResponse
 from app.agents.chatbot.service import answer_question
-from app.core.deps import get_embedding_client, get_llm_client, get_session
+from app.core.deps import get_chatbot_llm_client, get_embedding_client, get_session
 from app.core.exceptions import (
     EmbeddingGenerationError,
     EmbeddingIndexEmptyError,
@@ -71,7 +71,7 @@ _RESPONSES: dict = {
 async def query(
     request: RagQueryRequest,
     db: AsyncSession = Depends(get_session),
-    llm_client: LLMClient = Depends(get_llm_client),
+    llm_client: LLMClient = Depends(get_chatbot_llm_client),
     embedding_client: EmbeddingClient = Depends(get_embedding_client),
 ) -> RagQueryResponse:
     try:

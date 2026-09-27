@@ -380,6 +380,38 @@ async def get_berth_current_cargo(db: AsyncSession = Depends(get_session)) -> li
 
 
 # --------------------------------------------------------------------------
+# [2026-09-25] 선박별 화물 — 선석에 붙었든 아니든 **지금의 입항 건** 화물.
+#
+# 화면이 선박 화물을 /berth-cargo 에서 가져오고 있었다. 그 뷰는
+# vessel_presence.presence_zone='BERTH' 인 배만 담으므로, 항해 중·정박지의 배는
+# 입항 건에 화물이 있어도 "화물 미신고"로 보였고, 상세 패널은 그 빈자리를 선종
+# 추정 화물(케미칼선이면 벤젠)로 채워 판정까지 그걸로 돌렸다
+# (2026-09-25 크롬 확인: 목록의 액체화물선 12척 전부 입항 건 화물 1~5종 보유,
+#  berth-cargo 에는 0건).
+# 컬럼은 berth-cargo 와 맞춘다(어댑터가 같은 방식으로 읽게). 조건도 같다 —
+# UN 번호 없는 행('물질 미특정')은 뺀다.
+# --------------------------------------------------------------------------
+
+_QUERY_VESSEL_CARGO = text("""
+    SELECT vc.callsgn, vc.port_call_key, vc.basis AS call_basis,
+           cm.facility_name, cm.chem_id, cm.cas_no, cm.dg_un_no,
+           COALESCE(cm.msds_name_ko, cm.cargo_name_raw) AS cargo_name,
+           cm.imdg_class, cm.packing_group, cm.msds_matched, cm.is_synthetic, cm.cargo_basis
+    FROM mart.vessel_current_call vc
+    JOIN mart.cargo_msds cm ON cm.port_call_key = vc.port_call_key
+    WHERE cm.dg_un_no IS NOT NULL
+    ORDER BY vc.callsgn, cm.bl_no
+""")
+
+
+@router.get("/vessel-cargo", summary="선박별 현재 입항 건 화물 조회")
+async def get_vessel_cargo(db: AsyncSession = Depends(get_session)) -> list[dict]:
+    """배마다 지금의 입항 건(mart.vessel_current_call)에 실린 화물. 입항 건을 못 정한 배는 없다."""
+    rows = (await db.execute(_QUERY_VESSEL_CARGO)).mappings().all()
+    return [dict(row) for row in rows]
+
+
+# --------------------------------------------------------------------------
 # 수집기 생존 신호 — mart.pipeline_health.
 #
 # "지도에 배가 없다"와 "수집기가 죽어서 배가 안 보인다"는 다른 상황이다.
@@ -653,6 +685,7 @@ _QUERY_BERTH_ASSIGNMENTS = text("""
            la.id AS assessment_id, la.stage, la.level, la.action, la.recipient,
            la.reasons, la.acknowledged_by, la.assessed_at_utc,
            cm.chem_id AS cargo_chem_id, mc.name_ko AS cargo_name,
+           cl.cargo_names,
            -- 실제 입출항은 PORT-MIS(공식 신고)를 우선하고 VTS 로 보충한다.
            -- 다만 PORT-MIS 는 수집창 [어제, 오늘+3일] 밖이면 동결되므로
            -- portmis_collected_at 을 함께 내려보내 화면이 신선도를 알 수 있게 한다.
@@ -676,14 +709,30 @@ _QUERY_BERTH_ASSIGNMENTS = text("""
     LEFT JOIN live lv ON lv.wharf_name = b.wharf_name
     LEFT JOIN latest_assessment la ON upper(btrim(la.call_sign)) = upper(btrim(lv.callsgn))
     LEFT JOIN LATERAL (
-        SELECT cm2.chem_id FROM mart.cargo_msds cm2
-        WHERE upper(btrim(cm2.callsgn)) = upper(btrim(lv.callsgn)) AND cm2.chem_id IS NOT NULL
+        -- [0030] 콜사인이 아니라 지금의 입항 건으로 — 재입항 배의 지난 항차 화물 배제.
+        SELECT cm2.chem_id
+        FROM mart.vessel_current_call vc
+        JOIN mart.cargo_msds cm2 ON cm2.port_call_key = vc.port_call_key
+        WHERE vc.callsgn = upper(btrim(lv.callsgn)) AND cm2.chem_id IS NOT NULL
         -- ORDER BY 없는 LIMIT 1 은 한 배에 화물이 여럿일 때 어느 물질이 뽑힐지
         -- 우연에 맡긴다 — 인화점·IMDG 등급이 달라 화면 표시가 실제로 흔들린다.
         ORDER BY cm2.chem_id
         LIMIT 1
     ) cm ON true
     LEFT JOIN msds_chemical mc ON mc.chem_id = cm.chem_id
+    -- [2026-09-25] 한 입항 건의 화물 전부(이름). 위 cm 은 판정용 대표 1종이고,
+    -- 화면에는 실은 화물을 다 보여준다 — 1종만 보이면 여러 화물을 실은 배가
+    -- 단일 화물선처럼 읽힌다.
+    LEFT JOIN LATERAL (
+        SELECT array_agg(x.name ORDER BY x.name) AS cargo_names
+        FROM (
+            SELECT DISTINCT coalesce(cm3.msds_name_ko, cm3.cargo_name_raw) AS name
+            FROM mart.vessel_current_call vc3
+            JOIN mart.cargo_msds cm3 ON cm3.port_call_key = vc3.port_call_key
+            WHERE vc3.callsgn = upper(btrim(lv.callsgn))
+              AND coalesce(cm3.msds_name_ko, cm3.cargo_name_raw) IS NOT NULL
+        ) x
+    ) cl ON true
     LEFT JOIN LATERAL (
         SELECT pv.arrival_at_utc, pv.departure_at_utc, pv.departure_sched_utc, pv.collected_at_utc
         FROM portmis_vessel pv
@@ -751,6 +800,7 @@ async def get_berth_assignments(db: AsyncSession = Depends(get_session)) -> list
                 "vessel_name": row["vessel_name"],
                 "cargo_chem_id": row["cargo_chem_id"],
                 "cargo_name": row["cargo_name"],
+                "cargo_names": list(row["cargo_names"] or []),
                 # 실측 접안 근거 — 판정 방식('신고+위치'/'위치'/'신고'), 부두
                 # 대표좌표까지의 거리, 관측 시각, 그리고 그 관측의 신선도.
                 "berth_basis": row["berth_basis"],
