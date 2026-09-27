@@ -60,3 +60,42 @@ async def test_safety_pair(db, neo4j, target, adjacent, lo, hi, msds_conflict):
         assert bool(verdict.conflicts) is msds_conflict, (
             f"{target}↔{adjacent}: MSDS 충돌 {[c.shared_category for c in verdict.conflicts]}"
         )
+
+
+# ── 벌크 그룹 판정 근거 (2026-09-27) ─────────────────────────────────────────
+# 양쪽 46 CFR Part 150 그룹이 확인되면 그 쌍은 '판정함'이다 — 미평가 쌍이 없어야 한다.
+# 예전에는 MSDS '피해야 할 물질'이 비어 크실렌·암모니아가 낀 쌍이 전부 '확인요청'이었다.
+# (대상, 인접, 벌크 충돌이 있어야 하나)
+BULK_CASES = [
+    ("크실렌", "케로젠", False),                 # 32 ↔ 33 — 화물그룹끼리는 반응하지 않는다
+    ("암모니아", "가솔린", False),               # 6 ↔ 33 — 차트상 호환
+    # Appendix I(b) — 차트상 호환이지만 원문이 금지한 조합 (9/27 전에는 통과했다)
+    ("아크릴로니트릴", "수산화나트륨", True),
+    ("메틸 아크릴로니트릴", "수산화 칼륨", True),
+    ("트리클로로에틸렌", "수산화나트륨", True),
+    ("이염화에틸렌", "1,2-디아미노에탄", True),
+    ("메틸삼차 부틸에테르", "인산", True),
+    # Appendix I(a) — 차트상 비호환(5↔20)이지만 원문이 시험으로 풀어 준 조합 (9/27 전에는 막았다)
+    ("수산화나트륨", "메틸 알코올", False),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target,adjacent,bulk_conflict", BULK_CASES,
+                         ids=[f"{c[0]}-{c[1]}" for c in BULK_CASES])
+async def test_bulk_group_basis(db, neo4j, target, adjacent, bulk_conflict):
+    request = SafetyAssessmentRequest(
+        target_cargo=CargoRef(chem_id=await _chem_id(db, target)),
+        adjacent_cargos=[AdjacentCargo(
+            berth_name="평가", cargo=CargoRef(chem_id=await _chem_id(db, adjacent)), distance_m=None,
+        )],
+    )
+    verdict = await assess_verdict(db, neo4j, request)
+    assert not verdict.unassessed_pairs, (
+        f"{target}↔{adjacent}: 양쪽 벌크 그룹이 있는데 미평가 {[p.reason for p in verdict.unassessed_pairs]}"
+    )
+    assert bool(verdict.bulk_compatibility_conflicts) is bulk_conflict, (
+        f"{target}↔{adjacent}: 벌크 {[c.reason for c in verdict.bulk_compatibility_conflicts]}"
+    )
+    if bulk_conflict:
+        assert verdict.rule_engine_floor is RiskLevel.BLOCKED

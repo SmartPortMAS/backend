@@ -444,7 +444,9 @@ def _enforce_assessment_level(
     if assessment is None:
         return answer
     level = assessment.risk_level.value
-    if (conclusion_level or "").strip() == level:
+    # 결론 필드가 맞아도 본문에 등급 단어가 없으면 붙인다 — "혼재가 불가합니다"처럼
+    # 풀어 쓰면 관제사 화면에 등급이 안 보인다(9/27 평가셋에서 실측).
+    if (conclusion_level or "").strip() == level and level in answer:
         return answer
     logger.warning("chatbot: 답변 결론 등급 %r 이 판정 등급 %r 과 달라 교정", conclusion_level, level)
     return (

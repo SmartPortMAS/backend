@@ -101,6 +101,27 @@ def _assessability_reason(
     return " / ".join(missing) if missing else "판정 근거 일부 결측"
 
 
+def _bulk_chart_applies(group: tuple[int, str, str] | None) -> bool:
+    """46 CFR Part 150 그룹 차트로 판정할 수 있는 그룹인가 — 그룹이 있고 특수물질(0)이 아니다."""
+    return group is not None and group[1] != "special"
+
+
+def _bulk_group_gap(
+    *,
+    target_name: str,
+    adjacent_name: str,
+    target_group: tuple[int, str, str] | None,
+    adjacent_group: tuple[int, str, str] | None,
+) -> str:
+    """벌크 그룹 쪽에서 무엇이 비어 판정 근거가 MSDS로 넘어왔는지 적는다."""
+    missing = [
+        f"'{name}'은 46 CFR Part 150 호환성 그룹 " + ("미등재" if group is None else "특수물질(차트 비적용)")
+        for name, group in ((target_name, target_group), (adjacent_name, adjacent_group))
+        if not _bulk_chart_applies(group)
+    ]
+    return " / ".join(missing)
+
+
 async def _resolve_adjacent_cargos(
     db: AsyncSession, adjacent_cargos: list[AdjacentCargo]
 ) -> list[tuple[str, float | None, MsdsChemical]]:
@@ -371,11 +392,24 @@ async def _compute_verdict(
     # 판정 가능성 축 (2026-08-23 추가) — "충돌 없음"이 "안전 확인"인지 "볼 근거가
     # 없었음"인지 가른다. 후자는 최소 주의로 격상해 관제사에게 드러낸다.
     # 근거와 실측치는 rule_engine.compute_pair_assessability 주석 참고.
+    #
+    # [2026-09-27] 벌크 호환성 그룹을 판정 가능성의 1차 근거로 올렸다.
+    # MSDS 축은 KOSHA 10항 '피해야 할 물질'(J08)에 기댄다. 원문 직접 호출로 확인하니
+    # 151종 중 91종이 '자료없음', 26종이 "가연성 물질, 환원성 물질" 같은 상투 문구라
+    # MSDS만으로는 대부분의 쌍이 '볼 근거 없음'이 된다. 반면 46 CFR Part 150은
+    # 두 화물의 그룹을 알면 Figure 1(그룹 차트)과 Appendix I(개별 예외)로 그 쌍의
+    # 호환 여부가 규정상 정해진다 — 인접 탱크 기준이라 인접 선석보다 엄격하다.
+    # 그래서 양쪽 그룹이 모두 확인되고 둘 다 특수물질(0번, 차트 비적용)이 아니면
+    # '판정함'으로 본다. MSDS 충돌은 이와 별개로 계속 등급을 올린다(명시된 위험은 그대로).
     target_avoids, target_classes = facts.get(target_row.chem_id, (set(), set()))
+    target_bulk_group = groups_by_chem_id.get(target_row.chem_id)
 
     unassessed_pairs: list[UnassessedPair] = []
     worst_assessability = Assessability.FULL
     for berth_name, _distance_m, row in adjacent_resolved:
+        adj_bulk_group = groups_by_chem_id.get(row.chem_id)
+        if _bulk_chart_applies(target_bulk_group) and _bulk_chart_applies(adj_bulk_group):
+            continue
         adj_avoids, adj_classes = facts.get(row.chem_id, (set(), set()))
         assessability = compute_pair_assessability(
             target_avoids=target_avoids,
@@ -394,7 +428,12 @@ async def _compute_verdict(
                 adjacent_chem_id=row.chem_id,
                 adjacent_name=row.name_ko or row.chem_id,
                 assessability=assessability.value,
-                reason=_assessability_reason(
+                reason=_bulk_group_gap(
+                    target_name=_cargo_display_name(target_row),
+                    adjacent_name=row.name_ko or row.chem_id,
+                    target_group=target_bulk_group,
+                    adjacent_group=adj_bulk_group,
+                ) + " / " + _assessability_reason(
                     target_name=_cargo_display_name(target_row),
                     adjacent_name=row.name_ko or row.chem_id,
                     target_avoids=target_avoids & live_categories,

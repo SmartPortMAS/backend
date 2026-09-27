@@ -30,6 +30,13 @@ def test_mismatched_conclusion_gets_verdict_prefix():
     assert fixed.startswith("**혼재 판정: 배정불가**") and fixed.endswith("판단할 수 없습니다.")
 
 
+def test_matching_conclusion_without_level_word_gets_prefix():
+    from app.agents.chatbot.service import _enforce_assessment_level
+    # 실제 사례(9/27): 결론 필드는 배정불가인데 본문은 "혼재가 불가합니다"뿐
+    fixed = _enforce_assessment_level("혼재가 불가합니다.", _assessment("배정불가"), "배정불가")
+    assert fixed.startswith("**혼재 판정: 배정불가**")
+
+
 def test_no_assessment_no_change():
     from app.agents.chatbot.service import _enforce_assessment_level
     assert _enforce_assessment_level("벤젠의 인화점은 -11 ℃입니다.", None, None) == "벤젠의 인화점은 -11 ℃입니다."

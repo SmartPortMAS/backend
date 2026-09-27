@@ -179,7 +179,9 @@ def _format_profile(profile: ChemicalProfile) -> str:
     )
     lines.append(
         f"  - 이 화물이 기피하는 물질 카테고리: "
-        f"{', '.join(profile.incompatible_categories) if profile.incompatible_categories else '(없음)'}"
+        # [2026-09-27] KOSHA MSDS 10항 '피해야 할 물질'은 151종 중 91종이 '자료없음'이다.
+        # 비어 있다고 '(없음)'으로만 주면 LLM 이 "피할 물질이 없다"로 읽는다.
+        f"{', '.join(profile.incompatible_categories) if profile.incompatible_categories else '(MSDS에 피해야 할 물질 정보가 없습니다 — 기피 대상이 없다는 뜻이 아님)'}"
     )
     lines.append(
         f"  - 이 화물 자체의 분류: "
