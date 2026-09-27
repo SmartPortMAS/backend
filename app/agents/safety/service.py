@@ -171,6 +171,7 @@ class _Verdict:
     rule_engine_floor: RiskLevel
     imdg_classes: dict[str, str]
     hazard_summary: dict[str, list[str]]
+    unload_method_name: str | None = None  # 포장 검사를 했는지 LLM 입력에 적는다
 
 
 async def _compute_verdicts(
@@ -470,6 +471,7 @@ async def _compute_verdict(
         rule_engine_floor=rule_engine_floor,
         imdg_classes=imdg_classes,
         hazard_summary=hazard_summary,
+        unload_method_name=target_cargo.unload_method_name,
     )
 
 
@@ -502,6 +504,39 @@ async def assess_verdict(
     )
 
 
+def _checked_facts(v: _Verdict, adjacent_count: int) -> str:
+    """무엇을 검사했고 결과가 무엇인지 — 코드가 확정하는 첫 문장.
+
+    [2026-09-27] LLM 에 맡기면 이웃 0건·하역방식 미신고인 판정에서도 "인접 선석 충돌
+    없음으로 확인", "포장·하역방식 검증이 이루어졌으며", "기본 조치는 이행 중"처럼 하지
+    않은 검사를 했다고 썼다(입력 문구를 바로잡은 뒤에도 재현). 챗봇 결론 등급과 같은
+    원칙으로, 검사 사실은 근거에서 기계적으로 만든다. 여러 화물을 실은 배면 대표 화물
+    기준이다(나머지 화물 등급은 cargo_verdicts).
+    """
+    name = _cargo_display_name(v.target_row)
+    parts: list[str] = []
+    if adjacent_count == 0:
+        parts.append("인접 선석에 비교할 화물이 없어 혼재 검사 대상이 없었습니다")
+    else:
+        n_conf = len({c.adjacent_chem_id for c in v.conflicts}
+                     | {c.adjacent_chem_id for c in v.bulk_compatibility_conflicts})
+        if n_conf:
+            parts.append(f"인접 화물 중 {n_conf}종과 충돌이 있습니다"
+                         f"(MSDS {len(v.conflicts)}건 · 46 CFR 150 {len(v.bulk_compatibility_conflicts)}건)")
+        else:
+            parts.append(f"인접 화물 {adjacent_count}건과 MSDS·46 CFR 150 기준 충돌이 없습니다")
+        n_un = len({p.adjacent_chem_id for p in v.unassessed_pairs})
+        if n_un:
+            parts.append(f"그중 {n_un}종은 판정 근거가 없어 확인이 필요합니다")
+    if v.packaging_violations:
+        parts.append("포장·하역방식 부적합이 있습니다")
+    elif not v.unload_method_name:
+        parts.append("포장·하역방식은 하역방식이 신고되지 않아 검사하지 않았습니다")
+    else:
+        parts.append("포장·하역방식 부적합은 없습니다")
+    return f"[혼재 판정 {v.rule_engine_floor.value} · {name} 기준] " + ". ".join(parts) + "."
+
+
 async def assess_safety(
     db: AsyncSession,
     neo4j_driver: AsyncDriver,
@@ -525,6 +560,8 @@ async def assess_safety(
             packaging_violations=v.packaging_violations,
             unassessed_pairs=v.unassessed_pairs,
             rule_engine_floor=v.rule_engine_floor,
+            adjacent_count=len(request.adjacent_cargos),
+            unload_method_name=v.unload_method_name,
         ),
         schema=LLMAssessment,
     )
@@ -549,7 +586,7 @@ async def assess_safety(
             llm_result.checklist, v.target_row.un_no, v.target_row.cas_no,
         ),
         key_hazards=llm_result.key_hazards,
-        reasoning=llm_result.reasoning,
+        reasoning=_checked_facts(v, len(request.adjacent_cargos)) + "\n" + llm_result.reasoning,
         conflicts=v.conflicts,
         # IMDG 항목은 **참고 정보**로 응답에 남긴다 — 판정 근거와 LLM 프롬프트
         # 에서는 빠졌지만, 관제사가 "이 조합이 국제 규정상 선내 격리 대상인가"를

@@ -393,19 +393,6 @@ async def build_candidate_for_wharf_name(
     conflicts = reservation_map.get(berth["berth_id"], [])
     status = OccupancyStatus.OCCUPIED if conflicts else OccupancyStatus.AVAILABLE
 
-    adjacency_map = await find_adjacent_categories(neo4j_driver, berth_ids=[berth["berth_id"]])
-    adjacent_wharf_names = list({
-        entry["adjacent_wharf_name"]
-        for entry in adjacency_map.get(berth["berth_id"], [])
-        if entry.get("adjacent_wharf_name")
-    })
-    real_cargo_by_wharf = await _real_adjacent_cargo_by_wharf(
-        db, adjacent_wharf_names, exclude_call_sign=vessel.call_sign
-    )
-    occupied_wharfs = await _occupied_wharfs(
-        db, adjacent_wharf_names, exclude_call_sign=vessel.call_sign
-    )
-
     candidate = BerthCandidate(
         rank=1,
         berth_id=berth["berth_id"],
@@ -424,11 +411,52 @@ async def build_candidate_for_wharf_name(
             )
             for c in conflicts
         ],
-        adjacent_cargos=_adjacent_cargos_for(
-            adjacency_map.get(berth["berth_id"], []), real_cargo_by_wharf, occupied_wharfs
+        adjacent_cargos=await _adjacent_cargos_for_berth(
+            db, neo4j_driver, berth_id=berth["berth_id"], exclude_call_sign=vessel.call_sign,
         ),
     )
     return candidate, None, False
+
+
+async def _adjacent_cargos_for_berth(
+    db: AsyncSession, neo4j_driver: AsyncDriver, *, berth_id: str, exclude_call_sign: str | None,
+) -> list[AdjacentCargo]:
+    """선석 하나의 인접 선석(그래프 ADJACENT_TO)에 지금 있는 화물."""
+    adjacency_map = await find_adjacent_categories(neo4j_driver, berth_ids=[berth_id])
+    adjacent_wharf_names = list({
+        entry["adjacent_wharf_name"]
+        for entry in adjacency_map.get(berth_id, [])
+        if entry.get("adjacent_wharf_name")
+    })
+    real_cargo_by_wharf = await _real_adjacent_cargo_by_wharf(
+        db, adjacent_wharf_names, exclude_call_sign=exclude_call_sign
+    )
+    occupied_wharfs = await _occupied_wharfs(
+        db, adjacent_wharf_names, exclude_call_sign=exclude_call_sign
+    )
+    return _adjacent_cargos_for(adjacency_map.get(berth_id, []), real_cargo_by_wharf, occupied_wharfs)
+
+
+async def adjacent_cargos_for_wharf(
+    db: AsyncSession, neo4j_driver: AsyncDriver, *, wharf_name: str, exclude_call_sign: str | None,
+) -> tuple[str | None, list[AdjacentCargo]]:
+    """선석 이름 → (정본 선석명, 이웃 화물). 선석을 못 찾으면 (None, []).
+
+    [2026-09-27] 선박 상세 패널이 프론트엔드 자체 인접표(온산 13곳)로 이웃을 구해,
+    그 밖 선석(접안선 32척 중 22척)은 이웃 0건으로 혼재 판정을 받고 있었다. 판정 잡과
+    같은 계산(별칭 정규화 → 선석 → ADJACENT_TO → 실제 재항 화물)을 쓰게 하려고 뗐다.
+    흘수 검사와 무관하게 이웃만 구한다.
+    """
+    alias_row = (
+        await db.execute(_QUERY_RESOLVE_WHARF_ALIAS, {"name": wharf_name})
+    ).mappings().first()
+    canonical_wharf_name = alias_row["wharf_name"] if alias_row else wharf_name
+    berth = await get_berth_by_wharf_name(neo4j_driver, wharf_name=canonical_wharf_name)
+    if berth is None:
+        return None, []
+    return berth["wharf_name"], await _adjacent_cargos_for_berth(
+        db, neo4j_driver, berth_id=berth["berth_id"], exclude_call_sign=exclude_call_sign,
+    )
 
 
 async def suggest_alternative_berths(

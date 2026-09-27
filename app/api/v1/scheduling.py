@@ -1,12 +1,13 @@
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents import tools
-from app.agents.safety.schemas import CargoRef
+from app.agents.safety.schemas import AdjacentCargo, CargoRef
 from app.agents.scheduling.schemas import VesselSpec
+from app.agents.scheduling.service import adjacent_cargos_for_wharf
 from app.core.deps import get_session
 from app.core.exceptions import MsdsNotFoundError, MsdsUpstreamError
 from app.neo4j_client import neo4j_client
@@ -72,3 +73,31 @@ async def alternatives(
         raise HTTPException(status_code=404, detail=f"MSDS not found for identifier: {e.identifier}")
     except MsdsUpstreamError as e:
         raise HTTPException(status_code=502, detail=f"KOSHA MSDS API 호출 실패: {e.reason}")
+
+
+class AdjacentCargos(BaseModel):
+    wharf_name: str | None = Field(description="정본 선석명. 선석 제원 마스터에서 못 찾으면 None")
+    adjacent_cargos: list[AdjacentCargo] = Field(
+        default_factory=list, description="인접 선석에 지금 있는 화물 — /safety/verdict·assess 의 adjacent_cargos 에 그대로 넣는다",
+    )
+
+
+@router.get(
+    "/adjacent-cargos",
+    response_model=AdjacentCargos,
+    summary="선석의 이웃 화물 (혼재 판정 입력)",
+)
+async def adjacent_cargos(
+    wharf_name: str = Query(description="배가 있는 선석(위치 판정 선석명 또는 PORT-MIS 표기)"),
+    call_sign: str | None = Query(default=None, description="판정 대상 배 — 자기 화물은 이웃에서 뺀다"),
+    db: AsyncSession = Depends(get_session),
+) -> AdjacentCargos:
+    """판정 잡(10분)과 같은 인접 계산 — 그래프 ADJACENT_TO + 지금 재항 화물.
+
+    [2026-09-27] 선박 상세 패널이 프론트엔드 자체 인접표로 이웃을 구해 그 표 밖 선석은
+    이웃 0건으로 판정받던 것을 이 경로로 바꿨다.
+    """
+    canonical, cargos = await adjacent_cargos_for_wharf(
+        db, neo4j_client.driver, wharf_name=wharf_name, exclude_call_sign=call_sign,
+    )
+    return AdjacentCargos(wharf_name=canonical, adjacent_cargos=cargos)
