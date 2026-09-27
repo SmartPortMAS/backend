@@ -78,6 +78,10 @@ _QUERY_UPCOMING = text("""
            COALESCE(d.draught, s.draught_m) AS draught_m,
            CASE WHEN d.draught IS NOT NULL THEN '실측' WHEN s.draught_m IS NOT NULL THEN '제원최대' END AS draught_basis,
            d.received_at_utc AS draught_at_utc,
+           -- dev 화면(판정 요청 버튼)이 쓰는 대표 화물 — 이 입항 건 화물의 첫 행. 콜사인으로
+           -- 붙이면 다른 항차 화물을 집는다(2026-09-27 실측: 입항 예정 87건 중 46건).
+           cg.cargos->0->>'chem_id' AS chem_id, cg.cargos->0->>'cas_no' AS cas_no,
+           cg.cargos->0->>'name' AS cargo_name, (cg.cargos->0->>'is_synthetic')::boolean AS cargo_is_synthetic,
            a.collected_at_utc,
            cg.cargos
     FROM arr a
@@ -91,8 +95,9 @@ _QUERY_UPCOMING = text("""
     LEFT JOIN LATERAL (
         SELECT json_agg(json_build_object(
                    'name', coalesce(cm.msds_name_ko, cm.cargo_name_raw),
-                   'un_no', cm.dg_un_no, 'chem_id', cm.chem_id
-               ) ORDER BY cm.bl_no) AS cargos
+                   'un_no', cm.dg_un_no, 'chem_id', cm.chem_id,
+                   'cas_no', cm.cas_no, 'is_synthetic', cm.is_synthetic
+               ) ORDER BY (cm.chem_id IS NULL), cm.bl_no) AS cargos
         FROM mart.cargo_msds cm
         WHERE a.entry_year IS NOT NULL AND a.entry_count IS NOT NULL
           AND cm.port_call_key = upper(btrim(a.callsgn)) || '_' || a.entry_year::text
@@ -107,7 +112,7 @@ _QUERY_LATEST_ASSESSMENT = text("""
     SELECT DISTINCT ON (call_sign) call_sign, stage, level, reasons, action, recipient,
            changed_from, assessed_at_utc
     FROM assessment_history
-    WHERE call_sign = ANY(CAST(:call_signs AS text[]))
+    WHERE upper(btrim(call_sign)) = ANY(CAST(:call_signs AS text[]))
     ORDER BY call_sign, assessed_at_utc DESC
 """)
 
@@ -142,9 +147,9 @@ async def get_upcoming_arrivals(
     assessments: dict[str, dict] = {}
     has_history = bool((await db.execute(_QUERY_HAS_HISTORY)).scalar())
     if rows and has_history:
-        call_signs = sorted({r["call_sign"] for r in rows if r["call_sign"]})
+        call_signs = sorted({r["call_sign"].strip().upper() for r in rows if r["call_sign"]})
         for a in (await db.execute(_QUERY_LATEST_ASSESSMENT, {"call_signs": call_signs})).mappings().all():
-            assessments[a["call_sign"]] = dict(a)
+            assessments[a["call_sign"].strip().upper()] = dict(a)
 
     now = datetime.now(timezone.utc)
     items = []
@@ -152,7 +157,7 @@ async def get_upcoming_arrivals(
         depth, draught = r.get("depth_m"), r.get("draught_m")
         r["chart_margin_m"] = round(float(depth) - float(draught), 2) if depth is not None and draught is not None else None
         r["stage"] = _stage(r, now)
-        r["assessment"] = assessments.get(r["call_sign"])
+        r["assessment"] = assessments.get((r["call_sign"] or "").strip().upper())
         items.append(r)
 
     return {
