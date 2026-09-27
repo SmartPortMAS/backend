@@ -50,9 +50,3 @@ class EmbeddingIndexEmptyError(AppError):
         )
 
 
-class CargoCategoryUnknownError(AppError):
-    """Raised when a cargo has no cargo_category assigned in the Berth knowledge graph."""
-
-    def __init__(self, chem_id: str) -> None:
-        self.chem_id = chem_id
-        super().__init__(f"cargo_category not assigned for chem_id: {chem_id}")

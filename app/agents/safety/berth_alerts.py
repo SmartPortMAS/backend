@@ -175,19 +175,33 @@ async def _segregation_alerts(rows: list[dict], driver: AsyncDriver) -> list[dic
             if not raw_conflicts and not raw_imdg and not unconfirmed_imdg and not raw_bulk:
                 continue
 
-            floor = max_risk_level(
-                max_risk_level(
-                    max_risk_level(compute_risk_floor(raw_conflicts), compute_imdg_costowage_floor(raw_imdg)),
-                    compute_imdg_unconfirmed_floor(bool(unconfirmed_imdg)),
-                ),
-                compute_bulk_compatibility_floor(raw_bulk),
-            )
-            if risk_level_rank(floor) < risk_level_rank(RiskLevel.CAUTION):
-                continue
+            # [2026-09-26] 등급은 **화물쌍마다** 따로 낸다. 예전엔 대상 화물 하나와
+            # 같은 선석의 다른 화물 전부를 합쳐 한 등급을 내고 그 등급을 모든 쌍에
+            # 붙였다 — 쌍마다 1건(위험)인 조합 둘이 합쳐져 배정불가가 되고, 참고 수준의
+            # 쌍까지 배정불가로 표시됐다. compute_risk_floor 의 "2건 이상" 은 쌍 하나의 규칙이다.
+            def _of(rows: list[dict], oid: str) -> list[dict]:
+                return [r for r in rows if r["chem_id"] == oid]
+
+            pair_floor = {
+                oid: max_risk_level(
+                    max_risk_level(
+                        compute_risk_floor(_of(raw_conflicts, oid)),
+                        compute_imdg_costowage_floor(_of(raw_imdg, oid)),
+                    ),
+                    max_risk_level(
+                        compute_imdg_unconfirmed_floor(bool(_of(unconfirmed_imdg, oid))),
+                        compute_bulk_compatibility_floor(_of(raw_bulk, oid)),
+                    ),
+                )
+                for oid in other_ids
+            }
 
             name_of = {c["chem_id"]: (c["cargo_name"] or c["chem_id"]) for c in identified}
             for raw in raw_conflicts + raw_imdg + unconfirmed_imdg + raw_bulk:
                 other_id = raw["chem_id"]
+                floor = pair_floor[other_id]
+                if risk_level_rank(floor) < risk_level_rank(RiskLevel.CAUTION):
+                    continue
                 # (A,B)와 (B,A)는 같은 사건이라 한 번만 올린다
                 pair = tuple(sorted((target["chem_id"], other_id)))
                 if pair in seen:

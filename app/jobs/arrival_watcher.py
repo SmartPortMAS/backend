@@ -40,15 +40,18 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 
-from app.agents.orchestrator.schemas import OrchestratorRequest
+from app.agents.orchestrator.schemas import OrchestratorRequest, OrchestratorResult
 from app.agents.orchestrator.service import orchestrate
 from app.agents.safety.schemas import CargoRef
 from app.agents.scheduling.schemas import VesselSpec
 from app.database import AsyncSessionFactory
+from app.llm.base import LLMClient
 from app.llm.factory import get_llm_client
-from app.models.assessment_history import AssessmentLevel
+from app.llm.null_client import NullLLMClient
+from app.models.assessment_history import AssessmentLevel, AssessmentStage
 from app.neo4j_client import neo4j_client
 from app.services.assessment import (
+    is_unchanged_from_last,
     record_assessment,
     record_from_orchestrator,
     stage_from_nav_status,
@@ -94,34 +97,52 @@ _QUERY_ASSESSMENT_TARGETS = text("""
         FROM mart.vessel_presence
         WHERE nullif(btrim(callsgn), '') IS NOT NULL
     ),
+    -- [2026-09-27] 입항 건의 입항시각·신고 계류시설·출항 신고를 PORT-MIS(10분 주기)에서
+    --   읽는다. 예전엔 mart.dashboard_current(→ port_call_overview → upa_port_call)에서
+    --   읽었는데, upa_port_call 은 하루 1번 수집되는 VTS 이력이고 한 입항 건의 이벤트
+    --   (입항·이안·이선·접안) 중 첫 행을 골라 '최초 입항 선석'이 나왔다. 실측(9/27):
+    --   부두에 붙은 33척 중 9척이 실제로 있지 않은 부두로 판정됐다.
+    --   창은 mart.vessel_current_call 과 같다(입항시각 <= now()+12h 중 최근 건).
     pm AS (
         SELECT DISTINCT ON (upper(btrim(callsgn))) upper(btrim(callsgn)) AS cs,
-               collected_at_utc, arrival_report_type
+               collected_at_utc, arrival_report_type,
+               arrival_at_utc, departure_at_utc, arrival_facility_nm
         FROM portmis_vessel
         WHERE nullif(btrim(callsgn), '') IS NOT NULL
-        ORDER BY upper(btrim(callsgn)), arrival_at_utc DESC NULLS LAST
+          AND arrival_at_utc <= now() + interval '12 hours'
+        ORDER BY upper(btrim(callsgn)), arrival_at_utc DESC
     )
     SELECT
         dc.callsgn, dc.vessel_name, dc.imo_no, dc.draught AS draught_m,
-        dc.arrival_at_utc, dc.nav_status_code, dc.received_at_utc AS position_at_utc,
-        -- PORT-MIS 공식 배정 계선시설. '정박지-E1' 같은 정박지 배정도 여기로 온다.
-        dc.facility_name AS assigned_facility_name,
-        -- 그 배정 기록에 출항까지 신고돼 있으면 지난 입항의 기록이다(_target_wharf).
-        dc.departure_at_utc AS assigned_departure_at_utc,
+        pm.arrival_at_utc, dc.nav_status_code, dc.received_at_utc AS position_at_utc,
+        -- PORT-MIS 신고 계류시설. '정박지-E1' 같은 정박지 신고도 여기로 온다.
+        pm.arrival_facility_nm AS assigned_facility_name,
+        -- PORT-MIS 출항 신고 시각. 미리 신고되는 예정 시각이라 지났을 때만 끝난 입항이다.
+        pm.departure_at_utc AS assigned_departure_at_utc,
         lv.wharf_name AS moored_wharf_name,
         lv.distance_m AS moored_distance_m,
         pm.collected_at_utc AS portmis_collected_at,
         pm.arrival_report_type,
-        (
-            SELECT cm.chem_id FROM mart.cargo_msds cm
-            WHERE cm.callsgn = dc.callsgn AND cm.chem_id IS NOT NULL
-            LIMIT 1
-        ) AS chem_id,
+        -- [0030] 화물은 콜사인이 아니라 지금의 입항 건으로 찾는다(재입항 배의 지난
+        -- 항차 화물이 섞이지 않게). 한 입항 건에 여러 화물 → 목록. 입항 건을 못 정한
+        -- 배는 빈 목록 → 판정불가.
+        ARRAY(
+            SELECT DISTINCT ON (cm.chem_id) cm.chem_id
+            FROM mart.vessel_current_call vc
+            JOIN mart.cargo_msds cm ON cm.port_call_key = vc.port_call_key
+            WHERE vc.callsgn = upper(btrim(dc.callsgn)) AND cm.chem_id IS NOT NULL
+            ORDER BY cm.chem_id, cm.bl_no
+        ) AS chem_ids,
+        -- 판정할 선석(_target_wharf 와 같은 순서: 실제 접안 부두 → PORT-MIS 신고)의 재항 중앙값
         (
             SELECT bds.median_hours
-            FROM mart.facility_alias fa
-            JOIN mart.berth_dwell_stats bds ON bds.wharf_name = fa.wharf_name
-            WHERE fa.source_name = dc.facility_name AND fa.facility_type = 'BERTH'
+            FROM mart.berth_dwell_stats bds
+            WHERE bds.wharf_name = COALESCE(
+                lv.wharf_name,
+                (SELECT fa.wharf_name FROM mart.facility_alias fa
+                 WHERE fa.source_name = pm.arrival_facility_nm AND fa.facility_type = 'BERTH'
+                 LIMIT 1)
+            )
             LIMIT 1
         ) AS median_dwell_hours
     FROM mart.dashboard_current dc
@@ -130,15 +151,15 @@ _QUERY_ASSESSMENT_TARGETS = text("""
     LEFT JOIN present pr ON pr.cs = upper(btrim(dc.callsgn))
     WHERE dc.is_liquid_cargo_vessel
       AND (
-            -- (가) PORT-MIS 가 선석을 적어 둔 배 (정박지 배정은 대상이 아니다)
+            -- (가) PORT-MIS 가 선석을 신고한 배 (정박지 신고는 대상이 아니다)
             (
-                dc.arrival_at_utc IS NOT NULL
-                AND dc.departure_at_utc IS NULL
-                AND nullif(btrim(dc.facility_name), '') IS NOT NULL
-                AND dc.facility_name NOT LIKE '%정박지%'
+                pm.arrival_at_utc IS NOT NULL
+                AND (pm.departure_at_utc IS NULL OR pm.departure_at_utc > now())
+                AND nullif(btrim(pm.arrival_facility_nm), '') IS NOT NULL
+                AND pm.arrival_facility_nm NOT LIKE '%정박지%'
                 AND (
                     pr.cs IS NOT NULL
-                    OR dc.arrival_at_utc > now() - make_interval(hours => :grace_hours)
+                    OR pm.arrival_at_utc > now() - make_interval(hours => :grace_hours)
                 )
             )
             -- (나) AIS 가 실제로 부두에 붙어 있다고 말하는 배.
@@ -146,28 +167,30 @@ _QUERY_ASSESSMENT_TARGETS = text("""
             --      '지금 붙어 있다'가 관측이고 그게 판정 대상이다.
             OR lv.wharf_name IS NOT NULL
           )
-    ORDER BY dc.arrival_at_utc ASC NULLS LAST
+    ORDER BY pm.arrival_at_utc ASC NULLS LAST
 """)
 
 
 def _target_wharf(row: dict) -> tuple[str | None, str]:
     """검증할 계류시설과 그 출처.
 
-    PORT-MIS 배정을 먼저 본다 — 그게 공식 기록이고, AIS 는 아직 이동 중일 수 있다.
-    PORT-MIS 가 정박지거나 비어 있으면 AIS 실측으로 내려간다.
+    [2026-09-27] 실제로 붙어 있는 부두(mart.vessel_presence 의 BERTH)를 먼저 본다.
+    예전엔 신고 선석을 먼저 봤다 — "AIS 는 아직 이동 중일 수 있다"는 이유였는데,
+    BERTH 는 정지한 배만 잡으므로 이동 중인 배는 여기 오지 않는다. 반대로 신고 선석은
+    이선을 따라가지 못한다. 실측(9/27): 신고 선석으로 판정한 9척이 0.8~9.4km 떨어진
+    다른 부두에 멈춰 있었고, 그중 4척은 VTS 이선·접안 이벤트가 실제 위치와 같았다.
 
-    [2026-09-22] 그 배정 기록에 출항까지 신고돼 있으면 지난 입항의 기록이다 — 이번
-    입항은 아직 PORT-MIS 에 없거나 수집창 밖이다. 그때는 실제로 붙어 있는 자리를 본다.
-    실측: SUN BIRDIE 는 지금 정일1부두(107 m)에 붙어 있는데 7/25 입·출항 기록의
-    '정일스톨트헤븐울산신항3부두'로 하역중 판정을 받았다.
+    아직 붙지 않은 배(입항 전·묘박)는 PORT-MIS 신고 계류시설로 사전 검토한다.
+    정박지 신고이거나 출항 예정 시각이 지난 신고는 쓰지 않는다.
     """
-    assigned = (row.get("assigned_facility_name") or "").strip()
-    closed = row.get("assigned_departure_at_utc") is not None
-    if assigned and "정박지" not in assigned and not closed:
-        return assigned, "PORT-MIS"
     moored = (row.get("moored_wharf_name") or "").strip()
     if moored:
         return moored, "AIS"
+    assigned = (row.get("assigned_facility_name") or "").strip()
+    departure = row.get("assigned_departure_at_utc")
+    closed = departure is not None and departure <= datetime.now(timezone.utc)
+    if assigned and "정박지" not in assigned and not closed:
+        return assigned, "PORT-MIS"
     return None, "없음"
 
 
@@ -195,7 +218,31 @@ def _snapshot(row: dict, *, source: str, target: str | None) -> dict:
         "nav_status_code": row.get("nav_status_code"),
         "draught_m": float(row["draught_m"]) if row.get("draught_m") is not None else None,
         "arrival_at_utc": _iso(row.get("arrival_at_utc")),
+        "chem_ids": list(row.get("chem_ids") or []),
     }
+
+
+async def judge_with_llm_on_change(
+    db,
+    neo4j_driver,
+    llm_client: LLMClient,
+    request: OrchestratorRequest,
+    *,
+    call_sign: str,
+    stage: AssessmentStage | None,
+) -> OrchestratorResult | None:
+    """판정하되 LLM 은 결과가 바뀔 때만 부른다. 바뀌지 않았으면 None.
+
+    [2026-09-26] 같은 배를 10분마다 다시 판정하는 건 게이트 인터락이 변화(기상·이웃 화물·
+    시점)를 제때 받게 하려는 것이다. 그런데 기록은 결과가 바뀔 때만 남고(record_assessment),
+    LLM 은 문장만 쓴다 — 기록하지 않는 회차의 LLM 문장은 버려졌다(배당 2회 × 56척 × 10분).
+    그래서 LLM 없이 먼저 판정해 변화를 가리고, 바뀌었을 때만 LLM 을 붙여 다시 판정한다.
+    규칙 판정은 한 척 1초 안팎이라 두 번 돌아도 부담이 작다.
+    """
+    result = await orchestrate(db, neo4j_driver, NullLLMClient(), request)
+    if await is_unchanged_from_last(db, call_sign=call_sign, stage=stage, result=result):
+        return None
+    return await orchestrate(db, neo4j_driver, llm_client, request)
 
 
 async def watch_arrivals() -> None:
@@ -236,8 +283,8 @@ async def watch_arrivals() -> None:
             blocker = "계류시설을 특정할 수 없습니다(PORT-MIS 정박지·미배정, AIS 접안 미탐지)"
         elif stage is None:
             blocker = "AIS 항해상태가 없어 지금 어느 시점인지 판단할 수 없습니다"
-        elif not row.get("chem_id"):
-            blocker = "적재 화물을 식별할 수 없습니다(MSDS 매칭 없음)"
+        elif not row.get("chem_ids"):
+            blocker = "적재 화물을 식별할 수 없습니다(현재 입항 건 미확정 또는 MSDS 매칭 없음)"
         elif not row.get("draught_m") or float(row["draught_m"]) <= 0:
             blocker = "흘수 정보가 없어 수심 여유를 계산할 수 없습니다"
 
@@ -272,7 +319,8 @@ async def watch_arrivals() -> None:
                 draught_m=row["draught_m"], dwt_t=None, name_hint=row.get("vessel_name"),
                 call_sign=callsgn,
             ),
-            cargo=CargoRef(chem_id=row["chem_id"]),
+            cargo=CargoRef(chem_id=row["chem_ids"][0]),
+            cargos=[CargoRef(chem_id=c) for c in row["chem_ids"][1:]],
             window_start=window_start,
             window_end=window_end,
             # 검증모드 고정 — 이 시설 하나만 확인한다. None 을 넘기면 오케스트레이터가
@@ -286,9 +334,16 @@ async def watch_arrivals() -> None:
 
         async with AsyncSessionFactory() as db:
             try:
-                result = await orchestrate(db, neo4j_client.driver, llm_client, request)
+                result = await judge_with_llm_on_change(
+                    db, neo4j_client.driver, llm_client, request, call_sign=callsgn, stage=stage,
+                )
             except Exception:
                 logger.exception("watch_arrivals: %s 오케스트레이터 호출 실패", callsgn)
+                continue
+
+            if result is None:
+                skipped += 1
+                logger.info("watch_arrivals: %s -> 변화 없음(LLM·기록 생략)", callsgn)
                 continue
 
             wrote = await record_from_orchestrator(

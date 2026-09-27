@@ -18,6 +18,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.orchestrator.schemas import OrchestratorResult, OverallDecision
+from app.agents.safety.schemas import RiskLevel
 from app.agents.weather.schemas import WorkStatus
 from app.models.assessment_history import (
     AssessmentAction,
@@ -79,9 +80,24 @@ def level_from_decision(result: OrchestratorResult) -> tuple[AssessmentLevel, st
             return AssessmentLevel.UNKNOWN, "기상 관측이 없거나 오래돼 판단할 수 없습니다"
         if weather.status is not WorkStatus.NORMAL:
             return AssessmentLevel.CAUTION, f"배정된 선석은 조건에 맞으나 기상이 '{weather.status.value}'입니다"
+        # [2026-09-26] 오케스트레이터는 혼재 '배정불가'만 탈락시키므로 여기 온 결과의
+        # 혼재 등급은 안전·주의·위험 중 하나다. 예전엔 이 등급을 보지 않아 위험이어도
+        # '적합'으로 기록됐다(실측: 적합인데 혼재 주의 2건). 위험·주의는 '주의'로 둔다 —
+        # 배정불가만 막고 나머지는 경고로 보인다는 safety/service.py 의 설계를 따른다.
+        safety = result.safety_assessment
+        if safety is not None and safety.risk_level in (RiskLevel.DANGER, RiskLevel.CAUTION):
+            return (
+                AssessmentLevel.CAUTION,
+                f"배정된 선석은 조건에 맞으나 인접 화물 혼재 등급이 '{safety.risk_level.value}'입니다",
+            )
+        if result.conditions:
+            # 교차 확인 조건(체류 중 기상 악화 예보 등). 등급은 적합 그대로다(결정 7-1).
+            return AssessmentLevel.FIT, "배정된 선석이 이 선박·화물 조건에 맞습니다(조건부 — 체류 중 악화 예보)"
         return AssessmentLevel.FIT, "배정된 선석이 이 선박·화물 조건에 맞습니다"
 
     if decision is OverallDecision.WEATHER_BLOCKED:
+        if result.evidence_missing:
+            return AssessmentLevel.UNKNOWN, "기상 관측이 없거나 오래돼 판단할 수 없습니다"
         return AssessmentLevel.UNFIT, "기상 조건이 작업 한계를 넘었습니다"
 
     if decision is OverallDecision.NO_ELIGIBLE_BERTH:
@@ -108,11 +124,6 @@ def level_from_decision(result: OrchestratorResult) -> tuple[AssessmentLevel, st
         # 검증모드에서 이 귀결은 "다른 선석이 없다"가 아니라 **"배정된 그 선석이
         # 이 배에 안 맞는다"** 는 뜻이다. 대상이 한 곳뿐이기 때문이다.
         return AssessmentLevel.UNFIT, "배정된 선석이 이 선박·화물 조건에 맞지 않습니다"
-
-    if decision is OverallDecision.WAITING_ANCHORAGE:
-        # 검증모드에서는 원래 나오지 않는 귀결이다(대상이 선석 하나로 고정).
-        # 방어적으로 둔다 — 나오면 의견일 뿐 우리가 정박지로 보내지 않는다.
-        return AssessmentLevel.CAUTION, "지금 선석보다 정박지 대기가 적절해 보입니다"
 
     return AssessmentLevel.UNKNOWN, f"판정 결과를 해석할 수 없습니다({decision.value})"
 
@@ -145,7 +156,27 @@ def _axes_from_result(result: OrchestratorResult) -> dict:
             "risk_level": s.risk_level.value,
             "conflict_count": len(s.conflicts) + len(s.imdg_conflicts),
             "key_hazards": list(s.key_hazards[:5]),
+            # [2026-09-25] 한 입항 건의 화물마다 따로 판정한 결과. 대표 등급은 가장
+            # 위험한 화물의 것이다(is_governing).
+            "cargos": [
+                {
+                    "name": v.target_cargo_name,
+                    "chem_id": v.chem_id,
+                    "risk_level": v.risk_level.value,
+                    "conflict_count": v.conflict_count + v.bulk_conflict_count,
+                    "governing": v.is_governing,
+                }
+                for v in s.cargo_verdicts
+            ],
         }
+
+    # [2026-09-27] 도구별 의견(등급 · 확인한 것 · 못 본 것)과 교차 확인 조건. condition_key 는
+    # '변화 없음' 비교(_QUERY_LAST)에 쓴다.
+    if result.opinions:
+        axes["의견"] = [o.model_dump() for o in result.opinions]
+    if result.conditions:
+        axes["조건"] = list(result.conditions)
+    axes["condition_key"] = result.condition_key
 
     # '점유' 축은 일부러 비워 둔다.
     #   ① 우리는 선석을 점유하지 않는다(방향 C) — 우리 표의 예약을 점유라고 셀 수 없다.
@@ -185,8 +216,18 @@ def _alternatives_detail(result: OrchestratorResult) -> dict | None:
 
 def _reasons_from_result(result: OrchestratorResult, headline: str) -> list[str]:
     reasons = [headline]
+    reasons.extend(result.conditions)
     reasons.extend(result.assignment_trace)
     reasons.extend(result.weather_assessment.reasons)
+    # [2026-09-25] 화물이 둘 이상이면 화물별 혼재 등급을 한 줄로 — 대표 등급만 보면
+    # 어느 화물 때문에 그 등급인지 알 수 없다.
+    verdicts = result.safety_assessment.cargo_verdicts if result.safety_assessment else []
+    if len(verdicts) > 1:
+        parts = ", ".join(
+            f"{v.target_cargo_name} {v.risk_level.value}{' (대표)' if v.is_governing else ''}"
+            for v in verdicts
+        )
+        reasons.append(f"화물 {len(verdicts)}종 혼재 판정: {parts}")
     if result.suggested_alternatives:
         names = ", ".join(
             f"{c.wharf_name}(여유 {c.draught_margin_m:.1f}m)"
@@ -195,8 +236,6 @@ def _reasons_from_result(result: OrchestratorResult, headline: str) -> list[str]
         reasons.append(f"대체 선석 제안: {names} — 제안이며 배정이 아닙니다")
     elif result.suggestion_note:
         reasons.append(f"대체 선석을 제안하지 못했습니다: {result.suggestion_note}")
-    if result.assignment_changed:
-        reasons.append("배정된 선석과 다른 선석이 더 적합해 보입니다 — 의견이며 배정 변경이 아닙니다")
     # 중복 제거하되 순서는 유지한다(관제사가 읽는 순서가 근거의 우선순위다).
     seen: set[str] = set()
     return [r for r in reasons if r and not (r in seen or seen.add(r))]
@@ -209,12 +248,22 @@ _QUERY_LAST = text("""
                (SELECT string_agg(x->>'wharf_name', ',' ORDER BY x->>'rank')
                 FROM jsonb_array_elements(action_detail->'alternatives'->'suggested') AS x),
                ''
-           ) AS suggested_key
+           ) AS suggested_key,
+           -- 교차 확인 조건(예보 등급 등). 시각은 넣지 않은 요약이다.
+           COALESCE(axes->>'condition_key', '') AS condition_key
     FROM assessment_history
     WHERE call_sign = :call_sign
     ORDER BY assessed_at_utc DESC
     LIMIT 1
 """)
+
+
+def _same_as_last(last, stage_value: str, level: AssessmentLevel,
+                  action_value: str | None, suggested_key: str, condition_key: str = "") -> bool:
+    """직전 기록과 시점·등급·조치안·제안·조건이 모두 같은가 — 같으면 새로 기록하지 않는다."""
+    return last is not None and last["stage"] == stage_value and last["level"] == level.value \
+        and last["action"] == action_value and last["suggested_key"] == suggested_key \
+        and last["condition_key"] == condition_key
 
 
 async def record_assessment(
@@ -232,6 +281,7 @@ async def record_assessment(
     action_detail: dict | None = None,
     input_snapshot: dict | None = None,
     suggested_key: str = "",
+    condition_key: str = "",
 ) -> bool:
     """판정 1건을 남긴다. 실제로 기록했으면 True.
 
@@ -250,8 +300,7 @@ async def record_assessment(
     action_value = action.value if action is not None else None
 
     last = (await db.execute(_QUERY_LAST, {"call_sign": call_sign})).mappings().first()
-    if last is not None and last["stage"] == stage_value and last["level"] == level.value \
-            and last["action"] == action_value:
+    if _same_as_last(last, stage_value, level, action_value, suggested_key, condition_key):
         return False
 
     recipient = _RECIPIENT_BY_STAGE.get(stage) if (stage is not None and action is not None) else None
@@ -274,6 +323,42 @@ async def record_assessment(
     return True
 
 
+def _action_for(level: AssessmentLevel, stage: AssessmentStage | None) -> AssessmentAction | None:
+    # 조치안은 **판정이 섰고 그 판정이 '적합'이 아닐 때만** 붙는다.
+    # 받는 곳은 시점이 정한다(회의 §3).
+    #
+    # '판정불가'에는 조치안을 달지 않는다. 근거가 없어서 판단을 못 한 건인데
+    # "대체 선석을 검토하라"고 권하면 근거 없는 조언이 된다 — 실제로 필요한 건
+    # 배를 옮기는 게 아니라 **빠진 근거를 채우는 것**이다(표기 미해소면 별칭 사전,
+    # 흘수 미상이면 선박제원). 등급 자체가 그 사실을 이미 말하고 있다.
+    actionable = level in (AssessmentLevel.UNFIT, AssessmentLevel.CAUTION)
+    return _ACTION_BY_STAGE.get(stage) if (actionable and stage is not None) else None
+
+
+def _suggested_key(result: OrchestratorResult) -> str:
+    return ",".join(c.wharf_name for c in sorted(result.suggested_alternatives, key=lambda x: x.rank))
+
+
+async def is_unchanged_from_last(
+    db: AsyncSession,
+    *,
+    call_sign: str,
+    stage: AssessmentStage | None,
+    result: OrchestratorResult,
+) -> bool:
+    """이 결과를 record_from_orchestrator 에 넘기면 '변화 없음'으로 기록이 생략되는가.
+
+    판정 잡이 LLM 을 부르기 전에 쓴다(2026-09-26). 기록 여부를 가르는 값(시점·등급·
+    조치안·제안)은 전부 규칙으로 정해지므로 LLM 없이 계산한 결과로 판단할 수 있다.
+    """
+    level, _ = level_from_decision(result)
+    action = _action_for(level, stage)
+    stage_value = stage.value if stage is not None else AssessmentStage.BEFORE_ARRIVAL.value
+    last = (await db.execute(_QUERY_LAST, {"call_sign": call_sign})).mappings().first()
+    return _same_as_last(last, stage_value, level, action.value if action is not None else None,
+                         _suggested_key(result), result.condition_key)
+
+
 async def record_from_orchestrator(
     db: AsyncSession,
     *,
@@ -286,16 +371,7 @@ async def record_from_orchestrator(
 ) -> bool:
     """오케스트레이터 결과를 그대로 판정 1건으로 옮긴다."""
     level, headline = level_from_decision(result)
-
-    # 조치안은 **판정이 섰고 그 판정이 '적합'이 아닐 때만** 붙는다.
-    # 받는 곳은 시점이 정한다(회의 §3).
-    #
-    # '판정불가'에는 조치안을 달지 않는다. 근거가 없어서 판단을 못 한 건인데
-    # "대체 선석을 검토하라"고 권하면 근거 없는 조언이 된다 — 실제로 필요한 건
-    # 배를 옮기는 게 아니라 **빠진 근거를 채우는 것**이다(표기 미해소면 별칭 사전,
-    # 흘수 미상이면 선박제원). 등급 자체가 그 사실을 이미 말하고 있다.
-    actionable = level in (AssessmentLevel.UNFIT, AssessmentLevel.CAUTION)
-    action = _ACTION_BY_STAGE.get(stage) if (actionable and stage is not None) else None
+    action = _action_for(level, stage)
 
     action_detail = None
     if action is not None:
@@ -317,7 +393,6 @@ async def record_from_orchestrator(
         action=action,
         action_detail=action_detail,
         input_snapshot=input_snapshot,
-        suggested_key=",".join(
-            c.wharf_name for c in sorted(result.suggested_alternatives, key=lambda x: x.rank)
-        ),
+        suggested_key=_suggested_key(result),
+        condition_key=result.condition_key,
     )

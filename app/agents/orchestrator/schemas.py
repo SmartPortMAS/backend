@@ -11,7 +11,8 @@ from enum import Enum
 from pydantic import BaseModel, Field, model_validator
 
 from app.agents.safety.schemas import CargoRef, SafetyAssessmentResult
-from app.agents.scheduling.schemas import AnchorageAssignment, BerthCandidate, VesselSpec
+from app.agents.scheduling.schemas import BerthCandidate, VesselSpec
+from app.agents.tools import Opinion
 from app.agents.weather.schemas import WeatherAssessmentResult
 
 
@@ -38,28 +39,36 @@ class OverallDecision(str, Enum):
     WEATHER_BLOCKED = "기상불가_중단권고"
     NO_ELIGIBLE_BERTH = "적합선석없음"
     ALL_CANDIDATES_UNSAFE = "전 후보 부적합"
-    # 전용 선석 점유 + 대체 선석 없음(단독선석 등) -> 톤수에 맞는 정박지에서 대기
-    # (온산 MVP 이식: scheduling.service.resolve_berth_assignment의 '정박지대기' 경로).
-    WAITING_ANCHORAGE = "정박지대기"
+    # [2026-09-27] WAITING_ANCHORAGE("정박지대기")를 없앴다 — 정박지 배정 경로를 걷어냈다
+    # (27번 설계안 D단계). 정박지는 위치로 관찰만 한다.
 
 
 class OrchestratorRequest(BaseModel):
     vessel: VesselSpec
     cargo: CargoRef
+    cargos: list[CargoRef] = Field(
+        default_factory=list,
+        description="[2026-09-25] 같은 입항 건에 함께 실은 나머지 화물. 안전 판정은 화물마다 "
+        "돌려 가장 위험한 쪽을 대표로 삼고, 탐색모드 선석은 모든 화물 카테고리를 취급하는 "
+        "곳만 남긴다. 비우면 cargo 하나만(하위 호환).",
+    )
     window_start: datetime = Field(description="희망 접안 시작 시각(UTC)")
     window_end: datetime = Field(
         description="희망 접안 종료(출항 예정) 시각(UTC). 기상분석 에이전트의 "
         "예상 하역완료시각(expected_completion_at)으로도 그대로 쓰인다."
     )
-    draught_margin_m: float = Field(default=1.0, ge=0, description="수심 대비 흘수 안전 여유(m)")
+    draught_margin_m: float | None = Field(
+        default=None, ge=0,
+        description="수심 대비 흘수 안전 여유(m). 비우면 규칙 max(1.0m, 흘수 10%) — scheduling/ukc.py",
+    )
     weather_as_of: datetime | None = Field(
         default=None, description="기상 판단 기준 시각(UTC). 생략 시 서버 현재 시각(=지금 기상으로 판단)"
     )
-    assigned_wharf_name: str | None = Field(
-        default=None,
-        description="이미 정해진 선석(예: 실시간 위치 조인의 현재 접안 선석명). 있으면 "
-        "top-3 재탐색 대신 이 선석 하나만 검증한다(검증모드). 없으면 기존 top-3 "
-        "탐색 경로(탐색모드, 하위 호환).",
+    assigned_wharf_name: str = Field(
+        min_length=1,
+        description="검증할 선석 — 배가 실제로 붙은 부두(위치 판정) 또는 접안 전이면 PORT-MIS "
+        "신고 선석. [2026-09-27] 필수다: 선석을 새로 고르는 탐색모드를 걷어냈다(우리는 "
+        "배정하지 않는다). 다른 자리가 필요하면 대체 선석 제안(/scheduling/alternatives)을 쓴다.",
     )
 
     @model_validator(mode="after")
@@ -89,19 +98,9 @@ class OrchestratorResult(BaseModel):
     rejected_candidates: list[RejectedCandidate] = Field(
         default_factory=list, description="배정불가로 탈락해 재탐색된 후보 이력"
     )
-    anchorage_assignment: AnchorageAssignment | None = Field(
-        default=None, description="overall_decision이 정박지대기일 때만 채워짐(온산 MVP 이식)"
-    )
     assignment_trace: list[str] = Field(
         default_factory=list,
-        description="전용/대체/정박지대기 판단 경로와 근거(온산 MVP 이식: 팀원 오케스트레이터의 "
-        "berth_decision.trace와 동일한 목적)",
-    )
-    assignment_changed: bool = Field(
-        default=False,
-        description="검증모드(assigned_wharf_name 지정)에서, 최종 selected_berth.wharf_name이 "
-        "assigned_wharf_name과 다르면 True — 원래 있던 자리가 아니라 대체 선석으로 바뀌었다는 "
-        "뜻이라 관제사가 바로 알아야 한다. 탐색모드에서는 항상 False.",
+        description="판단 경로와 근거(선석 확인 결과, 점유 참고 등)",
     )
     suggested_alternatives: list[BerthCandidate] = Field(
         default_factory=list,
@@ -128,6 +127,20 @@ class OrchestratorResult(BaseModel):
         description="선석배정현황 팝업 전용 — 선석 스펙과 선박 매칭만 다루는 LLM 한 문장 "
         "요약(화학물질·안전판정 내용 제외). summary와 같은 LLM 호출에서 함께 받는다"
         "(호출 두 번 비용 방지). selected_berth가 없으면 None.",
+    )
+    opinions: list[Opinion] = Field(
+        default_factory=list,
+        description="검증모드에서 도구마다 낸 의견(등급 · 확인한 것 · 못 본 것). 27번 설계안 B단계",
+    )
+    conditions: list[str] = Field(
+        default_factory=list,
+        description="교차 확인으로 붙은 조건. 예: 지금은 적합이나 체류 중 기상 악화 예보 — "
+        "등급은 그대로 두고(적합) 조건만 붙인다. 그 시각이 되면 기상 게이트가 하역을 멈춘다.",
+    )
+    condition_key: str = Field(
+        default="",
+        description="판정 기록의 '변화 없음' 비교에 쓰는 조건 요약(시각 제외 — 예보가 새로 날 때마다 "
+        "시각이 흔들려도 새 행이 쌓이지 않게).",
     )
 
     def decision_detail(self) -> dict:

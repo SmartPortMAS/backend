@@ -25,7 +25,6 @@ from app.agents.orchestrator.schemas import OrchestratorRequest, OrchestratorRes
 from app.agents.orchestrator.service import orchestrate
 from app.core.deps import get_llm_client, get_session
 from app.core.exceptions import (
-    CargoCategoryUnknownError,
     LLMGenerationError,
     MsdsNotFoundError,
     MsdsUpstreamError,
@@ -41,14 +40,14 @@ from app.services.assessment import (
 router = APIRouter(prefix="/orchestrator", tags=["orchestrator"])
 
 _DESCRIPTION = """
-**선석 검증 화면의 주 엔드포인트.** 기상 → 선석 후보 → 선석별 기상 재판정 → 혼재 판정을
-순서대로 돌려 결론 하나를 냅니다. 개별 에이전트 API를 따로 호출해 합치지 마세요 —
-기상이 불가면 선석 탐색을 건너뛰고, 선석 확정 후 그 부두그룹 임계값으로 기상을 다시
-판정하는 순서가 여기 들어 있습니다.
+**선석 검증 화면의 주 엔드포인트.** 정해진 선석 하나에 대해 선석(가용수심·흘수 여유·이웃
+화물) → 그 선석 임계값으로 기상 → 혼재 판정을 순서대로 돌려 결론 하나를 냅니다. 판정 잡
+(10분 주기)과 같은 계산입니다.
 
-**`assigned_wharf_name` 을 반드시 채워 주세요(검증모드).** 비우면 118석 전체를
-탐색해 top-3를 고릅니다 — 이 시스템이 하지 않기로 한 동작입니다. 배정은 항만공사
-선석회의가 하고, 우리는 그 배정이 조건에 맞는지 확인합니다.
+**`assigned_wharf_name` 은 필수입니다.** 배가 실제로 붙은 부두(위치 판정) 또는 접안 전이면
+PORT-MIS 신고 선석을 넣으세요. [2026-09-27] 선석을 새로 고르는 탐색모드를 걷어냈습니다 —
+배정은 항만공사 선석회의가 하고, 우리는 그 배정이 조건에 맞는지 확인합니다. 다른 자리가
+필요하면 `POST /scheduling/alternatives`(대체 선석 제안)를 쓰세요.
 
 **`overall_decision`** 은 아직 배정 주체의 어휘(`승인가능`/`적합선석없음` …)로 나옵니다.
 화면에 그대로 쓰지 마세요 — `assessment_history.level`(적합/주의/부적합/판정불가)로
@@ -61,8 +60,7 @@ _DESCRIPTION = """
 
 _RESPONSES: dict = {
     404: {"description": "요청한 화물의 MSDS를 찾을 수 없음 (KOSHA 미등재 CAS/chem_id)"},
-    422: {"description": "요청 형식 오류, 또는 화물에 선석 카테고리(cargo_category)가 "
-                         "지정되지 않아 후보 탐색 불가"},
+    422: {"description": "요청 형식 오류 — assigned_wharf_name 누락 포함"},
     502: {"description": "KOSHA MSDS API 또는 LLM 호출 실패. 재시도 가능"},
 }
 
@@ -76,11 +74,6 @@ async def _orchestrate_or_http(
         raise HTTPException(status_code=404, detail=f"MSDS not found for identifier: {e.identifier}")
     except MsdsUpstreamError as e:
         raise HTTPException(status_code=502, detail=f"KOSHA MSDS API 호출 실패: {e.reason}")
-    except CargoCategoryUnknownError as e:
-        raise HTTPException(
-            status_code=422,
-            detail=f"화물({e.chem_id})에 선석 카테고리(cargo_category)가 지정되어 있지 않습니다.",
-        )
     except LLMGenerationError as e:
         raise HTTPException(status_code=502, detail=f"LLM 판단 생성 실패 ({e.provider}): {e.reason}")
 
@@ -118,11 +111,22 @@ class AssessAndRecordRequest(OrchestratorRequest):
 
 # 시점(stage)은 AIS 항해상태로만 정한다 — 프런트가 보낸 값을 믿지 않고 여기서 읽는다.
 # PORT-MIS 를 쓰지 않는 이유는 app/models/assessment_history.py::AssessmentStage 참고.
+# [2026-09-27] facility_name 은 PORT-MIS(10분 주기) 신고 계류시설이다. 예전엔
+# dashboard_current.facility_name(= 하루 1번 수집되는 VTS 이력의 첫 행)을 읽어
+# 스냅샷의 portmis_facility 칸에 VTS 선석이 남았다(arrival_watcher 와 같은 문제).
 _QUERY_LIVE_STATE = text("""
-    SELECT nav_status_code, received_at_utc, facility_name, draught
-    FROM mart.dashboard_current
-    WHERE callsgn = :call_sign
-    ORDER BY received_at_utc DESC NULLS LAST
+    SELECT dc.nav_status_code, dc.received_at_utc, pm.arrival_facility_nm AS facility_name, dc.draught
+    FROM mart.dashboard_current dc
+    LEFT JOIN LATERAL (
+        SELECT p.arrival_facility_nm
+        FROM portmis_vessel p
+        WHERE upper(btrim(p.callsgn)) = upper(btrim(dc.callsgn))
+          AND p.arrival_at_utc <= now() + interval '12 hours'
+        ORDER BY p.arrival_at_utc DESC
+        LIMIT 1
+    ) pm ON true
+    WHERE dc.callsgn = :call_sign
+    ORDER BY dc.received_at_utc DESC NULLS LAST
     LIMIT 1
 """)
 
@@ -148,15 +152,6 @@ async def assess_and_record(
     db: AsyncSession = Depends(get_session),
     llm_client: LLMClient = Depends(get_llm_client),
 ) -> AssessAndRecordResult:
-    if not request.assigned_wharf_name:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "assigned_wharf_name 이 필요합니다 — 이 시스템은 선석을 고르지 않고 "
-                "이미 배정된 시설이 조건에 맞는지 확인합니다."
-            ),
-        )
-
     base = OrchestratorRequest(**request.model_dump(include=set(OrchestratorRequest.model_fields)))
     result = await _orchestrate_or_http(db, llm_client, base)
 
