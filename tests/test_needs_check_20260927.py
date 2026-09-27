@@ -1,5 +1,6 @@
-"""혼재 '주의'에서 '확인요청'(충돌 없음 · 근거 없음)을 가른다 (2026-09-27).
+"""혼재 등급이 판정 등급으로 옮겨지는 적합 경로 (2026-09-27).
 
+'확인요청' 등급은 없앴다 — 충돌 없이 근거만 없는 혼재 '주의'도 '주의'로 기록한다.
 DB·그래프 없이 level_from_decision 의 적합 경로만 확인한다.
 """
 from types import SimpleNamespace
@@ -7,7 +8,7 @@ from types import SimpleNamespace
 from app.agents.orchestrator.schemas import OverallDecision
 from app.agents.safety.schemas import RiskLevel
 from app.agents.weather.schemas import WorkStatus
-from app.models.assessment_history import GATE_BLOCKING_LEVELS, AssessmentLevel
+from app.models.assessment_history import AssessmentLevel
 from app.services.assessment import level_from_decision
 
 
@@ -30,14 +31,13 @@ def _result(conditions=(), **safety):
     )
 
 
-def test_unassessed_only_is_needs_check():
-    level, headline = level_from_decision(_result())
-    assert level is AssessmentLevel.NEEDS_CHECK
-    assert "2쌍" in headline
+def test_unassessed_only_is_caution():
+    level, _ = level_from_decision(_result())
+    assert level is AssessmentLevel.CAUTION
 
 
-def test_needs_check_does_not_lock_gate():
-    assert AssessmentLevel.NEEDS_CHECK not in GATE_BLOCKING_LEVELS
+def test_needs_check_level_removed():
+    assert "확인요청" not in {lv.value for lv in AssessmentLevel}
 
 
 def test_real_conflict_stays_caution():
@@ -49,7 +49,6 @@ def test_real_conflict_stays_caution():
 
 
 def test_bulk_caution_stays_caution():
-    # 벌크 특수가스처럼 충돌 근거가 있는 주의는 확인요청이 아니다
     level, _ = level_from_decision(_result(
         bulk_compatibility_conflicts=[SimpleNamespace(adjacent_name="가스", reason="특수가스")],
     ))

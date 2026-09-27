@@ -137,7 +137,7 @@ class AssessAndRecordResult(BaseModel):
         description="판정이 실제로 기록됐는가. 직전 판정과 시점·등급·조치안이 모두 같으면 "
         "기록하지 않는다(변화만 남긴다) — 그때 False"
     )
-    level: str = Field(description="적합 | 주의 | 확인요청 | 부적합 | 판정불가")
+    level: str = Field(description="적합 | 주의 | 부적합 | 판정불가")
     stage: str | None = Field(default=None, description="AIS 항해상태로 정한 시점. 상태를 모르면 None")
 
 

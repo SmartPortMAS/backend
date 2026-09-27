@@ -44,7 +44,7 @@ class PendingItem(BaseModel):
     vessel_name: str | None
     stage: str = Field(description="입항전 | 접안직전 | 하역중")
     wharf_name: str | None
-    level: str = Field(description="적합 | 주의 | 확인요청 | 부적합 | 판정불가")
+    level: str = Field(description="적합 | 주의 | 부적합 | 판정불가")
     changed_from: str | None = Field(default=None, description="직전 판정 등급. 값이 있으면 등급이 바뀐 것")
     action: str | None = Field(default=None, description="조치안. 우리가 실행하지 않는다")
     recipient: str | None = Field(default=None, description="조치안을 받을 곳 — 선석운영주체 | VTS | 터미널")

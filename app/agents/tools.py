@@ -19,7 +19,7 @@
   who_is_at           운영 — 이 부두와 인접 부두에 붙은 배·화물·최근 판정(C단계)
 
 도구 결과는 berth_opinion · weather_opinion · segregation_opinion 으로 의견(Opinion:
-등급 · 확인한 것 · 못 본 것)이 된다(B단계). 혼재 '확인요청'은 segregation_opinion 이 정한다.
+등급 · 확인한 것 · 못 본 것)이 된다(B단계).
 """
 
 from datetime import datetime, timedelta, timezone
@@ -45,7 +45,7 @@ from app.agents.weather.service import assess_weather
 from app.llm.base import LLMClient
 
 
-OpinionLevel = Literal["적합", "주의", "확인요청", "부적합", "판정불가"]
+OpinionLevel = Literal["적합", "주의", "부적합", "판정불가"]
 
 
 class Opinion(BaseModel):
@@ -225,29 +225,10 @@ def weather_opinion(w: WeatherAssessmentResult) -> Opinion:
     return Opinion(axis="기상", level=level, evidence=evidence, checked=checked, missing=missing)
 
 
-def only_unassessed(s: SafetyAssessmentResult) -> bool:
-    """혼재 '주의'의 근거가 충돌이 아니라 '볼 근거 없음'(미평가 쌍)뿐인가.
-
-    규칙 하한이 '주의'이고 MSDS·벌크·포장 충돌이 하나도 없을 때만(LLM 이 올린 등급은
-    여기서 판단하지 않는다). 2026-09-27 실측: 인접 관계를 넓힌 뒤 적합 37척 중 혼재
-    '주의' 19척이 전부 이 경우였다.
-    """
-    return (
-        s.risk_level is RiskLevel.CAUTION
-        and s.rule_engine_floor is RiskLevel.CAUTION
-        and bool(s.unassessed_pairs)
-        and not s.conflicts
-        and not s.bulk_compatibility_conflicts
-        and not s.packaging_violations
-    )
-
-
 def segregation_opinion(s: SafetyAssessmentResult) -> Opinion:
-    """check_segregation 결과 → 혼재 의견. '확인요청'은 여기서 정해진다."""
-    if only_unassessed(s):
-        level: OpinionLevel = "확인요청"
-    elif s.risk_level is RiskLevel.SAFE:
-        level = "적합"
+    """check_segregation 결과 → 혼재 의견."""
+    if s.risk_level is RiskLevel.SAFE:
+        level: OpinionLevel = "적합"
     elif s.risk_level is RiskLevel.BLOCKED:
         level = "부적합"
     else:
