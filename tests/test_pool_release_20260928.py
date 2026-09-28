@@ -8,6 +8,7 @@ import asyncio
 
 import pytest
 
+from app.agents.safety import berth_alerts
 from app.agents.safety.berth_alerts import build_berth_alerts
 from app.api.v1 import dashboard
 
@@ -17,6 +18,23 @@ async def test_build_berth_alerts_leaves_no_open_transaction(db, neo4j):
     # 트랜잭션이 열려 있으면 연결이 풀로 돌아가지 않는다
     await build_berth_alerts(db, neo4j)
     assert not db.in_transaction()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_graph_queries_give_same_alerts_as_sequential(db, neo4j, monkeypatch):
+    # 동시 조회는 속도만 바꾼다 — 1개씩(예전 순차)과 경고 내용·순서가 같아야 한다
+    rows = [dict(r) for r in (await db.execute(berth_alerts._QUERY_BERTH_CARGO)).mappings().all()]
+
+    async def run() -> list[dict]:
+        return (
+            await berth_alerts._segregation_alerts(rows, neo4j)
+            + await berth_alerts._adjacent_berth_alerts(rows, neo4j)
+        )
+
+    monkeypatch.setattr(berth_alerts, "_NEO4J_CONCURRENCY", 1)
+    sequential = await run()
+    monkeypatch.setattr(berth_alerts, "_NEO4J_CONCURRENCY", 8)
+    assert await run() == sequential
 
 
 @pytest.mark.asyncio
