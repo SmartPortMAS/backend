@@ -475,12 +475,20 @@ async def build_berth_alerts(db: AsyncSession, driver: AsyncDriver) -> list[dict
     # 재항 화물은 한 번만 읽어 같은 선석 판정과 인접 선석 판정(D3)이 나눠 쓴다 —
     # 두 번 읽으면 두 경고가 서로 다른 시점의 현황을 말할 수 있다.
     cargo_rows = [dict(r) for r in (await db.execute(_QUERY_BERTH_CARGO)).mappings().all()]
+    draught = await _draught_alerts(db)
+    assessment = await _assessment_alerts(db)
+    # [2026-09-28] DB 조회를 먼저 끝내고 트랜잭션을 닫은 뒤 Neo4j 판정을 한다.
+    #   Neo4j 조회는 화물 수에 비례해 수백 번 순차로 돌고(운영 Aura 에서 2분 이상),
+    #   그동안 트랜잭션이 열려 있으면 연결이 풀로 안 돌아가고 facility_alias 의
+    #   락도 쥔 채라 수집기 REFRESH 까지 막혔다(docs/31 참고). 읽기만 했으므로
+    #   commit 은 아무것도 쓰지 않는다.
+    await db.commit()
 
     alerts = (
         await _segregation_alerts(cargo_rows, driver)
         + await _adjacent_berth_alerts(cargo_rows, driver)
-        + await _draught_alerts(db)
-        + await _assessment_alerts(db)
+        + draught
+        + assessment
     )
     order = {"DANGER": 0, "WARNING": 1, "INFO": 2}
     alerts.sort(key=lambda a: (order.get(a["level"], 9), a["type"]))
