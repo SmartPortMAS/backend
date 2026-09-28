@@ -17,6 +17,8 @@
    (위험물인데 정체 미확인)은 판정 대상에서 빼되, 그 사실 자체를 경고로 올린다.
 """
 
+import asyncio
+
 from neo4j import AsyncDriver
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -77,6 +79,35 @@ _RISK_TO_ALERT = {
 }
 
 
+# Neo4j 동시 조회 상한. 드라이버 풀(기본 100)과 Aura 부하를 넘지 않게 작게 둔다.
+_NEO4J_CONCURRENCY = 8
+
+
+async def _segregation_facts(
+    driver: AsyncDriver, sem: asyncio.Semaphore, target_id: str, other_ids: list[str]
+) -> tuple:
+    """대상 화물 하나의 혼재 판정에 필요한 그래프 조회 결과(판정은 하지 않는다)."""
+    async with sem:
+        return (
+            await find_incompatible_conflicts(
+                driver, target_chem_id=target_id, adjacent_chem_ids=other_ids
+            ),
+            await find_imdg_segregation_conflicts(
+                driver, target_chem_id=target_id, adjacent_chem_ids=other_ids
+            ),
+            await find_imdg_no_segregation_required(
+                driver, target_chem_id=target_id, adjacent_chem_ids=other_ids
+            ),
+            await find_bulk_group_conflicts(
+                driver, target_chem_id=target_id, adjacent_chem_ids=other_ids
+            ),
+            await find_bulk_groups(driver, chem_ids=[target_id, *other_ids]),
+            await find_bulk_exceptions(
+                driver, target_chem_id=target_id, adjacent_chem_ids=other_ids
+            ),
+        )
+
+
 async def _segregation_alerts(rows: list[dict], driver: AsyncDriver) -> list[dict]:
     """같은 선석에 있는 화물끼리 짝을 지어 혼재금지·IMDG 격리 규칙을 돌린다.
 
@@ -91,6 +122,8 @@ async def _segregation_alerts(rows: list[dict], driver: AsyncDriver) -> list[dic
     alerts: list[dict] = []
     # 선석별 충돌 쌍을 모았다가 마지막에 한 건으로 묶는다
     pairs_by_berth: dict[str, list[dict]] = {}
+    # (선석, 선석의 식별 화물, 대상 화물, 대상 외 화물, 대상 외 chem_id)
+    jobs: list[tuple] = []
     for berth, cargos in by_berth.items():
         identified = [c for c in cargos if c["chem_id"]]
         unidentified = len(cargos) - len(identified)
@@ -110,130 +143,127 @@ async def _segregation_alerts(rows: list[dict], driver: AsyncDriver) -> list[dic
         if len(identified) < 2:
             continue
 
-        seen: set[tuple[str, str]] = set()
         for target in identified:
             others = [c for c in identified if c["chem_id"] != target["chem_id"]]
             if not others:
                 continue
-            other_ids = list({c["chem_id"] for c in others})
+            jobs.append((berth, identified, target, others, list({c["chem_id"] for c in others})))
 
-            raw_conflicts = await find_incompatible_conflicts(
-                driver, target_chem_id=target["chem_id"], adjacent_chem_ids=other_ids
-            )
-            raw_imdg = await find_imdg_segregation_conflicts(
-                driver, target_chem_id=target["chem_id"], adjacent_chem_ids=other_ids
-            )
+    # [2026-09-28] Neo4j 조회는 동시에 돌리고 판정은 원래 순서대로 한다. 순차로 돌면
+    #   운영(Aura) 왕복 지연 때문에 대상 59개 × 조회 6개가 2분을 넘었다(docs/31).
+    #   조회 입력·판정 함수는 그대로라 결과는 같다.
+    sem = asyncio.Semaphore(_NEO4J_CONCURRENCY)
+    facts = await asyncio.gather(*(
+        _segregation_facts(driver, sem, target["chem_id"], other_ids)
+        for _, _, target, _, other_ids in jobs
+    ))
 
-            # 대상·인접 화물의 IMDG Class가 둘 다 알려져 있는데 위 조회에 안 걸린
-            # 쌍 — SEGREGATE 관계가 없다는 게 "공인 규정상 X(개별 확인 필요)"인지
-            # "이 Class 조합이 그래프 커버리지 밖"인지 구분이 안 되므로, 여기서
-            # "충돌 없음 = 안전"으로 조용히 넘기지 않는다(safety.rule_engine.
-            # compute_imdg_unconfirmed_floor와 동일한 원칙 — 판정 로직은 그쪽이
-            # 유일한 권위이므로 등급 계산은 반드시 그 함수를 그대로 호출한다).
-            confirmed_imdg_ids = {r["chem_id"] for r in raw_imdg}
-            # NO_SEGREGATION_REQUIRED로 확정된 조합(같은 Class끼리 등)은 미확인
-            # 대상에서 뺀다 — service.assess_safety와 동일한 이유(2026-08-21 발견,
-            # 벤젠-가솔린처럼 같은 Class끼리마다 근거 없는 주의 경고가 나던 문제).
-            confirmed_no_segregation_ids = await find_imdg_no_segregation_required(
-                driver, target_chem_id=target["chem_id"], adjacent_chem_ids=other_ids
-            )
-            unconfirmed_imdg = [
-                {
-                    "chem_id": o["chem_id"],
-                    "name_ko": o["cargo_name"],
-                    "segregation_code": "X(개별확인필요)",
-                }
-                for o in others
-                if o["imdg_class"]
-                and target["imdg_class"]
-                and o["chem_id"] not in confirmed_imdg_ids
-                and o["chem_id"] not in confirmed_no_segregation_ids
-            ]
+    seen_by_berth: dict[str, set[tuple[str, str]]] = {}
+    for (berth, identified, target, others, other_ids), fact in zip(jobs, facts):
+        seen = seen_by_berth.setdefault(berth, set())
+        (raw_conflicts, raw_imdg, confirmed_no_segregation_ids,
+         bulk_group_rows, bulk_groups, (bulk_safe_ids, bulk_blocked_ids)) = fact
 
-            # 벌크 액체화학물질 호환성 그룹 참고축(bulk_compatibility.py) — MSDS
-            # 텍스트 마이닝·IMDG 공인 격리표와 근거가 다른 제3의 신호. 2026-08-21부터
-            # Neo4j 그래프 조회로 판정한다(chem_id 기준 — service.assess_safety와
-            # 동일한 그래프·동일한 판정 함수를 그대로 재사용해, 이 화면과 개별 심사
-            # API·챗봇이 같은 질문에 다른 답을 내지 않게 한다).
-            bulk_group_rows = await find_bulk_group_conflicts(
-                driver, target_chem_id=target["chem_id"], adjacent_chem_ids=other_ids
-            )
-            bulk_groups = await find_bulk_groups(driver, chem_ids=[target["chem_id"], *other_ids])
-            bulk_safe_ids, bulk_blocked_ids = await find_bulk_exceptions(
-                driver, target_chem_id=target["chem_id"], adjacent_chem_ids=other_ids
-            )
-            raw_bulk = build_bulk_conflicts(
-                target_chem_id=target["chem_id"],
-                adjacent_chem_ids=other_ids,
-                adjacent_names={o["chem_id"]: (o["cargo_name"] or o["chem_id"]) for o in others},
-                group_conflict_ids={row["chem_id"] for row in bulk_group_rows},
-                groups_by_chem_id=bulk_groups,
-                safe_exception_ids=bulk_safe_ids,
-                blocked_exception_ids=bulk_blocked_ids,
-            )
-
-            if not raw_conflicts and not raw_imdg and not unconfirmed_imdg and not raw_bulk:
-                continue
-
-            # [2026-09-26] 등급은 **화물쌍마다** 따로 낸다. 예전엔 대상 화물 하나와
-            # 같은 선석의 다른 화물 전부를 합쳐 한 등급을 내고 그 등급을 모든 쌍에
-            # 붙였다 — 쌍마다 1건(위험)인 조합 둘이 합쳐져 배정불가가 되고, 참고 수준의
-            # 쌍까지 배정불가로 표시됐다. compute_risk_floor 의 "2건 이상" 은 쌍 하나의 규칙이다.
-            def _of(rows: list[dict], oid: str) -> list[dict]:
-                return [r for r in rows if r["chem_id"] == oid]
-
-            pair_floor = {
-                oid: max_risk_level(
-                    max_risk_level(
-                        compute_risk_floor(_of(raw_conflicts, oid)),
-                        compute_imdg_costowage_floor(_of(raw_imdg, oid)),
-                    ),
-                    max_risk_level(
-                        compute_imdg_unconfirmed_floor(bool(_of(unconfirmed_imdg, oid))),
-                        compute_bulk_compatibility_floor(_of(raw_bulk, oid)),
-                    ),
-                )
-                for oid in other_ids
+        # 대상·인접 화물의 IMDG Class가 둘 다 알려져 있는데 위 조회에 안 걸린
+        # 쌍 — SEGREGATE 관계가 없다는 게 "공인 규정상 X(개별 확인 필요)"인지
+        # "이 Class 조합이 그래프 커버리지 밖"인지 구분이 안 되므로, 여기서
+        # "충돌 없음 = 안전"으로 조용히 넘기지 않는다(safety.rule_engine.
+        # compute_imdg_unconfirmed_floor와 동일한 원칙 — 판정 로직은 그쪽이
+        # 유일한 권위이므로 등급 계산은 반드시 그 함수를 그대로 호출한다).
+        confirmed_imdg_ids = {r["chem_id"] for r in raw_imdg}
+        # NO_SEGREGATION_REQUIRED로 확정된 조합(같은 Class끼리 등)은 미확인
+        # 대상에서 뺀다 — service.assess_safety와 동일한 이유(2026-08-21 발견,
+        # 벤젠-가솔린처럼 같은 Class끼리마다 근거 없는 주의 경고가 나던 문제).
+        unconfirmed_imdg = [
+            {
+                "chem_id": o["chem_id"],
+                "name_ko": o["cargo_name"],
+                "segregation_code": "X(개별확인필요)",
             }
+            for o in others
+            if o["imdg_class"]
+            and target["imdg_class"]
+            and o["chem_id"] not in confirmed_imdg_ids
+            and o["chem_id"] not in confirmed_no_segregation_ids
+        ]
 
-            name_of = {c["chem_id"]: (c["cargo_name"] or c["chem_id"]) for c in identified}
-            for raw in raw_conflicts + raw_imdg + unconfirmed_imdg + raw_bulk:
-                other_id = raw["chem_id"]
-                floor = pair_floor[other_id]
-                if risk_level_rank(floor) < risk_level_rank(RiskLevel.CAUTION):
-                    continue
-                # (A,B)와 (B,A)는 같은 사건이라 한 번만 올린다
-                pair = tuple(sorted((target["chem_id"], other_id)))
-                if pair in seen:
-                    continue
-                seen.add(pair)
+        # 벌크 액체화학물질 호환성 그룹 참고축(bulk_compatibility.py) — MSDS
+        # 텍스트 마이닝·IMDG 공인 격리표와 근거가 다른 제3의 신호. 2026-08-21부터
+        # Neo4j 그래프 조회로 판정한다(chem_id 기준 — service.assess_safety와
+        # 동일한 그래프·동일한 판정 함수를 그대로 재사용해, 이 화면과 개별 심사
+        # API·챗봇이 같은 질문에 다른 답을 내지 않게 한다).
+        raw_bulk = build_bulk_conflicts(
+            target_chem_id=target["chem_id"],
+            adjacent_chem_ids=other_ids,
+            adjacent_names={o["chem_id"]: (o["cargo_name"] or o["chem_id"]) for o in others},
+            group_conflict_ids={row["chem_id"] for row in bulk_group_rows},
+            groups_by_chem_id=bulk_groups,
+            safe_exception_ids=bulk_safe_ids,
+            blocked_exception_ids=bulk_blocked_ids,
+        )
 
-                target_name = target["cargo_name"] or target["chem_id"]
-                other_name = raw.get("name_ko") or name_of.get(other_id, other_id)
-                if "segregation_code" in raw:
-                    why = f"IMDG 격리코드 {raw['segregation_code']}"
-                elif "reason" in raw:
-                    why = f"벌크호환성그룹(참고) — {raw['reason']}"
-                else:
-                    why = f"혼재금지({raw.get('category', '분류 미상')})"
+        if not raw_conflicts and not raw_imdg and not unconfirmed_imdg and not raw_bulk:
+            continue
 
-                pairs_by_berth.setdefault(berth, []).append({
-                    "level": _RISK_TO_ALERT[floor],
-                    "risk_level": floor,
-                    "text": f"{target_name} ↔ {other_name} {why}",
-                    # 이 조합에 실제로 걸린 배들. 화면이 경고에서 선박 상세로 갈
-                    # 수 있게 하려면 선석 이름만으로는 부족하다.
-                    "callsgns": [
-                        c["callsgn"]
-                        for c in identified
-                        if c["chem_id"] in (target["chem_id"], other_id) and c["callsgn"]
-                    ],
-                    # 이 경고가 지목한 두 물질. 화면이 "이 경고를 심사"로 넘어갈 때
-                    # 무엇을 폼에 넣어야 하는지가 이 값이다 — 없으면 그 선석의 아무
-                    # 화물이나 집어넣게 되어, 경고는 "가솔린↔부탄"인데 심사는 케로젠을
-                    # 하는 상황이 된다.
-                    "chem_ids": [target["chem_id"], other_id],
-                })
+        # [2026-09-26] 등급은 **화물쌍마다** 따로 낸다. 예전엔 대상 화물 하나와
+        # 같은 선석의 다른 화물 전부를 합쳐 한 등급을 내고 그 등급을 모든 쌍에
+        # 붙였다 — 쌍마다 1건(위험)인 조합 둘이 합쳐져 배정불가가 되고, 참고 수준의
+        # 쌍까지 배정불가로 표시됐다. compute_risk_floor 의 "2건 이상" 은 쌍 하나의 규칙이다.
+        def _of(rows: list[dict], oid: str) -> list[dict]:
+            return [r for r in rows if r["chem_id"] == oid]
+
+        pair_floor = {
+            oid: max_risk_level(
+                max_risk_level(
+                    compute_risk_floor(_of(raw_conflicts, oid)),
+                    compute_imdg_costowage_floor(_of(raw_imdg, oid)),
+                ),
+                max_risk_level(
+                    compute_imdg_unconfirmed_floor(bool(_of(unconfirmed_imdg, oid))),
+                    compute_bulk_compatibility_floor(_of(raw_bulk, oid)),
+                ),
+            )
+            for oid in other_ids
+        }
+
+        name_of = {c["chem_id"]: (c["cargo_name"] or c["chem_id"]) for c in identified}
+        for raw in raw_conflicts + raw_imdg + unconfirmed_imdg + raw_bulk:
+            other_id = raw["chem_id"]
+            floor = pair_floor[other_id]
+            if risk_level_rank(floor) < risk_level_rank(RiskLevel.CAUTION):
+                continue
+            # (A,B)와 (B,A)는 같은 사건이라 한 번만 올린다
+            pair = tuple(sorted((target["chem_id"], other_id)))
+            if pair in seen:
+                continue
+            seen.add(pair)
+
+            target_name = target["cargo_name"] or target["chem_id"]
+            other_name = raw.get("name_ko") or name_of.get(other_id, other_id)
+            if "segregation_code" in raw:
+                why = f"IMDG 격리코드 {raw['segregation_code']}"
+            elif "reason" in raw:
+                why = f"벌크호환성그룹(참고) — {raw['reason']}"
+            else:
+                why = f"혼재금지({raw.get('category', '분류 미상')})"
+
+            pairs_by_berth.setdefault(berth, []).append({
+                "level": _RISK_TO_ALERT[floor],
+                "risk_level": floor,
+                "text": f"{target_name} ↔ {other_name} {why}",
+                # 이 조합에 실제로 걸린 배들. 화면이 경고에서 선박 상세로 갈
+                # 수 있게 하려면 선석 이름만으로는 부족하다.
+                "callsgns": [
+                    c["callsgn"]
+                    for c in identified
+                    if c["chem_id"] in (target["chem_id"], other_id) and c["callsgn"]
+                ],
+                # 이 경고가 지목한 두 물질. 화면이 "이 경고를 심사"로 넘어갈 때
+                # 무엇을 폼에 넣어야 하는지가 이 값이다 — 없으면 그 선석의 아무
+                # 화물이나 집어넣게 되어, 경고는 "가솔린↔부탄"인데 심사는 케로젠을
+                # 하는 상황이 된다.
+                "chem_ids": [target["chem_id"], other_id],
+            })
 
     # 선석 단위로 묶는다.
     #
@@ -301,75 +331,84 @@ async def _adjacent_berth_alerts(rows: list[dict], driver: AsyncDriver) -> list[
     seen: set[frozenset] = set()
     alerts: list[dict] = []
 
-    for wharf, cargos in by_wharf.items():
-        for target in {c["chem_id"]: c for c in cargos}.values():
-            hits = await find_adjacent_berth_conflicts(
-                driver,
-                wharf_name=wharf,
-                target_chem_id=target["chem_id"],
-                neighbor_cargo=cargo,
+    # 조회는 동시에, 판정은 원래 순서대로(_segregation_alerts 와 같은 이유)
+    targets = [
+        (wharf, target)
+        for wharf, cargos in by_wharf.items()
+        for target in {c["chem_id"]: c for c in cargos}.values()
+    ]
+    sem = asyncio.Semaphore(_NEO4J_CONCURRENCY)
+
+    async def _hits(wharf: str, target_id: str) -> list[dict]:
+        async with sem:
+            return await find_adjacent_berth_conflicts(
+                driver, wharf_name=wharf, target_chem_id=target_id, neighbor_cargo=cargo
             )
-            for hit in hits:
-                pair = frozenset({
-                    (wharf, target["chem_id"]),
-                    (hit["neighbor_wharf"], hit["chem_id"]),
-                })
-                if pair in seen:
-                    continue
-                seen.add(pair)
 
-                msds = (
-                    [{"category": hit["via"]}]
-                    if hit["basis"] == "MSDS_INCOMPATIBLE"
-                    else []
-                )
-                floor = max_risk_level(
-                    compute_risk_floor(msds),
-                    # 항상 SAFE. "IMDG 를 의도적으로 뺐다"가 코드에 보이게 남긴다.
-                    compute_imdg_berth_adjacency_floor([hit]),
-                )
-                is_reference_only = floor == RiskLevel.SAFE
+    all_hits = await asyncio.gather(*(_hits(w, t["chem_id"]) for w, t in targets))
 
-                target_name = target["cargo_name"] or target["chem_id"]
-                dist = (
-                    f"{int(round(hit['distance_m']))}m"
-                    if hit["distance_m"] is not None
-                    else "거리 미상"
-                )
-                if is_reference_only:
-                    message = (
-                        f"{wharf}: {target_name} ↔ 인접 {hit['neighbor_wharf']}"
-                        f"({dist}) {hit['name_ko']} — IMDG 격리코드 "
-                        f"{hit['segregation_code']} (참고 — 부두 간에는 등급 근거로 "
-                        f"쓰지 않음)"
-                    )
-                else:
-                    message = (
-                        f"{wharf}: {target_name} ↔ 인접 {hit['neighbor_wharf']}"
-                        f"({dist}) {hit['name_ko']} 혼재금지({hit['via']})"
-                        f" → {floor.value}"
-                    )
+    for (wharf, target), hits in zip(targets, all_hits):
+        for hit in hits:
+            pair = frozenset({
+                (wharf, target["chem_id"]),
+                (hit["neighbor_wharf"], hit["chem_id"]),
+            })
+            if pair in seen:
+                continue
+            seen.add(pair)
 
-                callsgns = [
-                    cs
-                    for cs in (target.get("callsgn"), hit.get("callsgn"))
-                    if cs
-                ]
-                alerts.append({
-                    "level": "INFO" if is_reference_only else _RISK_TO_ALERT[floor],
-                    "type": "ADJACENT_SEGREGATION",
-                    "berth_name": wharf,
-                    "message": message,
-                    "risk_level": None if is_reference_only else floor.value,
-                    "basis": "Neo4j ADJACENT_TO 확장 탐색 (선석→인접→재항화물→충돌)",
-                    # 그래프가 만든 경로 문장. 화면·보고서가 근거를 다시 조립하지
-                    # 않게 하려고 그대로 싣는다(회의 §3 "경로 문장").
-                    "graph_path": hit["path_text"],
-                    "neighbor_berth_name": hit["neighbor_wharf"],
-                    "distance_m": hit["distance_m"],
-                    "callsgns": list(dict.fromkeys(callsgns)),
-                    "chem_ids": [target["chem_id"], hit["chem_id"]],
-                })
+            msds = (
+                [{"category": hit["via"]}]
+                if hit["basis"] == "MSDS_INCOMPATIBLE"
+                else []
+            )
+            floor = max_risk_level(
+                compute_risk_floor(msds),
+                # 항상 SAFE. "IMDG 를 의도적으로 뺐다"가 코드에 보이게 남긴다.
+                compute_imdg_berth_adjacency_floor([hit]),
+            )
+            is_reference_only = floor == RiskLevel.SAFE
+
+            target_name = target["cargo_name"] or target["chem_id"]
+            dist = (
+                f"{int(round(hit['distance_m']))}m"
+                if hit["distance_m"] is not None
+                else "거리 미상"
+            )
+            if is_reference_only:
+                message = (
+                    f"{wharf}: {target_name} ↔ 인접 {hit['neighbor_wharf']}"
+                    f"({dist}) {hit['name_ko']} — IMDG 격리코드 "
+                    f"{hit['segregation_code']} (참고 — 부두 간에는 등급 근거로 "
+                    f"쓰지 않음)"
+                )
+            else:
+                message = (
+                    f"{wharf}: {target_name} ↔ 인접 {hit['neighbor_wharf']}"
+                    f"({dist}) {hit['name_ko']} 혼재금지({hit['via']})"
+                    f" → {floor.value}"
+                )
+
+            callsgns = [
+                cs
+                for cs in (target.get("callsgn"), hit.get("callsgn"))
+                if cs
+            ]
+            alerts.append({
+                "level": "INFO" if is_reference_only else _RISK_TO_ALERT[floor],
+                "type": "ADJACENT_SEGREGATION",
+                "berth_name": wharf,
+                "message": message,
+                "risk_level": None if is_reference_only else floor.value,
+                "basis": "Neo4j ADJACENT_TO 확장 탐색 (선석→인접→재항화물→충돌)",
+                # 그래프가 만든 경로 문장. 화면·보고서가 근거를 다시 조립하지
+                # 않게 하려고 그대로 싣는다(회의 §3 "경로 문장").
+                "graph_path": hit["path_text"],
+                "neighbor_berth_name": hit["neighbor_wharf"],
+                "distance_m": hit["distance_m"],
+                "callsgns": list(dict.fromkeys(callsgns)),
+                "chem_ids": [target["chem_id"], hit["chem_id"]],
+            })
 
     return alerts
 
