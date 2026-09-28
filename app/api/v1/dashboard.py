@@ -11,6 +11,7 @@ upa_* 테이블(포트 호출/선박위치)은 data-pipeline UPA 로더가 auto_
 않는다 — ORM 모델 없이 raw SQL로 읽기만 한다.
 """
 
+import asyncio
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
@@ -34,7 +35,12 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 # 판정의 원천(재항 현황·화물·기상)은 cloud_pull 이 시간 단위로 갱신하므로,
 # 5분 캐시는 의미를 잃지 않는다 — 같은 입력을 5분에 한 번만 다시 계산할 뿐이다.
 # 프로세스 메모리 캐시라 재시작하면 비워지고, 워커 1개(uvicorn 기본) 전제다.
+#
+# [2026-09-28] 키별 Lock 으로 동시 요청을 한 번의 계산에 합친다. 운영(Neo4j Aura)에서
+#   /alerts 계산이 2분을 넘자, 캐시가 비어 있는 동안 들어온 폴링이 전부 따로
+#   계산하며 DB 연결을 하나씩 쥐어 풀(5+10)이 고갈됐다(docs/31 참고).
 _TTL_CACHE: dict = {}
+_TTL_LOCKS: dict[str, asyncio.Lock] = {}
 _TTL_SECONDS = 300.0
 
 
@@ -44,9 +50,15 @@ async def _cached(key: str, producer):
     hit = _TTL_CACHE.get(key)
     if hit is not None and (now - hit[0]) < _TTL_SECONDS:
         return hit[1]
-    value = await producer()
-    _TTL_CACHE[key] = (now, value)
-    return value
+    async with _TTL_LOCKS.setdefault(key, asyncio.Lock()):
+        # 기다리는 동안 앞선 요청이 채웠으면 그걸 쓴다
+        now = _time.monotonic()
+        hit = _TTL_CACHE.get(key)
+        if hit is not None and (now - hit[0]) < _TTL_SECONDS:
+            return hit[1]
+        value = await producer()
+        _TTL_CACHE[key] = (now, value)
+        return value
 
 
 # --------------------------------------------------------------------------
