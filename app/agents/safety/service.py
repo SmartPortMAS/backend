@@ -17,6 +17,7 @@
 
 import asyncio
 import re
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 
 from neo4j import AsyncDriver
@@ -27,17 +28,7 @@ from app.llm.base import LLMClient
 from app.models import MsdsChemical
 
 from .bulk_compatibility import build_bulk_conflicts
-from .graph_queries import (
-    find_assessability_facts,
-    find_bulk_exceptions,
-    find_bulk_group_conflicts,
-    find_bulk_groups,
-    find_imdg_classes,
-    find_imdg_no_segregation_required,
-    find_imdg_segregation_conflicts,
-    find_incompatible_conflicts,
-    find_live_categories,
-)
+from .graph_snapshot import get_snapshot
 from .msds_context import ghs_classification, resolve_cargo, summarize_hazard_sections
 from .prompt import SYSTEM_PROMPT, build_user_prompt
 from .stabilized_cargo import with_stabilized_checklist
@@ -208,15 +199,24 @@ async def _compute_onboard_conflicts(
             basis=basis, detail=detail,
         ))
 
-    for v in verdicts:
+    # 화물 행은 이미 해석돼 있다 — DB 없이 화물마다 동시에 돌린다(_compute_verdicts 와 같은 이유, 2026-09-29).
+    def onboard_verdict(v: "_Verdict"):
         a = v.target_row.chem_id
-        others = [
-            AdjacentCargo(berth_name=_ONBOARD_LABEL, cargo=CargoRef(chem_id=o.target_row.chem_id))
-            for o in verdicts if o.target_row.chem_id != a
-        ]
-        ov = await _compute_verdict(
-            db, neo4j_driver, SafetyAssessmentRequest(target_cargo=CargoRef(chem_id=a), adjacent_cargos=others),
+        others = [o for o in verdicts if o.target_row.chem_id != a]
+        request = SafetyAssessmentRequest(
+            target_cargo=CargoRef(chem_id=a),
+            adjacent_cargos=[
+                AdjacentCargo(berth_name=_ONBOARD_LABEL, cargo=CargoRef(chem_id=o.target_row.chem_id))
+                for o in others
+            ],
         )
+        return _compute_verdict(
+            db, neo4j_driver, request,
+            resolved=(v.target_row, [(_ONBOARD_LABEL, None, o.target_row) for o in others]),
+        )
+
+    for v, ov in zip(verdicts, await asyncio.gather(*(onboard_verdict(v) for v in verdicts))):
+        a = v.target_row.chem_id
         for c in ov.bulk_compatibility_conflicts:
             groups = sorted([(c.target_group, c.target_group_name), (c.adjacent_group, c.adjacent_group_name)])
             add(a, c.adjacent_chem_id, "46 CFR 150", " ↔ ".join(f"{n}({g})" for g, n in groups))
@@ -263,16 +263,24 @@ async def _compute_verdicts(
     배의 등급(네 번째 반환값)을 최소 '주의'로 올린다 — 격리 적재 확인 필요이지 배정불가가
     아니다(IBC Code 3.1.3). 화물별 등급(cargo_verdicts)은 인접 선석 기준 그대로다.
     """
-    verdicts: list[_Verdict] = []
-    seen_chem: set[str] = set()
     methods = await _unload_methods(db, request.call_sign) if request.call_sign else {}
+    # [2026-09-29] DB 해석은 먼저 순서대로 끝내고, 그래프 조회만 화물마다 동시에 돌린다. 운영 Neo4j(Aura)는
+    #   조회 한 번이 약 300ms 라, 화물을 하나씩 기다리면 6종 배가 규칙 판정에만 약 13초 걸렸다.
+    adjacent_resolved = await _resolve_adjacent_cargos(db, request.adjacent_cargos)
+    targets: list[tuple[CargoRef, MsdsChemical]] = []
+    seen_chem: set[str] = set()
     for cargo in request.all_targets():
-        verdict = await _compute_verdict(db, neo4j_driver, request, target_cargo=cargo, unload_methods=methods)
+        row = await resolve_cargo(db, cargo)
         # 같은 물질이 다른 키(cas_no 만 / chem_id)로 두 번 올 수 있다 — 해석된 chem_id 로 한 번만.
-        if verdict.target_row.chem_id in seen_chem:
+        if row.chem_id in seen_chem:
             continue
-        seen_chem.add(verdict.target_row.chem_id)
-        verdicts.append(verdict)
+        seen_chem.add(row.chem_id)
+        targets.append((cargo, row))
+    verdicts: list[_Verdict] = list(await asyncio.gather(*(
+        _compute_verdict(db, neo4j_driver, request, target_cargo=cargo, unload_methods=methods,
+                         resolved=(row, adjacent_resolved))
+        for cargo, row in targets
+    )))
     governing = _pick_governing(verdicts)
     summaries = [
         CargoVerdictSummary(
@@ -324,14 +332,17 @@ async def _compute_verdict(
     *,
     target_cargo: CargoRef | None = None,
     unload_methods: dict[str, str] | None = None,
+    resolved: tuple[MsdsChemical, list[tuple[str, float | None, MsdsChemical]]] | None = None,
 ) -> _Verdict:
     """화물 하나에 대해 LLM을 부르지 않고 등급과 근거를 확정한다.
 
     unload_methods — 이번 입항 건 신고의 chem_id별 하역방식(_unload_methods). 요청에 하역방식이
     없는 화물만 채운다. 해석된 chem_id 로 찾으므로 CAS 로만 온 화물도 맞는다.
+    resolved — 호출부가 미리 해석한 (대상 화물, 인접 화물). 주면 DB 를 쓰지 않아 화물 여럿을
+    동시에 돌릴 수 있다(AsyncSession 은 동시 사용 불가, 2026-09-29).
     """
     target_cargo = target_cargo or request.target_cargo
-    target_row = await resolve_cargo(db, target_cargo)
+    target_row = resolved[0] if resolved else await resolve_cargo(db, target_cargo)
     if not target_cargo.unload_method_name and (unload_methods or {}).get(target_row.chem_id):
         target_cargo = target_cargo.model_copy(update={"unload_method_name": unload_methods[target_row.chem_id]})
 
@@ -340,42 +351,24 @@ async def _compute_verdict(
     # 나와(대한유화부두 후보) 왕복이 그대로 쌓였다 — 실측 34.2ms -> 12.3ms(-64%).
     # chem_id만 있는 화물은 한 번의 IN 조회로 끝내고, cas_no로 들어온 화물만
     # 기존 lazy-fetch 경로(resolve_cargo -> 없으면 KOSHA API 호출)를 태운다.
-    adjacent_resolved = await _resolve_adjacent_cargos(db, request.adjacent_cargos)
+    adjacent_resolved = resolved[1] if resolved else await _resolve_adjacent_cargos(db, request.adjacent_cargos)
     adjacent_chem_ids = list({row.chem_id for _, _, row in adjacent_resolved})
 
-    # [2026-08-23] 그래프 조회를 병렬로 묶었다. 일곱 개 Cypher가 서로의 결과를
-    # 보지 않는 독립 조회인데 순차 await 하고 있었다 — 실측 71.4ms -> 34.1ms(-52%).
-    # Neo4j 드라이버는 조회마다 자체 세션을 열므로 동시 사용에 문제가 없다
-    # (PostgreSQL 세션과 달리 공유 상태가 없다).
-    (
-        raw_conflicts,
-        raw_imdg_conflicts,
-        imdg_classes,
-        confirmed_no_segregation_ids,
-        group_conflict_rows,
-        groups_by_chem_id,
-        bulk_exception_ids,
-        live_categories,
-        facts,
-    ) = await asyncio.gather(
-        find_incompatible_conflicts(
-            neo4j_driver, target_chem_id=target_row.chem_id, adjacent_chem_ids=adjacent_chem_ids),
-        find_imdg_segregation_conflicts(
-            neo4j_driver, target_chem_id=target_row.chem_id, adjacent_chem_ids=adjacent_chem_ids),
-        find_imdg_classes(
-            neo4j_driver, chem_ids=[target_row.chem_id, *adjacent_chem_ids]),
-        find_imdg_no_segregation_required(
-            neo4j_driver, target_chem_id=target_row.chem_id, adjacent_chem_ids=adjacent_chem_ids),
-        find_bulk_group_conflicts(
-            neo4j_driver, target_chem_id=target_row.chem_id, adjacent_chem_ids=adjacent_chem_ids),
-        find_bulk_groups(
-            neo4j_driver, chem_ids=[target_row.chem_id, *adjacent_chem_ids]),
-        find_bulk_exceptions(
-            neo4j_driver, target_chem_id=target_row.chem_id, adjacent_chem_ids=adjacent_chem_ids),
-        find_live_categories(neo4j_driver),
-        find_assessability_facts(
-            neo4j_driver, chem_ids=[target_row.chem_id, *adjacent_chem_ids]),
-    )
+    # [2026-09-29] 그래프 조회 9개를 메모리 사본(graph_snapshot)으로 바꿨다. 기준 데이터라 판정마다 다시
+    #   읽을 이유가 없고, 운영 Neo4j(Aura)는 조회 한 번이 약 300ms 라 화물 6종 배가 규칙 판정에만 12초 넘게
+    #   걸렸다. 답은 graph_queries 의 같은 이름 Cypher 와 같다(tests/test_graph_snapshot_20260929.py).
+    graph = await get_snapshot(neo4j_driver)
+    target_id = target_row.chem_id
+    all_ids = [target_id, *adjacent_chem_ids]
+    raw_conflicts = graph.incompatible_conflicts(target_id, adjacent_chem_ids)
+    raw_imdg_conflicts = graph.imdg_segregation_conflicts(target_id, adjacent_chem_ids)
+    imdg_classes = graph.imdg_classes(all_ids)
+    confirmed_no_segregation_ids = graph.imdg_no_segregation_required(target_id, adjacent_chem_ids)
+    group_conflict_rows = graph.bulk_group_conflicts(target_id, adjacent_chem_ids)
+    groups_by_chem_id = graph.bulk_groups(all_ids)
+    bulk_exception_ids = graph.bulk_exceptions(target_id, adjacent_chem_ids)
+    live_categories = graph.live_categories
+    facts = graph.assessability_facts(all_ids)
     bulk_safe_exception_ids, bulk_blocked_exception_ids = bulk_exception_ids
     # 충돌 여부와 무관하게 대상·인접 화물 각자의 Class 자체를 별도로 조회한다 —
     # find_imdg_segregation_conflicts는 SEGREGATE 관계(=충돌)가 있을 때만 Class 값을
@@ -895,12 +888,17 @@ async def assess_safety(
     neo4j_driver: AsyncDriver,
     llm_client: LLMClient,
     request: SafetyAssessmentRequest,
+    *,
+    defer: list[Awaitable[None]] | None = None,
 ) -> SafetyAssessmentResult:
     """판정 + LLM 서술. 응답 형태는 종전과 같고 cargo_verdicts 만 늘었다.
 
     LLM 은 한 번만 부른다 — 화물마다 부르면 호출 비용이 화물 수만큼 늘어난다.
     [2026-09-29] 서술 대상은 대표 화물 하나가 아니라 _focus 다: 안전이 아닌 화물만, 모두 안전이면
     전 화물을 묶어서. target_cargo_name 도 그 화물들 이름이다(화면의 "○○ 기준").
+
+    defer — 목록을 주면 LLM 서술(체크리스트·위험성 보충)을 기다리지 않고 그 목록에 넣는다. 등급·근거는
+    이미 확정돼 있으므로 호출부가 다른 LLM 호출과 동시에 기다릴 수 있다(오케스트레이터 종합 문장, 2026-09-29).
     """
     v, verdicts, summaries, onboard, ship_level = await _compute_verdicts(db, neo4j_driver, request)
     needs_check = _needs_check(verdicts)
@@ -908,26 +906,37 @@ async def assess_safety(
     focus = _focus(verdicts, onboard)
     methods = {x.unload_method_name for x in focus}
 
-    llm_result = await llm_client.generate_structured(
-        system_prompt=SYSTEM_PROMPT,
-        user_prompt=build_user_prompt(
-            target_cargo_name=_focus_name(focus),
-            hazard_summary=_merged_hazards(focus),
-            conflicts=[c for x in focus for c in x.conflicts],
-            bulk_compatibility_conflicts=[c for x in focus for c in x.bulk_compatibility_conflicts],
-            packaging_violations=[p for x in focus for p in x.packaging_violations],
-            unassessed_pairs=[p for x in focus for p in x.unassessed_pairs],
-            adjacent_count=len(request.adjacent_cargos),
-            # 하나라도 신고가 없으면 '검사하지 않음'으로 넘긴다 — 본 것처럼 쓰지 않게.
-            unload_method_name="·".join(sorted(methods)) if None not in methods else None,
-            onboard_conflicts=onboard,
-            needs_check=needs_check,
-            # 모든 화물의 충돌을 화물 이름과 함께 넘긴다 — 대표 화물 것만 넘기면 나머지 화물의
-            # 충돌이 체크리스트에서 빠졌다(2026-09-29).
-            conflict_checks=[b for b in basis if b.startswith("이웃 화물 충돌") or "포장·하역방식 부적합" in b],
-        ),
-        schema=LLMAssessment,
-    )
+    def _narrated_checklist(items: list[str]) -> list[str]:
+        # 중합성 화물(IMDG ", STABILIZED")이면 탱크 온도·억제제 확인 항목을 규칙으로
+        # 맨 앞에 붙인다 — LLM 이 뽑을지에 맡기지 않는다(stabilized_cargo.py, 2026-09-17).
+        return with_stabilized_checklist(
+            _drop_generic_checklist(items, [_cargo_display_name(x.target_row) for x in verdicts]),
+            v.target_row.un_no, v.target_row.cas_no,
+        )
+
+    async def narrate() -> None:
+        llm_result = await llm_client.generate_structured(
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt=build_user_prompt(
+                target_cargo_name=_focus_name(focus),
+                hazard_summary=_merged_hazards(focus),
+                conflicts=[c for x in focus for c in x.conflicts],
+                bulk_compatibility_conflicts=[c for x in focus for c in x.bulk_compatibility_conflicts],
+                packaging_violations=[p for x in focus for p in x.packaging_violations],
+                unassessed_pairs=[p for x in focus for p in x.unassessed_pairs],
+                adjacent_count=len(request.adjacent_cargos),
+                # 하나라도 신고가 없으면 '검사하지 않음'으로 넘긴다 — 본 것처럼 쓰지 않게.
+                unload_method_name="·".join(sorted(methods)) if None not in methods else None,
+                onboard_conflicts=onboard,
+                needs_check=needs_check,
+                # 모든 화물의 충돌을 화물 이름과 함께 넘긴다 — 대표 화물 것만 넘기면 나머지 화물의
+                # 충돌이 체크리스트에서 빠졌다(2026-09-29).
+                conflict_checks=[b for b in basis if b.startswith("이웃 화물 충돌") or "포장·하역방식 부적합" in b],
+            ),
+            schema=LLMAssessment,
+        )
+        result.checklist = _narrated_checklist(llm_result.checklist)
+        result.key_hazards = result.key_hazards or llm_result.key_hazards
 
     # [2026-08-23] 등급은 규칙엔진이 확정한다 — LLM은 서술만 담당한다.
     # 이전: max_risk_level(llm_result.risk_level, rule_engine_floor). LLM이 하한
@@ -940,22 +949,15 @@ async def assess_safety(
     # 네 등급이 모두 의미 있는 크기를 갖는다. **배정불가 62건은 불변이므로
     # 자동배정에서 막히는 조합은 하나도 달라지지 않는다**(오케스트레이터는
     # BLOCKED만 후보 탈락시킴) — 바뀌는 것은 화면에 표시되는 경고 등급뿐이다.
-    return SafetyAssessmentResult(
+    result = SafetyAssessmentResult(
         target_cargo_name=_focus_name(focus),
         risk_level=ship_level,
-        # 중합성 화물(IMDG ", STABILIZED")이면 탱크 온도·억제제 확인 항목을 규칙으로
-        # 맨 앞에 붙인다 — LLM 이 뽑을지에 맡기지 않는다(stabilized_cargo.py, 2026-09-17).
-        checklist=with_stabilized_checklist(
-            _drop_generic_checklist(
-                llm_result.checklist, [_cargo_display_name(x.target_row) for x in verdicts],
-            ),
-            v.target_row.un_no, v.target_row.cas_no,
-        ),
+        checklist=_narrated_checklist([]),  # LLM 서술 전 — narrate() 가 채운다
         # [2026-09-29] 주요 위험성은 MSDS GHS 분류에서 코드가 만든다(_hazard_lines). 분류가 없는 화물뿐일
         #   때만 LLM 것을 쓴다. LLM 화물 설명(cargo_profile)은 쓰지 않는다 — 여러 화물이면 가장 센 물질의
         #   특성을 전부에 씌웠고(케로젠·디젤을 '고인화성'), 한 화물이어도 분류에 없는 위험을 썼다
         #   (가솔린 '피부에 심각한 자극' — 피부 자극 분류 없음). 사용자 결정 9/29.
-        key_hazards=_hazard_lines(focus) or llm_result.key_hazards,
+        key_hazards=_hazard_lines(focus),
         # reasoning 은 종전 소비처(챗봇 근거·옛 화면)용으로 남긴다 — 등급의 이유(코드) + 화물 특성(LLM).
         reasoning="\n".join(
             s for s in (_checked_facts(focus, len(request.adjacent_cargos), onboard, ship_level),) if s
@@ -979,3 +981,8 @@ async def assess_safety(
         cargo_verdicts=summaries,
         onboard_conflicts=onboard,
     )
+    if defer is not None:
+        defer.append(narrate())
+    else:
+        await narrate()
+    return result

@@ -22,6 +22,7 @@
 등급 · 확인한 것 · 못 본 것)이 된다(B단계).
 """
 
+from collections.abc import Awaitable
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
@@ -140,10 +141,12 @@ async def check_segregation(
     cargos: list[CargoRef],
     adjacent_cargos: list[AdjacentCargo],
     call_sign: str | None = None,
+    defer: list[Awaitable[None]] | None = None,
 ) -> SafetyAssessmentResult:
     """이 배의 화물과 이웃 화물의 혼재 등급. 등급은 규칙 하한이 정하고 LLM 은 설명만 쓴다.
 
     call_sign 을 주면 이번 입항 건 화물 신고의 하역방식을 채운다(안전 에이전트가 조회, 2026-09-29).
+    defer 를 주면 LLM 서술을 기다리지 않고 그 목록에 넣는다(assess_safety 참고).
     """
     return await assess_safety(
         db,
@@ -152,6 +155,7 @@ async def check_segregation(
         SafetyAssessmentRequest(
             target_cargo=cargo, target_cargos=cargos, adjacent_cargos=adjacent_cargos, call_sign=call_sign,
         ),
+        defer=defer,
     )
 
 

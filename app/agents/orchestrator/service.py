@@ -17,7 +17,9 @@
 추천·'적합 선석 없음')을 보여 주고 있었다. 정박지는 위치로 관찰만 한다(/dashboard/anchorages).
 """
 
+import asyncio
 import logging
+from collections.abc import Awaitable
 from datetime import timedelta, timezone
 
 from neo4j import AsyncDriver
@@ -145,9 +147,14 @@ async def orchestrate(
     """summarize=False 면 종합 문장을 템플릿으로 쓴다(안전 서술 LLM 은 그대로 부른다).
 
     판정 잡이 쓴다 — 종합 문장은 판정 기록에 저장되지 않아, 잡에서 LLM 으로 쓰면 버려진다.
+
+    [2026-09-29] 혼재 서술 LLM(체크리스트)은 판정 중에 기다리지 않고, 종합 문장 LLM 과 함께 기다린다.
+    종합 문장은 규칙 결과(근거·확인 필요)만 보므로 서술을 기다릴 필요가 없다 — 두 호출이 차례로 약 6초였다.
     """
-    result = await _judge(db, neo4j_driver, llm_client, request)
-    return await _finish(result, request, llm_client if summarize else None)
+    pending: list[Awaitable[None]] = []
+    result = await _judge(db, neo4j_driver, llm_client, request, defer=pending)
+    result, *_ = await asyncio.gather(_finish(result, request, llm_client if summarize else None), *pending)
+    return result
 
 
 async def _judge(
@@ -155,8 +162,10 @@ async def _judge(
     neo4j_driver: AsyncDriver,
     llm_client: LLMClient,
     request: OrchestratorRequest,
+    *,
+    defer: list[Awaitable[None]] | None = None,
 ) -> OrchestratorResult:
-    """판정 본체 — 종합 문장(summary)은 비워 두고 _finish 가 채운다."""
+    """판정 본체 — 종합 문장(summary)은 비워 두고 _finish 가 채운다. defer 는 assess_safety 참고."""
     # 전역 폴백 판정(__GLOBAL_DEFAULT__ 임계값). 선석을 확인하지 못했거나 혼재로 부적합인
     # 응답의 weather_assessment 를 채우는 용도다 — 통과/차단은 아래 선석별 임계값으로 한다.
     # [2026-09-29] 판정 대상 시설 이름을 넘긴다 — 파고 적용 규칙(wave_applies_to)이 이름으로 정해진다.
@@ -270,6 +279,7 @@ async def _judge(
         cargos=request.cargos,
         adjacent_cargos=candidate.adjacent_cargos,
         call_sign=request.vessel.call_sign,
+        defer=defer,
     )
     opinions.append(tools.segregation_opinion(safety_result))
 
