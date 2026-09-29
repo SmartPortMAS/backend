@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     # 고르는 에이전트라(27번 설계안 C단계) 작은 모델로는 도구 선택이 불안정하고, 판정 잡은
     # 결과가 바뀔 때만 LLM 을 부르므로 작은 모델로 충분해 둘을 나눈다.
     chatbot_llm_model: str | None = None
+    # [2026-09-29] 화물 혼재 심사(POST /safety/assess)만 쓰는 모델. 비우면 llm_model. 등급은 규칙엔진이
+    # 정하고 LLM 은 화물 특성·체크리스트만 쓰므로 작은 모델로 응답 시간을 줄인다.
+    safety_llm_model: str | None = None
     # 임베딩은 llm_provider와 독립적으로 고른다. 챗봇 RAG의 벡터 공간은 적재
     # 시점(scripts/embed_msds.py)과 조회 시점이 반드시 같은 모델이어야 하는데,
     # llm_provider는 답변 품질/비용 사정으로 자유롭게 바뀔 수 있기 때문이다.

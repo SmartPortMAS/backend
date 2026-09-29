@@ -7,7 +7,7 @@ from app.agents.safety.schemas import (
     SafetyVerdict,
 )
 from app.agents.safety.service import assess_safety, assess_verdict
-from app.core.deps import get_llm_client, get_session
+from app.core.deps import get_safety_llm_client, get_session
 from app.core.exceptions import LLMGenerationError, MsdsNotFoundError, MsdsUpstreamError
 from app.llm.base import LLMClient
 from app.neo4j_client import neo4j_client
@@ -57,7 +57,7 @@ _RESPONSES: dict = {
 async def assess(
     request: SafetyAssessmentRequest,
     db: AsyncSession = Depends(get_session),
-    llm_client: LLMClient = Depends(get_llm_client),
+    llm_client: LLMClient = Depends(get_safety_llm_client),
 ) -> SafetyAssessmentResult:
     try:
         return await assess_safety(db, neo4j_client.driver, llm_client, request)
