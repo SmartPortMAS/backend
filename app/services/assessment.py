@@ -36,11 +36,18 @@ logger = logging.getLogger("assessment")
 # AIS 항해상태 하나만 본다. PORT-MIS 를 쓰지 않는 이유는 모델 주석 참고
 # (수집창 [어제, 오늘+3일] 밖이면 동결 — 2026-09-21 실측 79척 중 32척).
 
-def stage_from_nav_status(nav_status_code: str | None) -> AssessmentStage | None:
-    """UPA 항해상태 → 시점. 상태를 모르면 None(= 판정불가로 기록)."""
+def stage_from_nav_status(
+    nav_status_code: str | None, *, target_source: str | None = None,
+) -> AssessmentStage | None:
+    """UPA 항해상태 → 시점. 상태를 모르면 None(= 판정불가로 기록).
+
+    [2026-09-29] 상태가 없어도 판정 대상이 PORT-MIS 배정 선석이면 입항 전이다 — 아직 AIS 에
+    잡히지 않은 배다. 예전엔 None 이 되어 '입항전'으로 기록되면서도 조치안·받는 곳이 비었다
+    (운영 308 HYODONG CHEMI, [판정 요청] 경로).
+    """
     nav = (nav_status_code or "").strip()
     if not nav:
-        return None
+        return AssessmentStage.BEFORE_ARRIVAL if target_source == "PORT-MIS" else None
     if nav.startswith("정박(계류)"):
         return AssessmentStage.DURING_CARGO
     if nav.startswith("정박(앵커링)"):
