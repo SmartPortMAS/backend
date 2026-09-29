@@ -22,6 +22,7 @@ from app.api.v1.safety import router as safety_router
 from app.api.v1.scheduling import router as scheduling_router
 from app.api.v1.twin import router as twin_router
 from app.api.v1.weather import router as weather_router
+from app.agents.safety.graph_snapshot import get_snapshot
 from app.config import get_settings
 from app.core.logging import configure_logging
 from app.database import AsyncSessionFactory
@@ -50,10 +51,22 @@ async def _warm_up_postgres() -> None:
         logging.getLogger(__name__).warning("PostgreSQL 워밍업 실패 — 첫 요청이 느릴 수 있습니다", exc_info=True)
 
 
+async def _warm_up_graph_snapshot() -> None:
+    """혼재 판정 그래프 사본을 미리 읽는다(2026-09-29) — 첫 판정이 적재를 기다리지 않게.
+
+    실패해도 앱을 막지 않는다. 사본은 첫 판정 때 다시 읽는다.
+    """
+    try:
+        await get_snapshot(neo4j_client.driver)
+    except Exception:  # noqa: BLE001 - 워밍업 실패는 기동을 막지 않는다
+        logging.getLogger(__name__).warning("혼재 판정 그래프 사본 워밍업 실패 — 첫 판정이 느릴 수 있습니다", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await neo4j_client.driver.verify_connectivity()
     await _warm_up_postgres()
+    await _warm_up_graph_snapshot()
     # 08_스케줄링_전면재설계_자동배정_설계문서.md §5.1·§5.5 — 입항 자동추천·출항
     # 자동해제 백그라운드 잡. 둘 다 실패해도 API 자체는 계속 떠 있어야 하므로
     # 앱 시작을 막지 않는다(스케줄러 자체 등록 실패만 여기서 전파됨).
