@@ -36,8 +36,22 @@ def get_chatbot_llm_client() -> LLMClient:
     provider 는 get_llm_client 와 같다 — 챗봇만 다른 provider 를 쓸 이유가 아직 없다.
     """
     settings = get_settings()
-    model = settings.chatbot_llm_model or settings.llm_model
+    return _client_for(settings.chatbot_llm_model or settings.llm_model)
 
+
+@lru_cache
+def get_safety_llm_client() -> LLMClient:
+    """화물 혼재 심사(POST /safety/assess)용 LLMClient. safety_llm_model 이 있으면 그 모델, 없으면 llm_model.
+
+    [2026-09-29] 종합 문장 품질 때문에 llm_model 을 mini 로 올리자 혼재 심사 화면(화물 특성·체크리스트만
+    LLM)이 느려졌다 — 등급은 규칙엔진이 정하므로 이 서술은 작은 모델로 충분하다.
+    """
+    settings = get_settings()
+    return _client_for(settings.safety_llm_model or settings.llm_model)
+
+
+def _client_for(model: str) -> LLMClient:
+    settings = get_settings()
     if settings.llm_provider == "gemini":
         if not settings.gemini_api_key:
             raise RuntimeError("GEMINI_API_KEY가 설정되지 않았습니다 (.env 확인).")
