@@ -100,7 +100,7 @@ _TAGS_METADATA = [
     {"name": "weather", "description": "기상 기반 하역 가능 여부 판정. LLM 미사용."},
     {"name": "safety", "description": "화물 혼재 위험 판정."},
     {"name": "dashboard", "description": "모니터링 현황 조회. 판정 로직 없음."},
-    {"name": "approvals", "description": "관제사 사전승인. 시스템 자동추천(REQUESTED)을 승인/반려해야 실제 배정이 확정된다."},
+    {"name": "approvals", "description": "관제사 사전승인. 시스템이 검증해 올린 선석(REQUESTED)을 승인/반려해야 실제 배정이 확정된다."},
     {"name": "chatbot", "description": "챗봇 화면용 목록 조회. 질의응답은 `rag`."},
     {"name": "msds", "description": "MSDS 원문 조회."},
     {"name": "health", "description": "서비스 상태 확인."},

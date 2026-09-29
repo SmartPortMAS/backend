@@ -105,24 +105,24 @@ def _axis(subject: str, score: float | None, basis: str) -> dict:
 async def build_safety_index(db: AsyncSession, driver: AsyncDriver) -> dict:
     axes: list[dict] = []
 
-    # 1. 기상 여유 — 임계값까지 얼마나 남았나 (풍속·파고 중 나쁜 쪽)
+    # 1. 기상 여유 — 풍속이 중단 임계까지 얼마나 남았나.
+    #    [2026-09-29] 파고는 점수에서 뺐다. 우리 파고는 외해 부이(22189) 관측 하나라 항내 부두에는
+    #    적용하지 않는다(weather.rule_engine.wave_applies_to) — 여기서만 대입해, 풍속 2.1m/s 로
+    #    멀쩡한데 파고 1.4m 하나로 이 축이 6.7점이었다(실측). 값은 참고로 적어 둔다.
     th = (await db.execute(_Q_GLOBAL_THRESHOLD)).mappings().first()
     wx = (await db.execute(_Q_WEATHER)).mappings().first()
-    if th and wx and (wx["wind_speed_ms"] is not None or wx["wave_height_sig_m"] is not None):
-        used = []
-        if wx["wind_speed_ms"] is not None and th["stop_wind_ms"]:
-            used.append(wx["wind_speed_ms"] / float(th["stop_wind_ms"]))
-        if wx["wave_height_sig_m"] is not None and th["stop_wave_m"]:
-            used.append(wx["wave_height_sig_m"] / float(th["stop_wave_m"]))
-        worst = max(used) if used else None
+    if th and wx and wx["wind_speed_ms"] is not None and th["stop_wind_ms"]:
+        wave_note = (
+            f" · 파고 {wx['wave_height_sig_m']} m 는 외해 부이 관측이라 항내 부두에 적용하지 않음(참고)"
+            if wx["wave_height_sig_m"] is not None else ""
+        )
         axes.append(_axis(
             "기상 여유",
-            None if worst is None else (1 - worst) * 100,
-            f"풍속 {wx['wind_speed_ms']} m/s (중단 {th['stop_wind_ms']}), "
-            f"파고 {wx['wave_height_sig_m']} m (중단 {th['stop_wave_m']})",
+            (1 - wx["wind_speed_ms"] / float(th["stop_wind_ms"])) * 100,
+            f"풍속 {wx['wind_speed_ms']} m/s (중단 {th['stop_wind_ms']}){wave_note}",
         ))
     else:
-        axes.append(_axis("기상 여유", None, "관측값 없음 — 판정 불가"))
+        axes.append(_axis("기상 여유", None, "풍속 관측값 없음 — 판정 불가"))
 
     # 2. 흘수 여유 — 접안 불가/경계 판정이 얼마나 섞여 있나.
     #    UNKNOWN(부두 제원 미확보)과 CHECK(선석별 수심이 달라 어느 선석인지 확인 필요)는

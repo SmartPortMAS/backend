@@ -60,6 +60,10 @@ class Opinion(BaseModel):
     evidence: list[str] = Field(default_factory=list, description="등급의 근거 문장")
     checked: list[str] = Field(default_factory=list, description="확인한 것")
     missing: list[str] = Field(default_factory=list, description="못 본 것")
+    notes: list[str] = Field(
+        default_factory=list,
+        description="[2026-09-29] 참고 — 판정에 쓰지 않은 값(외해 파고 등). '확인한 것' 칩에 두면 확인한 근거처럼 읽혔다",
+    )
 
 
 class BerthCheck(BaseModel):
@@ -135,14 +139,18 @@ async def check_segregation(
     cargo: CargoRef,
     cargos: list[CargoRef],
     adjacent_cargos: list[AdjacentCargo],
+    call_sign: str | None = None,
 ) -> SafetyAssessmentResult:
-    """이 배의 화물과 이웃 화물의 혼재 등급. 등급은 규칙 하한이 정하고 LLM 은 설명만 쓴다."""
+    """이 배의 화물과 이웃 화물의 혼재 등급. 등급은 규칙 하한이 정하고 LLM 은 설명만 쓴다.
+
+    call_sign 을 주면 이번 입항 건 화물 신고의 하역방식을 채운다(안전 에이전트가 조회, 2026-09-29).
+    """
     return await assess_safety(
         db,
         neo4j_driver,
         llm_client,
         SafetyAssessmentRequest(
-            target_cargo=cargo, target_cargos=cargos, adjacent_cargos=adjacent_cargos,
+            target_cargo=cargo, target_cargos=cargos, adjacent_cargos=adjacent_cargos, call_sign=call_sign,
         ),
     )
 
@@ -207,22 +215,35 @@ def weather_opinion(w: WeatherAssessmentResult) -> Opinion:
         else "부적합"
     )
     checked, missing = [], []
+    # [2026-09-29] missing 은 화면의 '확인 필요' 줄이 된다 — '대상 — 이유'로 적는다.
     if w.wind.is_stale:
-        missing.append("풍속 관측 없음 또는 오래됨")
+        missing.append("풍속 — 관측이 끊겼거나 오래됐습니다")
     else:
         checked.append(f"풍속 관측 {w.wind.value}{w.wind.unit}")
     # 파고는 항내 부두에 적용하지 않는 값이라 없다고 '못 본 것'으로 적지 않는다. 적용되는
     # 부두에서 없으면 등급이 이미 판정불가이고 사유가 reasons 에 남는다.
-    if not w.wave.is_stale:
+    # [2026-09-29] '적용하지 않음 - 참고값' 문장은 등급의 근거가 아니다 — 근거에서 빼고 확인한 것으로
+    # 옮긴다. 예전엔 항내 부두 판정마다 근거 첫머리에 "파고 … 적용하지 않음"이 떴다(31건 중 30건).
+    evidence = [r for r in w.reasons if "적용하지 않음" not in r]
+    wave_reference = [r for r in w.reasons if "적용하지 않음" in r]
+    # 판정에 쓴 파고만 '파고 관측'으로 적는다. 안 쓴 파고까지 적으면 '확인' 칩에 "파고 관측 1.4m"와
+    # "파고 1.4m … 적용하지 않음"이 나란히 떠, 파고를 봤다는 건지 안 봤다는 건지 읽히지 않았다.
+    if not w.wave.is_stale and not wave_reference:
         checked.append(f"파고 관측 {w.wave.value}{w.wave.unit}")
-    evidence = list(w.reasons)
     fw = w.forecast_warning
     if fw is not None:
         checked.append(f"체류 종료까지 예보 {fw.forecast_points_checked}개 시각")
         if fw.will_deteriorate and fw.earliest_deterioration_at_utc is not None:
             at = fw.earliest_deterioration_at_utc.astimezone(_KST)
-            evidence.append(f"{at:%m/%d %H:%M} 부터 '{fw.worst_status.value}' 예보")
-    return Opinion(axis="기상", level=level, evidence=evidence, checked=checked, missing=missing)
+            cause = f" ({' · '.join(fw.earliest_deterioration_causes)})" if fw.earliest_deterioration_causes else ""
+            evidence.append(f"{at:%m/%d %H:%M} 부터 '{fw.worst_status.value}' 예보{cause}")
+        elif level == "적합":
+            evidence.append("체류 중 악화 예보 없음")
+        if fw.no_forecast_after_utc is not None:
+            gap = fw.no_forecast_after_utc.astimezone(_KST)
+            missing.append(f"{gap:%m/%d %H:%M} 이후 기상 — 예보가 아직 나오지 않았습니다")
+    return Opinion(axis="기상", level=level, evidence=evidence, checked=checked, missing=missing,
+                   notes=wave_reference)
 
 
 def segregation_opinion(s: SafetyAssessmentResult) -> Opinion:
@@ -233,16 +254,14 @@ def segregation_opinion(s: SafetyAssessmentResult) -> Opinion:
         level = "부적합"
     else:
         level = "주의"
-    evidence = [f"[MSDS] {c.adjacent_name} — '{c.shared_category}'" for c in s.conflicts]
-    evidence += [f"[벌크] {c.adjacent_name} — {c.reason}" for c in s.bulk_compatibility_conflicts]
-    n_pairs = len({c.adjacent_chem_id for c in s.unassessed_pairs})
+    # [2026-09-29] 근거는 안전 에이전트가 코드로 만든 verdict_basis 를 그대로 쓴다. 예전엔 이웃 충돌만
+    # 옮겨, 같은 선박 화물 충돌로 '주의'가 된 배의 근거가 비어 있었다(실측 GOLDEN DENISE).
     return Opinion(
         axis="혼재",
         level=level,
-        evidence=evidence,
-        checked=[f"화물 {len(s.cargo_verdicts) or 1}종 × 이웃 화물, 규칙 하한 '{s.rule_engine_floor.value}'"],
-        missing=[f"{p.adjacent_name}: {p.reason}" for p in s.unassessed_pairs[:5]]
-        + ([f"외 {n_pairs - 5}종"] if n_pairs > 5 else []),
+        evidence=list(s.verdict_basis),
+        checked=[f"화물 {len(s.cargo_verdicts) or 1}종 × 이웃 화물 {s.adjacent_count}건, 규칙 하한 '{s.rule_engine_floor.value}'"],
+        missing=list(s.needs_check),
     )
 
 

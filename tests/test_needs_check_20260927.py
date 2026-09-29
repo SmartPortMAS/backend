@@ -20,7 +20,7 @@ def _result(conditions=(), **safety):
     base = dict(
         risk_level=RiskLevel.CAUTION, rule_engine_floor=RiskLevel.CAUTION,
         unassessed_pairs=[_pair("쌍1"), _pair("쌍2")], conflicts=[], bulk_compatibility_conflicts=[],
-        packaging_violations=[], cargo_verdicts=[],
+        packaging_violations=[], cargo_verdicts=[], onboard_conflicts=[],
     )
     base.update(safety)
     return SimpleNamespace(
@@ -28,6 +28,7 @@ def _result(conditions=(), **safety):
         weather_assessment=SimpleNamespace(status=WorkStatus.NORMAL),
         safety_assessment=SimpleNamespace(**base),
         conditions=list(conditions),
+        target_source=None,
     )
 
 

@@ -86,7 +86,8 @@ async def test_1_weather_stop_is_weather_blocked(monkeypatch):
     monkeypatch.setattr(orch.tools, "check_weather", fake_weather)
     monkeypatch.setattr(orch.tools, "suggest_alternatives", fake_alternatives)
 
-    result = await orch.orchestrate(None, None, _NoLLM(), _verify_request())
+    # 판정 경로만 본다 — 종합 문장 LLM 은 끈다(2026-09-29 부터 부적합에도 종합 문장을 쓴다).
+    result = await orch.orchestrate(None, None, _NoLLM(), _verify_request(), summarize=False)
     level, headline = level_from_decision(result)
     assert result.overall_decision is OverallDecision.WEATHER_BLOCKED
     assert level is AssessmentLevel.UNFIT

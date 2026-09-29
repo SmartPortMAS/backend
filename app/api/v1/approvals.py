@@ -52,12 +52,26 @@ class PendingItem(BaseModel):
     assessed_at_utc: datetime
 
 
+# [2026-09-29] 배마다 **최신 판정을 먼저 고른 뒤** 거른다. 예전엔 '적합 아님·미확인'을 먼저 걸러,
+#   판정불가 → 적합으로 바뀐 배의 옛 판정불가가 그대로 남았다(실측: 확인 대기 판정불가 70척 중 31척).
+#   판정은 바뀔 때만 기록되므로 시각만으로는 자를 수 없다 — 항내에 있는 배이거나(위치 관측)
+#   24시간 안에 판정된 배만 '현재'로 본다. 떠난 배의 마지막 판정은 이력이다.
+#   berth_alerts._QUERY_ACTIVE_ASSESSMENTS 와 같은 조건이다(대시보드 타일과 경고 수가 같게).
 _QUERY_PENDING = text("""
+    WITH latest AS (
+        SELECT DISTINCT ON (call_sign) *
+        FROM assessment_history
+        ORDER BY call_sign, assessed_at_utc DESC
+    ), present AS (
+        SELECT DISTINCT upper(btrim(callsgn)) AS cs FROM mart.vessel_presence
+    )
     SELECT id, call_sign, vessel_name, stage, wharf_name, level,
            changed_from, action, recipient, reasons, assessed_at_utc
-    FROM assessment_history
+    FROM latest l
     WHERE acknowledged_at_utc IS NULL
       AND (NOT :only_actionable OR level <> :fit_level)
+      AND (assessed_at_utc > now() - interval '24 hours'
+           OR EXISTS (SELECT 1 FROM present p WHERE p.cs = upper(btrim(l.call_sign))))
     ORDER BY assessed_at_utc DESC
     LIMIT :limit
 """)
@@ -91,7 +105,11 @@ async def get_pending(
             },
         )
     ).mappings().all()
-    return [PendingItem(**dict(r)) for r in rows]
+    # 9/29 이전 판정 문장의 "배정된 선석" — 우리는 배정하지 않으므로 보일 때만 고친다(기록은 그대로).
+    return [
+        PendingItem(**{**dict(r), "reasons": [s.replace("배정된 선석", "이 선석") for s in r["reasons"] or []]})
+        for r in rows
+    ]
 
 
 class AcknowledgeRequest(BaseModel):

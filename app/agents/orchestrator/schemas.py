@@ -7,6 +7,7 @@
 
 from datetime import datetime
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -27,9 +28,11 @@ class OverallDecision(str, Enum):
       "승인가능"      -> "적합"        우리는 승인하지 않는다. 조건에 맞는지만 말한다.
       "전후보배정불가" -> "전 후보 부적합"  우리는 배정을 거부하는 주체가 아니다.
 
-    '배정'이라는 단어 자체를 지운 것이 아니다 — `NO_ELIGIBLE_BERTH`("적합선석없음")나
-    판정 근거의 "배정된 선석이…"는 **남이 한 배정**을 가리키는 정확한 서술이라 그대로
-    둔다. 문제는 그 배정을 우리가 한다고 읽히는 어휘였다.
+    '배정'이라는 단어 자체를 지운 것이 아니다 — `NO_ELIGIBLE_BERTH`("적합선석없음")는
+    **남이 한 배정**을 가리키는 서술이라 그대로 둔다. 문제는 그 배정을 우리가 한다고 읽히는
+    어휘였다. [2026-09-29] 판정 문구의 "배정된 선석이…"는 걷어냈다 — 판정 대상은 대개
+    AIS 로 본 실제 접안 부두이고 PORT-MIS 신고와 다르다(실측 27척 중 26척). 출처대로
+    "지금 접안한 선석" / "배정된 선석"이라 쓴다(target_source).
 
     이 값은 DB 에 저장되지 않는다(`assessment_history` 는 `AssessmentLevel` 을 쓴다).
     화면이 `decision_label` 로 그대로 표시하므로 값이 곧 관제사가 읽는 문장이다.
@@ -70,6 +73,16 @@ class OrchestratorRequest(BaseModel):
         "신고 선석. [2026-09-27] 필수다: 선석을 새로 고르는 탐색모드를 걷어냈다(우리는 "
         "배정하지 않는다). 다른 자리가 필요하면 대체 선석 제안(/scheduling/alternatives)을 쓴다.",
     )
+    target_source: Literal["AIS", "PORT-MIS"] | None = Field(
+        default=None,
+        description="[2026-09-29] assigned_wharf_name 의 출처. AIS=실제 접안 부두, PORT-MIS=접안 전 신고 선석. "
+        "판정 문구가 '지금 접안한 선석'/'배정된 선석'으로 갈린다. 비우면 '이 선석'.",
+    )
+    reported_wharf_name: str | None = Field(
+        default=None,
+        description="[2026-09-29] PORT-MIS 신고 계류시설. 실제 접안 부두와 다르면 판정 경로에 한 줄 남긴다 "
+        "(신고 정정이 필요하다는 신호).",
+    )
 
     @model_validator(mode="after")
     def _window_must_be_ordered(self) -> "OrchestratorRequest":
@@ -89,10 +102,10 @@ class RejectedCandidate(BaseModel):
 class OrchestratorResult(BaseModel):
     overall_decision: OverallDecision
     selected_berth: BerthCandidate | None = Field(
-        default=None, description="최종 추천 선석. 승인가능이 아니면 None"
+        default=None, description="검증을 통과한 선석. 승인가능이 아니면 None"
     )
     safety_assessment: SafetyAssessmentResult | None = Field(
-        default=None, description="선택된 선석에 대한 안전관제 결과. 기상불가/적합선석없음이면 None"
+        default=None, description="배정된 선석에 대한 안전관제 결과(혼재 배정불가여도 싣는다). 기상불가/적합선석없음이면 None"
     )
     weather_assessment: WeatherAssessmentResult
     rejected_candidates: list[RejectedCandidate] = Field(
@@ -121,12 +134,22 @@ class OrchestratorResult(BaseModel):
         "회의 §4 '근거 부족을 안전과 구분' — 이 값이 assessment_history.level 에서 "
         "'판정불가'와 '부적합'을 가른다.",
     )
-    summary: str = Field(description="관제사가 읽을 종합 의견 (1~2문단)")
-    berth_match_summary: str | None = Field(
-        default=None,
-        description="선석배정현황 팝업 전용 — 선석 스펙과 선박 매칭만 다루는 LLM 한 문장 "
-        "요약(화학물질·안전판정 내용 제외). summary와 같은 LLM 호출에서 함께 받는다"
-        "(호출 두 번 비용 방지). selected_berth가 없으면 None.",
+    summary: str = Field(description="관제사가 읽을 종합 의견 (1~2문장)")
+    # [2026-09-29] berth_match_summary(선석배정현황 팝업용 LLM 한 문장)를 없앴다 — 화면이 더 이상
+    # 쓰지 않고(BerthAssignmentMap 은 판정 기록 reasons 를 쓴다) 문장만 매번 만들고 있었다.
+    level: str = Field(
+        default="",
+        description="[2026-09-29] 판정 등급 — 적합 | 주의 | 부적합 | 판정불가. 판정 기록(assessment_history.level)과 "
+        "같은 함수로 정한다. 화면은 overall_decision 이 아니라 이 값으로 등급·색을 정한다 "
+        "(예전엔 혼재 '주의'가 초록 '적합'으로, 근거 부족이 빨간 '적합선석없음'으로 보였다).",
+    )
+    headline: str = Field(default="", description="[2026-09-29] 등급의 이유 한 줄(판정 기록 reasons 첫 줄과 같다)")
+    needs_check: list[str] = Field(
+        default_factory=list,
+        description="[2026-09-29] 확인 필요 — 도구 의견의 '못 본 것'을 모은 것('대상 — 이유')",
+    )
+    target_source: Literal["AIS", "PORT-MIS"] | None = Field(
+        default=None, description="판정한 선석의 출처(요청값 그대로)"
     )
     opinions: list[Opinion] = Field(
         default_factory=list,
@@ -158,8 +181,6 @@ class OrchestratorResult(BaseModel):
         /대체 경로)만 다뤄야 두 화면의 책임이 안 섞인다.
         """
         detail: dict = {"trace": self.assignment_trace}
-        if self.berth_match_summary:
-            detail["narrative"] = self.berth_match_summary
         if self.selected_berth:
             detail["berth"] = {
                 "rank": self.selected_berth.rank,
@@ -181,11 +202,6 @@ class OrchestratorResult(BaseModel):
 
 
 class LLMSummary(BaseModel):
-    """Gemini response_schema로 강제할 최종 종합 의견 구조화 출력."""
+    """LLM 구조화 출력 — 확정된 판정 사실을 관제사용 문장으로 다시 정리한 것."""
 
-    summary: str = Field(description="관제사가 바로 읽을 수 있는 종합 의견, 1~2문단 한국어")
-    berth_match_summary: str = Field(
-        description="선석 스펙(수심·정원·전용/대체 여부)이 이 선박과 왜 맞는지만 다루는 "
-        "한 문장. 화학물질명·위험등급·유해성 등 안전판정 내용은 절대 넣지 말 것 — "
-        "선석 배정 근거 화면 전용이라 안전 얘기가 섞이면 안 된다.",
-    )
+    summary: str = Field(description="관제사가 바로 읽을 종합 의견, 1~2문장 한국어")

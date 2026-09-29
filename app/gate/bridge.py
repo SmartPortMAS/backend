@@ -44,7 +44,7 @@ import paho.mqtt.client as mqtt
 from sqlalchemy import text
 
 from app.agents.weather.data_access import get_berth_threshold
-from app.agents.weather.rule_engine import evaluate
+from app.agents.weather.rule_engine import evaluate, wave_applies_to
 from app.agents.weather.schemas import WorkStatus
 from app.config import get_settings
 from app.database import AsyncSessionFactory
@@ -279,9 +279,14 @@ class GateBridge:
                 wave = demo["wave_m"] if demo.get("wave_m") is not None else wx.get("wave_height_sig_m")
                 wind_stale = demo.get("wind_ms") is None and (wind_at is None or now - wind_at > _OBS_MAX_AGE)
                 wave_stale = demo.get("wave_m") is None and (wave_at is None or now - wave_at > _OBS_MAX_AGE)
+                # 실측 파고는 외해 부이 값이라 기상 에이전트와 같은 규칙(wave_applies_to)으로만 쓴다 —
+                # 예전엔 기본값(적용)으로 불러, 에이전트는 '적합'인데 정일1부두 게이트가 파고 1.4m 로
+                # 잠겼다(2026-09-29 실측). 시연 파고는 관제사가 그 부두 파고로 넣은 값이라 적용한다.
+                wave_applies = demo.get("wave_m") is not None or wave_applies_to(berth)
                 status, reasons = evaluate(
                     wind_speed_ms=wind, wind_is_stale=wind_stale,
                     wave_height_m=wave, wave_is_stale=wave_stale, threshold=th,
+                    wave_applies=wave_applies,
                 )
                 weather_lock = status is not WorkStatus.NORMAL
                 dv = demo_verdict.get(gate_id)
@@ -295,7 +300,7 @@ class GateBridge:
                 state = "LOCKED" if (weather_lock or blocking) else "UNLOCKED"
                 reason, reason_ko = "", []
                 if weather_lock:
-                    reason = _short_reason(status, wind, wave, th)
+                    reason = _short_reason(status, wind, wave if wave_applies else None, th)
                     # 화면 근거는 넘긴 항목만 — "파고 0.5m < 2.0m 정상" 같은 줄까지 붙이면 관제사가
                     # 무엇 때문에 잠겼는지 한눈에 못 본다. 넘긴 항목이 없으면(판단불가) 전부 보인다.
                     exceeded = [r for r in reasons if "->" in r]

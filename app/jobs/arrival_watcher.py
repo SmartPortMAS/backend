@@ -133,6 +133,9 @@ _QUERY_ASSESSMENT_TARGETS = text("""
             WHERE vc.callsgn = upper(btrim(dc.callsgn)) AND cm.chem_id IS NOT NULL
             ORDER BY cm.chem_id, cm.bl_no
         ) AS chem_ids,
+        -- [2026-09-29] 화물을 가져온 입항 건 키 — 판정 기록에 남겨 화면이 같은 입항 건의 판정만 붙인다.
+        (SELECT vc.port_call_key FROM mart.vessel_current_call vc
+         WHERE vc.callsgn = upper(btrim(dc.callsgn))) AS port_call_key,
         -- 판정할 선석(_target_wharf 와 같은 순서: 실제 접안 부두 → PORT-MIS 신고)의 재항 중앙값
         (
             SELECT bds.median_hours
@@ -219,6 +222,7 @@ def _snapshot(row: dict, *, source: str, target: str | None) -> dict:
         "draught_m": float(row["draught_m"]) if row.get("draught_m") is not None else None,
         "arrival_at_utc": _iso(row.get("arrival_at_utc")),
         "chem_ids": list(row.get("chem_ids") or []),
+        "port_call_key": row.get("port_call_key"),
     }
 
 
@@ -230,6 +234,7 @@ async def judge_with_llm_on_change(
     *,
     call_sign: str,
     stage: AssessmentStage | None,
+    port_call_key: str = "",
 ) -> OrchestratorResult | None:
     """판정하되 LLM 은 결과가 바뀔 때만 부른다. 바뀌지 않았으면 None.
 
@@ -240,9 +245,12 @@ async def judge_with_llm_on_change(
     규칙 판정은 한 척 1초 안팎이라 두 번 돌아도 부담이 작다.
     """
     result = await orchestrate(db, neo4j_driver, NullLLMClient(), request)
-    if await is_unchanged_from_last(db, call_sign=call_sign, stage=stage, result=result):
+    if await is_unchanged_from_last(db, call_sign=call_sign, stage=stage, result=result,
+                                    port_call_key=port_call_key):
         return None
-    return await orchestrate(db, neo4j_driver, llm_client, request)
+    # [2026-09-29] 종합 문장(summary)은 판정 기록에 저장되지 않는다 — 잡에서는 LLM 으로 쓰지 않는다.
+    # 안전 서술(key_hazards 는 axes 에 저장)만 실제 LLM 으로 받는다.
+    return await orchestrate(db, neo4j_driver, llm_client, request, summarize=False)
 
 
 async def watch_arrivals() -> None:
@@ -326,6 +334,8 @@ async def watch_arrivals() -> None:
             # 검증모드 고정 — 이 시설 하나만 확인한다. None 을 넘기면 오케스트레이터가
             # 탐색모드로 떨어져 선석 top-3 를 새로 고른다. 그건 배정이다.
             assigned_wharf_name=target,
+            target_source=source,
+            reported_wharf_name=row.get("assigned_facility_name"),
         )
         logger.info(
             "watch_arrivals: %s 검증 (%s / 출처 %s / 시점 %s)",
@@ -336,6 +346,7 @@ async def watch_arrivals() -> None:
             try:
                 result = await judge_with_llm_on_change(
                     db, neo4j_client.driver, llm_client, request, call_sign=callsgn, stage=stage,
+                    port_call_key=row.get("port_call_key") or "",
                 )
             except Exception:
                 logger.exception("watch_arrivals: %s 오케스트레이터 호출 실패", callsgn)
