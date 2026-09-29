@@ -110,6 +110,8 @@ ANSWER_SYSTEM_PROMPT = """\
    쓰세요. 임의로 등급을 올리거나 내리지 마세요. 그 판정은 규칙엔진 하한(MSDS
    혼재금지·벌크 호환성그룹·포장기준·판정가능성)으로 보정된 값입니다. 근거로는
    충돌이 적힌 축을 인용하세요 — 한 축이 "충돌 없음"이어도 다른 축이 등급을 정했을 수 있습니다.
+   "[참고"로 시작하는 항목(IMDG 격리표 등)은 등급의 근거로 인용하지 마세요.
+   근거에 적힌 화물쌍만 말하고, "울산항에서 ○○의 혼재금지 대상은 A와 B" 같은 일반화는 하지 마세요.
 5. 수치(인화점, 끓는점 등)는 근거에 적힌 값과 단위를 그대로 인용하세요. 환산·반올림
    하지 마세요.
 6. [근거 · 항만 운영 현황]이 있으면 배 이름·부두·화물·판정 등급·시각을 적힌 그대로
@@ -232,27 +234,30 @@ def _format_assessment(result: SafetyAssessmentResult) -> str:
             )
     else:
         lines.append("  - [MSDS 텍스트 기반 혼재금지] 충돌 없음")
+    # [2026-09-29] IMDG 는 한 선박 안의 적부 기준이라 부두 간 판정의 근거가 아니다(안전 에이전트
+    #   verdict_basis 에 없다). '공인 격리표'로만 적어 넘기자 답변이 "IMDG 기준으로도 충돌"을 근거처럼 썼다.
+    imdg_label = "[참고 · IMDG 격리표 — 한 선박 안 적부 기준이라 부두 간 판정에는 쓰지 않음]"
     if result.imdg_conflicts:
         for c in result.imdg_conflicts:
             lines.append(
-                f"  - [IMDG 공인 격리표] {c.adjacent_name}({c.adjacent_chem_id}) "
+                f"  - {imdg_label} {c.adjacent_name}({c.adjacent_chem_id}) "
                 f"Class {c.adjacent_imdg_class} vs 대상 Class {c.target_imdg_class}, "
                 f"격리코드 {c.segregation_code}"
             )
     else:
-        lines.append("  - [IMDG 공인 격리표] 충돌 없음")
+        lines.append(f"  - {imdg_label} 충돌 없음")
     # [2026-09-27] 벌크 호환성그룹 축. 판정(rule_engine_floor)은 이 축으로 '배정불가'가
     # 되는데 근거 목록에 없어서, 황산+가성소다처럼 등급은 배정불가인데 근거는 모두
     # "충돌 없음"인 입력이 모델에 들어갔고 답변이 "판단 불가"로 나왔다.
     if result.bulk_compatibility_conflicts:
         for c in result.bulk_compatibility_conflicts:
             lines.append(
-                f"  - [벌크 호환성그룹(USCG 46 CFR 150 참고)] {c.adjacent_name}({c.adjacent_chem_id}) "
+                f"  - [판정 근거 · 46 CFR 150 호환성 그룹] {c.adjacent_name}({c.adjacent_chem_id}) "
                 f"그룹 {c.adjacent_group}({c.adjacent_group_name}) vs 대상 그룹 "
                 f"{c.target_group}({c.target_group_name}) — {c.reason}"
             )
     else:
-        lines.append("  - [벌크 호환성그룹(USCG 46 CFR 150 참고)] 충돌 없음")
+        lines.append("  - [판정 근거 · 46 CFR 150 호환성 그룹] 충돌 없음")
     if result.unassessed_pairs:
         lines.append(
             f"  - [판정 근거 부족] {len(result.unassessed_pairs)}쌍은 MSDS 혼재금지 근거가 없어 "

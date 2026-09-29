@@ -2,47 +2,38 @@ from .msds_context import RELEVANT_SECTIONS
 from .schemas import (
     BulkCompatibilityConflict,
     IncompatibleConflict,
+    OnboardConflict,
     PackagingViolation,
-    RiskLevel,
     UnassessedPair,
 )
 
+# [2026-09-29] 등급 설명(reasoning)을 LLM 에서 걷어냈다. 예전 규칙 1("그 등급이 왜 그렇게
+# 나왔는지 설명하라")과 규칙 4("등급 설명은 쓰지 마라")가 부딪혔고, 입력의 대부분이 MSDS
+# 유해성이라 모델이 등급의 원인을 유해성에서 찾았다 — 같은 선박 화물 충돌로 '주의'가 된 배를
+# "발암성 때문에 주의"라고 썼다(nano·mini 모두 재현). 등급의 이유는 코드(verdict_basis)가
+# 확정하고, LLM 에는 등급을 주지도 묻지도 않는다.
 SYSTEM_PROMPT = """\
-당신은 울산항 액체화물 하역 안전관제를 보조하는 AI입니다.
-아래 규칙을 반드시 지켜 JSON으로만 응답하세요.
+당신은 울산항 액체화물 하역 관제 화면에 들어갈 화물 설명과 하역 전 확인 항목을 쓰는 보조자입니다.
+JSON으로만 응답하세요. 등급과 그 이유는 규칙 엔진이 정해 화면에 따로 표시합니다 —
+당신은 등급('안전'·'주의'·'위험'·'배정불가')을 말하거나 설명하지 않습니다.
 
-1. ★ 위험등급은 이미 규칙엔진이 확정했습니다. 당신은 등급을 정하지 않습니다.
-   입력의 "확정 위험등급"을 사실로 받아들이고, 그 등급이 왜 그렇게 나왔는지를
-   제공된 근거로 설명하세요. 등급을 다르게 판단하거나 "더 위험해 보인다"고
-   쓰지 마세요 — 화면에 표시되는 등급과 당신의 설명이 어긋나면 관제사가
-   무엇을 믿어야 할지 알 수 없게 됩니다.
-2. checklist와 key_hazards는 반드시 입력으로 제공된 MSDS 발췌문 안의 내용에
-   근거해서만 작성하세요. 제공되지 않은 사실을 추측해서 만들어내지 마세요.
-3. checklist는 5~8개, key_hazards는 2~5개의 짧고 실행 가능한 한국어 항목으로 작성하세요.
-4. reasoning은 1문단으로 대상 화물의 위험성(MSDS 발췌 근거)을 설명하고, 충돌이나
-   판정 근거 부족이 있으면 어떤 화물과 어떤 카테고리·그룹 때문인지 적으세요.
-   ★ "어떤 검사를 했고 충돌이 없었다"는 요약과 등급 설명은 쓰지 마세요 — 코드가
-   확정 문장으로 앞에 붙입니다. 입력에 없는 조치·이행 상황("조치가 이행 중")도 쓰지 마세요.
-5. "포장·하역방식 부적합"은 인접 화물과 무관하게 대상 화물 자신의 신고 내용만
-   보는 판정입니다(용기등급 대비 하역방식). 이게 있다면 인접 선석 충돌과는
-   별개 문제로 명확히 구분해서 reasoning에 적으세요.
-6. "벌크 액체화학물질 호환성 그룹 충돌"은 미국 해안경비대 규정 46 CFR Part 150의
-   산적 액체화물 호환성 차트(인접 탱크 기준)와 그 예외표에서 옮긴 것입니다.
-   reasoning에서 "IMDG Code"나 "국내 법령"인 것처럼 표현하지 말고, "46 CFR Part 150
-   호환성 차트 기준"이라고 정확히 표현하세요.
-7. "혼재금지 판정 근거 부족" 항목에 화물이 실려 있으면, 그 화물에 대한
-   "충돌 없음"은 **안전이 확인된 것이 아니라 확인할 자료가 없는 것**입니다.
-   reasoning에서 "충돌이 없어 안전하다"고 쓰지 말고 "판정 근거가 없어 확인이
-   필요하다"고 정확히 구분해 쓰고, checklist에 자료 보완·전문가 확인 항목을
-   하나 넣으세요. 근거가 없는 것을 안전으로 단정하지 않는 것이 이 시스템의
-   원칙입니다.
-8. 이 판정은 **서로 다른 부두에 접안한 선박 사이**의 문제입니다. IMDG Code의
-   격리 규정은 단일 선박 내 화물 적부 기준(이격거리 3~24m)이라 부두 간에는
-   적용 대상이 아니므로, IMDG 격리코드를 부두 간 배치의 근거로 인용하지
-   마세요. 위 입력에도 IMDG 항목은 제공되지 않습니다.
-9. 입력에 "검사하지 않음" 또는 "인접 화물 없음"이라고 적힌 항목은 **검증된 것이
-   아닙니다.** "검증이 이루어졌다", "적합하게 수행되고 있다", "충돌 없음으로 확인됐다"처럼
-   쓰지 말고, 하지 않은 검사는 하지 않았다고 그대로 쓰세요.
+1. cargo_profile — 이 화물이 하역 현장(부두·로딩암·탱크)에서 무엇이 위험한지 1~2문장, 100자 이내.
+   [대상 화물 MSDS 발췌]만 근거로 쓰세요. 등급·충돌 여부·검사 여부는 쓰지 마세요.
+   [대상 화물]이 여러 종('·'로 이어짐)이면 화물마다 나열하지 말고, 공통 위험과 특히 두드러진 화물을
+   묶어 1~2문장, 150자 이내로 쓰세요. key_hazards·checklist 도 그 화물들 전체를 대상으로 고르세요.
+2. key_hazards — 핵심 유해성 2~5개. 각각 15자 안팎의 명사구. MSDS 발췌만 근거로.
+3. checklist — 하역 전에 관제사·터미널이 확인할 항목 3~5개, 각각 한 문장.
+   - [이번 판정에서 확인할 것]에 항목이 있으면 그것부터 빠짐없이 확인 항목으로 옮기세요.
+   - 나머지는 MSDS 발췌에서 이 화물의 하역 작업에 특히 필요한 것만 고르세요.
+   - 이 화물은 탱커가 로딩암·호스로 탱크에 벌크 하역합니다. 용기·드럼·포장 취급을 전제로 한 항목은
+     쓰지 마세요("용기 밀폐 상태 확인" 등).
+   - 어느 화물에나 붙는 일반 수칙은 쓰지 마세요: 보호구 착용, MSDS 숙지, 폐기물 처리, 환기 확인,
+     방폭 설비 확인, 스파크 없는 도구 사용, 점화원 제거 같은 문장. 이 화물만의 수치·조건
+     (인화점·증기압·반응 상대·온도 관리 등)이 들어간 항목을 쓰세요.
+4. 입력에 없는 사실·조치·이행 상황을 만들지 마세요. "검사하지 않음"·"인접 화물 없음"인 항목을
+   검증된 것처럼 쓰지 마세요.
+5. 46 CFR Part 150 호환성 차트 근거는 "46 CFR 150 호환성 차트"라고 쓰고 IMDG Code·국내 법령으로
+   부르지 마세요. IMDG 격리 규정은 한 선박 안의 적부 기준이라 부두 간 배치의 근거가 아닙니다.
 """
 
 
@@ -121,6 +112,16 @@ def _format_packaging_violations(
     return f"(부적합 없음 — 신고된 하역방식 '{unload_method_name}' 기준)"
 
 
+def _format_onboard(onboard: list[OnboardConflict]) -> str:
+    if not onboard:
+        return "(충돌 없음 — 또는 화물이 1종이라 비교 대상 없음)"
+    return "\n".join(
+        f"  - {c.cargo_a_name} ↔ {c.cargo_b_name}: {c.basis} {c.detail} "
+        "(한 선박 적재 자체는 격리 시 허용 — 격리 적재 여부 확인 필요)"
+        for c in onboard
+    )
+
+
 # [2026-09-27] 이웃이 0건이어도 예전엔 "충돌 없음"·"판정 근거가 확보됨"으로 넘겨, LLM 이
 # "인접 선석 충돌 없음으로 확인"이라고 썼다. 비교할 이웃이 없었다는 사실을 그대로 적는다.
 _NO_NEIGHBORS = "(인접 화물 없음 — 비교할 이웃 화물이 없어 혼재 검사를 하지 않았습니다)"
@@ -134,11 +135,30 @@ def build_user_prompt(
     bulk_compatibility_conflicts: list[BulkCompatibilityConflict],
     packaging_violations: list[PackagingViolation],
     unassessed_pairs: list[UnassessedPair],
-    rule_engine_floor: RiskLevel,
     adjacent_count: int,
     unload_method_name: str | None,
+    onboard_conflicts: list[OnboardConflict] | None = None,
+    needs_check: list[str] | None = None,
+    conflict_checks: list[str] | None = None,
 ) -> str:
+    """conflict_checks — 배가 실은 **모든 화물**의 충돌 줄(화물 이름 포함, service._verdict_basis).
+
+    [2026-09-29] 주면 대표 화물의 충돌 목록 대신 이것을 '확인할 것'에 쓴다. 예전엔 대표 화물 것만
+    넘겨, 다른 화물의 충돌이 체크리스트에서 빠졌다. 아래 충돌 절(대표 화물 기준)은 그대로 둔다.
+    """
     no_neighbors = adjacent_count == 0
+    if conflict_checks is None:
+        conflict_checks = (
+            [f"이웃 {c.adjacent_berth} {c.adjacent_name}와 '{c.shared_category}' 혼재금지 충돌" for c in conflicts]
+            + [f"이웃 {c.adjacent_berth} {c.adjacent_name}와 46 CFR 150 호환성 충돌 — {c.reason}"
+               for c in bulk_compatibility_conflicts]
+            + [f"포장·하역방식 부적합 — {v.reason}" for v in packaging_violations]
+        )
+    to_check = (
+        [f"{c.cargo_a_name} ↔ {c.cargo_b_name} 같은 선박 적재 — 격리 적재 확인" for c in onboard_conflicts or []]
+        + list(conflict_checks)
+        + list(needs_check or [])
+    )
     return f"""\
 [대상 화물]
 {target_cargo_name}
@@ -146,7 +166,7 @@ def build_user_prompt(
 [대상 화물 MSDS 발췌]
 {_format_hazard_summary(hazard_summary)}
 
-[인접 선석 혼재금지 충돌 (Neo4j 그래프 탐색 결과, MSDS 텍스트 기반)]
+[인접 선석 혼재금지 충돌 — 대상 화물 기준 (Neo4j 그래프 탐색 결과, MSDS 텍스트 기반)]
 {_NO_NEIGHBORS if no_neighbors else _format_conflicts(conflicts)}
 
 [벌크 액체화학물질 호환성 그룹 충돌 (46 CFR Part 150 호환성 차트 기준)]
@@ -158,10 +178,11 @@ def build_user_prompt(
 [혼재금지 판정 근거 부족 — ★ 위의 "충돌 없음"을 "안전 확인"으로 읽으면 안 되는 화물]
 {_format_unassessed(unassessed_pairs, adjacent_count)}
 
-[확정 위험등급 — 규칙엔진이 결정했으며 변경 대상이 아님]
-{rule_engine_floor.value}
+[같은 선박 내 화물끼리의 혼재 충돌 (이 배가 함께 실은 화물 간)]
+{_format_onboard(onboard_conflicts or [])}
 
-위 정보를 바탕으로 checklist, key_hazards, reasoning을 JSON으로 응답하세요.
-reasoning은 "확정 위험등급"이 그렇게 나온 이유를 제공된 근거로 설명하는 글입니다.
-포장·하역방식 부적합이 있다면 reasoning과 checklist에 그 내용을 반드시 반영하세요.
+[이번 판정에서 확인할 것]
+{chr(10).join(f"  - {t}" for t in to_check) or "(없음)"}
+
+위 정보를 바탕으로 cargo_profile, key_hazards, checklist를 JSON으로 응답하세요.
 """

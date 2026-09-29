@@ -122,6 +122,17 @@ class ForecastWarning(BaseModel):
     earliest_deterioration_at_utc: datetime | None = Field(
         default=None, description="조건부가능 이상으로 처음 악화되는 예보 시각"
     )
+    earliest_deterioration_causes: list[str] = Field(
+        default_factory=list,
+        description="[2026-09-29] 그 시각에 기준을 넘은 항목(예: '강수량 1.0mm/h >= 1.0mm/h'). 화면이 "
+        "'하역중단 예보'만 적어 무엇 때문인지 알 수 없었다.",
+    )
+    no_forecast_after_utc: datetime | None = Field(
+        default=None,
+        description="[2026-09-29] 이 시각부터 체류 종료까지 예보 값이 없다. 악화가 아니라 '못 본 구간'이라 "
+        "will_deteriorate·worst_status 에 넣지 않는다 — 예전엔 값 없는 예보 시각이 '판단불가'로 "
+        "악화에 잡혀, 체류가 긴 배에 없는 악화 경고가 붙었다(실측 ATHENS SPIRIT, 5일 체류).",
+    )
     points: list[ForecastPoint]
 
 

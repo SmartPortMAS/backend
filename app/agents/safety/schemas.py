@@ -98,6 +98,11 @@ class SafetyAssessmentRequest(BaseModel):
         "비우면 target_cargo 하나만 본다(하위 호환).",
     )
     adjacent_cargos: list[AdjacentCargo] = Field(default_factory=list)
+    call_sign: str | None = Field(
+        default=None,
+        description="[2026-09-29] 대상 화물을 실은 배의 호출부호. 주면 이번 입항 건 화물 신고의 "
+        "하역방식(unload_method_name)을 채운다 — 비어 있는 화물만. 화물만 골라 묻는 경우엔 비운다.",
+    )
 
     def all_targets(self) -> list[CargoRef]:
         """target_cargo + target_cargos (같은 식별자는 한 번만)."""
@@ -206,6 +211,22 @@ class BulkCompatibilityConflict(BaseModel):
     reason: str
 
 
+class OnboardConflict(BaseModel):
+    """같은 선박이 이번 입항에 함께 실은 화물끼리의 혼재 충돌 (2026-09-28 추가).
+
+    인접 선석 축과 같은 근거(MSDS 혼재금지·46 CFR 150 호환성 그룹)로 본다. 다만 한 선박
+    안에서는 탱크를 격리하면 함께 실을 수 있으므로(IBC Code 3.1.3) 규정 위반이 아니라
+    "격리 적재 확인 필요"다 — 배의 등급을 최소 '주의'로만 올린다(배정불가 아님).
+    """
+
+    cargo_a_chem_id: str
+    cargo_a_name: str
+    cargo_b_chem_id: str
+    cargo_b_name: str
+    basis: str = Field(description="'46 CFR 150' 또는 'MSDS'")
+    detail: str = Field(description="충돌 근거 — 호환성 그룹 쌍 또는 혼재금지 카테고리")
+
+
 class PackagingViolation(BaseModel):
     """포장·하역방식 부적합. IncompatibleConflict/ImdgSegregationConflict와 달리
     인접 화물이 아니라 대상 화물 자신의 신고 내용(용기등급 vs 하역방식)만으로 판정한다."""
@@ -234,11 +255,18 @@ class LLMAssessment(BaseModel):
     것 — MSDS 근거에 기반한 서술 — 만 맡는다. 부수 효과로 등급이 결정적이 되어
     같은 입력에 항상 같은 등급이 나오고, LLM을 기다리지 않고도 등급을 확정할 수
     있다(45ms, /safety/verdict).
+
+    [2026-09-29] reasoning(등급 설명)을 cargo_profile(화물 특성)로 바꿨다. "등급이 왜 이렇게
+    나왔나"를 LLM 에 쓰게 했더니, 입력의 대부분인 MSDS 유해성을 원인으로 댔다 — 같은 선박
+    화물 충돌로 '주의'가 된 배를 "발암성 때문에 주의"라고 썼다(nano·mini 모두 재현).
+    등급의 이유는 코드가 verdict_basis 로 확정하고, LLM 은 화물 특성과 체크리스트만 쓴다.
     """
 
-    checklist: list[str] = Field(description="화물 맞춤형 안전 체크리스트 (MSDS 문구 근거)")
+    checklist: list[str] = Field(description="이번 판정 결과와 MSDS 에 맞춘 하역 전 확인 항목 (3~5개)")
     key_hazards: list[str] = Field(description="핵심 유해성 요약 (2~5개)")
-    reasoning: str = Field(description="판단 근거 요약 (관제사가 읽을 한두 문단)")
+    cargo_profile: str = Field(
+        description="이 화물이 하역 현장에서 무엇이 위험한지 1~2문장. 등급·충돌·검사 여부는 쓰지 않는다"
+    )
 
 
 class SafetyVerdict(BaseModel):
@@ -265,6 +293,16 @@ class SafetyVerdict(BaseModel):
     imdg_classes: dict[str, str] = Field(default_factory=dict)
     cargo_verdicts: list[CargoVerdictSummary] = Field(
         default_factory=list, description="화물별 판정 요약. 화물이 하나면 원소도 하나다."
+    )
+    onboard_conflicts: list[OnboardConflict] = Field(
+        default_factory=list, description="같은 선박 화물끼리의 혼재 충돌. 있으면 등급이 최소 '주의'."
+    )
+    adjacent_count: int = Field(default=0, description="비교한 이웃 화물 수. 0 이면 혼재 비교 대상이 없었다")
+    verdict_basis: list[str] = Field(
+        default_factory=list, description="[2026-09-29] 등급의 근거 — 코드가 판정 결과에서 만든 문장"
+    )
+    needs_check: list[str] = Field(
+        default_factory=list, description="[2026-09-29] 확인 필요 — 판정에 쓰지 못한 근거('대상 — 이유')"
     )
 
 
@@ -302,7 +340,7 @@ class SafetyAssessmentResult(BaseModel):
         "원인은 대개 KOSHA MSDS의 J08('피해야 할 물질')이 '자료없음'인 것으로, "
         "2026-08-23 API 원천 확인 결과 36종 중 27종이 해당한다.",
     )
-    rule_engine_floor: RiskLevel = Field(description="그래프 탐색 기반 결정적 하한 등급 (MSDS 텍스트 + 벌크 호환성그룹 + 포장기준 + 판정가능성 중 가장 심각한 쪽)")
+    rule_engine_floor: RiskLevel = Field(description="그래프 탐색 기반 결정적 하한 등급 (MSDS 텍스트 + 벌크 호환성그룹 + 포장기준 + 판정가능성 + 같은 선박 혼재 중 가장 심각한 쪽)")
     msds_sections_used: list[str] = Field(description="프롬프트 근거로 사용된 MSDS detail 섹션 키 목록")
     imdg_classes: dict[str, str] = Field(
         default_factory=dict,
@@ -315,4 +353,21 @@ class SafetyAssessmentResult(BaseModel):
     cargo_verdicts: list[CargoVerdictSummary] = Field(
         default_factory=list,
         description="[2026-09-25] 화물별 판정 요약. 최상위 필드는 is_governing=True 인 화물 기준이다.",
+    )
+    onboard_conflicts: list[OnboardConflict] = Field(
+        default_factory=list,
+        description="[2026-09-28] 같은 선박 화물끼리의 혼재 충돌. 있으면 risk_level 이 최소 '주의'"
+        "(격리 적재 확인 필요 — IBC Code 3.1.3 상 격리하면 함께 실을 수 있어 배정불가는 아니다).",
+    )
+    adjacent_count: int = Field(default=0, description="비교한 이웃 화물 수. 0 이면 혼재 비교 대상이 없었다")
+    verdict_basis: list[str] = Field(
+        default_factory=list,
+        description="[2026-09-29] 등급의 근거 — 코드가 판정 결과에서 만든 문장. 화면은 이걸 등급 바로 "
+        "아래에 둔다(LLM 서술에 맡기지 않는다).",
+    )
+    needs_check: list[str] = Field(
+        default_factory=list, description="[2026-09-29] 확인 필요 — 판정에 쓰지 못한 근거('대상 — 이유')"
+    )
+    cargo_profile: str = Field(
+        default="", description="[2026-09-29] LLM 이 쓴 화물 특성 1~2문장(참고). 등급의 이유가 아니다"
     )

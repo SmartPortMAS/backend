@@ -12,7 +12,7 @@ data-pipeline이 수집)에서 as_of~expected_completion_at 구간의 예보를 
 비교" 요구사항 — 이 기능은 팀원 MVP에는 없고 기존 구현에만 있어 그대로 유지).
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -67,15 +67,21 @@ async def _build_forecast_warning(
     expected_completion_at: datetime,
     threshold,
     extra_condition_active: bool,
+    wave_applies: bool = True,
 ) -> ForecastWarning:
+    """wave_applies — 현재 관측 판정과 같은 값을 받는다(2026-09-29). 예보 파고도 해상 예보라 항내 부두에는
+    쓰지 않는다 — 예전엔 넘기지 않아, 풍속은 멀쩡한데 예보 파고 하나로 '하역중단 예보' 조건이 붙었다
+    (실측: 우선호@달포부두 "09/29 13:00 부터 '하역중단' 예보")."""
     forecast_rows = await get_forecast_range(db, start=as_of, end=expected_completion_at)
 
     points: list[ForecastPoint] = []
     worst_status = WorkStatus.NORMAL
     earliest_deterioration_at: datetime | None = None
+    earliest_causes: list[str] = []
+    no_forecast_after: datetime | None = None
 
     for row in forecast_rows:
-        point_status, _ = evaluate(
+        point_status, point_reasons = evaluate(
             wind_speed_ms=row.wind_speed_ms,
             wind_is_stale=False,
             wave_height_m=row.wave_height_m,
@@ -83,6 +89,7 @@ async def _build_forecast_warning(
             threshold=threshold,
             extra_condition_active=extra_condition_active,
             precip_mm=row.precip_mm,
+            wave_applies=wave_applies,
         )
         points.append(
             ForecastPoint(
@@ -93,10 +100,22 @@ async def _build_forecast_warning(
                 precip_mm=row.precip_mm,
             )
         )
+        # 값이 없는 예보 시각(판단불가)은 악화가 아니라 예보 공백이다 — 따로 센다.
+        if point_status is WorkStatus.UNKNOWN:
+            if no_forecast_after is None:
+                no_forecast_after = row.fcst_at_utc
+            continue
         if severity(point_status) > severity(worst_status):
             worst_status = point_status
         if earliest_deterioration_at is None and point_status is not WorkStatus.NORMAL:
             earliest_deterioration_at = row.fcst_at_utc
+            # "강수량 1.0mm/h >= 1.0mm/h -> 하역중단" → "강수량 1.0mm/h >= 1.0mm/h"
+            earliest_causes = [r.split(" -> ")[0] for r in point_reasons if " -> " in r]
+
+    # 예보 행 자체가 체류 종료 전에 끝나도 공백이다(예보 간격 3시간보다 길게 비면).
+    last_at = points[-1].fcst_at_utc if points else as_of
+    if no_forecast_after is None and expected_completion_at - last_at > timedelta(hours=3):
+        no_forecast_after = last_at
 
     return ForecastWarning(
         window_end_utc=expected_completion_at,
@@ -104,6 +123,8 @@ async def _build_forecast_warning(
         will_deteriorate=earliest_deterioration_at is not None,
         worst_status=worst_status,
         earliest_deterioration_at_utc=earliest_deterioration_at,
+        earliest_deterioration_causes=earliest_causes,
+        no_forecast_after_utc=no_forecast_after,
         points=points,
     )
 
@@ -132,9 +153,11 @@ async def assess_weather(db: AsyncSession, request: WeatherAssessmentRequest) ->
     # [2026-09-21, D2 ②] 외해 부이 파고를 항내 부두에 대입하지 않는다.
     # wharf_name 을 안 넘긴 호출은 예전대로 적용한다(하위 호환) — 다만 그러면
     # 항내 부두가 외해 파고로 막히므로, 판정 경로는 반드시 이 값을 채워야 한다.
-    wave_applies = (
-        rule_engine_wave_applies_to(request.wharf_name) if request.wharf_name else True
-    )
+    # [2026-09-29] 부두그룹만 넘긴 호출(대시보드 '부두 기상 판정')도 같은 규칙을 그룹 이름에 쓴다 — 예전엔
+    #   이 경로가 하위 호환으로 적용돼, 에이전트는 외해 파고를 안 쓰는데 그 패널만 "파고 1.6m < 2.0m 정상"처럼
+    #   OTK·정일 등 항내 부두에 외해 파고를 대입했다. 부이 그룹(한국석유공사원유부이)은 그대로 적용된다.
+    wave_target = request.wharf_name or request.berth_group
+    wave_applies = rule_engine_wave_applies_to(wave_target) if wave_target else True
 
     status, reasons = evaluate(
         wind_speed_ms=wind_speed_ms,
@@ -155,6 +178,7 @@ async def assess_weather(db: AsyncSession, request: WeatherAssessmentRequest) ->
             expected_completion_at=request.expected_completion_at,
             threshold=threshold,
             extra_condition_active=request.extra_condition_active,
+            wave_applies=wave_applies,
         )
 
     return WeatherAssessmentResult(

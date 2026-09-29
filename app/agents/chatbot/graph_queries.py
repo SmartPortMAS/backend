@@ -158,8 +158,10 @@ async def fetch_bulk_compatibility_groups(driver: AsyncDriver, chem_id: str) -> 
     ([{"category": str, "chemicals": [...]}])이라 service.py에서 그대로
     IncompatibleCategoryGroup 리스트에 이어붙일 수 있다.
 
-    category 라벨에 "(참고축)"을 명시해 MSDS/IMDG 근거와 구분한다 — 근거의
+    category 라벨에 출처(46 CFR 150)를 명시해 MSDS 근거와 구분한다 — 근거의
     성격이 다르다는 것을 프롬프트·화면 양쪽에서 알 수 있어야 한다.
+    [2026-09-29] 예전 라벨 "(참고축)"은 뺐다. 이 축은 안전 에이전트 등급의 근거다
+    (compute_bulk_compatibility_floor · verdict_basis) — '참고'라 적으면 판정과 어긋난다.
     """
     group_rows = await _read(driver, _CYPHER_BULK_GROUP_INCOMPATIBLE, chem_id=chem_id)
     exception_rows = await _read(driver, _CYPHER_BULK_BLOCKED_EXCEPTION, chem_id=chem_id)
@@ -167,7 +169,7 @@ async def fetch_bulk_compatibility_groups(driver: AsyncDriver, chem_id: str) -> 
     groups: list[dict] = [
         {
             "category": (
-                f"벌크호환성그룹(참고축) {row['my_group_name']}(그룹{row['my_group']}) "
+                f"46 CFR 150 호환성 그룹 {row['my_group_name']}(그룹{row['my_group']}) "
                 f"↔ {row['other_group_name']}(그룹{row['other_group']})"
             ),
             "chemicals": row["chemicals"],
@@ -176,7 +178,7 @@ async def fetch_bulk_compatibility_groups(driver: AsyncDriver, chem_id: str) -> 
     ]
     if exception_rows:
         groups.append({
-            "category": "벌크호환성그룹(참고축) 개별 예외 규정 — 일반 그룹 규칙과 무관하게 강제 격리",
+            "category": "46 CFR 150 호환성 그룹 개별 예외 규정 — 일반 그룹 규칙과 무관하게 강제 격리",
             "chemicals": [dict(row) for row in exception_rows],
         })
     return groups
@@ -190,8 +192,9 @@ async def fetch_imdg_segregation_groups(driver: AsyncDriver, chem_id: str) -> li
     return [
         {
             "category": (
-                f"IMDG 공인 격리표 Class {row['my_class']}↔{row['other_class']} "
-                f"(격리코드 {row['segregation_code']})"
+                # [2026-09-29] 참고임을 이름에 박는다 — 한 선박 안 적부 기준이라 부두 간 판정 근거가 아니다.
+                f"[참고] IMDG 격리표 Class {row['my_class']}↔{row['other_class']} "
+                f"(격리코드 {row['segregation_code']}, 한 선박 안 적부 기준 — 부두 간 판정에는 쓰지 않음)"
             ),
             "chemicals": row["chemicals"],
         }

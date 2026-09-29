@@ -83,7 +83,13 @@ _QUERY_UPCOMING = text("""
            cg.cargos->0->>'chem_id' AS chem_id, cg.cargos->0->>'cas_no' AS cas_no,
            cg.cargos->0->>'name' AS cargo_name, (cg.cargos->0->>'is_synthetic')::boolean AS cargo_is_synthetic,
            a.collected_at_utc,
-           cg.cargos
+           cg.cargos,
+           -- [2026-09-29] 이 행의 입항 건 키와 판정 잡이 지금 보는 입항 건 키. 판정 기록은 같은 입항 건 것만 붙인다.
+           CASE WHEN a.entry_year IS NOT NULL AND a.entry_count IS NOT NULL
+                THEN upper(btrim(a.callsgn)) || '_' || a.entry_year::text || '_' || lpad(a.entry_count::text, 3, '0')
+           END AS port_call_key,
+           (SELECT vc.port_call_key FROM mart.vessel_current_call vc
+            WHERE vc.callsgn = upper(btrim(a.callsgn))) AS current_call_key
     FROM arr a
     LEFT JOIN fac f ON f.source_name = a.arrival_facility_nm
     LEFT JOIN berth b ON b.wharf_name = f.wharf_name
@@ -108,13 +114,27 @@ _QUERY_UPCOMING = text("""
 
 _QUERY_HAS_HISTORY = text("SELECT to_regclass('public.assessment_history') IS NOT NULL")
 
+# [2026-09-29] 입항 건별 최신 판정. 예전엔 호출부호의 최신 판정 하나를 붙여, 입항이 12시간 넘게 남은
+#   배의 새 입항 건 옆에 지난 입항 건 판정이 떴다(실측: 기록이 있는 7척 전부 화물이 달랐다).
+#   입항 건 키가 없는 옛 기록(port_call_key '')은 이 행이 판정 잡의 지금 입항 건일 때만 붙인다.
 _QUERY_LATEST_ASSESSMENT = text("""
-    SELECT DISTINCT ON (call_sign) call_sign, stage, level, reasons, action, recipient,
-           changed_from, assessed_at_utc
+    SELECT DISTINCT ON (upper(btrim(call_sign)), COALESCE(input_snapshot->>'port_call_key', ''))
+           upper(btrim(call_sign)) AS cs, COALESCE(input_snapshot->>'port_call_key', '') AS port_call_key,
+           call_sign, stage, level, reasons, action, recipient, changed_from, assessed_at_utc
     FROM assessment_history
     WHERE upper(btrim(call_sign)) = ANY(CAST(:call_signs AS text[]))
-    ORDER BY call_sign, assessed_at_utc DESC
+    ORDER BY upper(btrim(call_sign)), COALESCE(input_snapshot->>'port_call_key', ''), assessed_at_utc DESC
 """)
+
+
+def _assessment_for(row: dict, by_key: dict[tuple[str, str], dict]) -> dict | None:
+    """이 행(입항 건)의 판정. 같은 입항 건 기록이 없으면 키 없는 옛 기록을, 지금 입항 건일 때만."""
+    cs = (row.get("call_sign") or "").strip().upper()
+    key = row.get("port_call_key") or ""
+    hit = by_key.get((cs, key)) if key else None
+    if hit is None and (not key or key == row.get("current_call_key")):
+        hit = by_key.get((cs, ""))
+    return hit
 
 
 def _stage(row: dict, now: datetime) -> str:
@@ -144,12 +164,13 @@ async def get_upcoming_arrivals(
         _QUERY_UPCOMING, {"ahead_hours": ahead_hours, "past_hours": past_hours},
     )).mappings().all()]
 
-    assessments: dict[str, dict] = {}
+    assessments: dict[tuple[str, str], dict] = {}
     has_history = bool((await db.execute(_QUERY_HAS_HISTORY)).scalar())
     if rows and has_history:
         call_signs = sorted({r["call_sign"].strip().upper() for r in rows if r["call_sign"]})
         for a in (await db.execute(_QUERY_LATEST_ASSESSMENT, {"call_signs": call_signs})).mappings().all():
-            assessments[a["call_sign"].strip().upper()] = dict(a)
+            a = dict(a)
+            assessments[(a.pop("cs"), a.pop("port_call_key"))] = a
 
     now = datetime.now(timezone.utc)
     items = []
@@ -157,7 +178,7 @@ async def get_upcoming_arrivals(
         depth, draught = r.get("depth_m"), r.get("draught_m")
         r["chart_margin_m"] = round(float(depth) - float(draught), 2) if depth is not None and draught is not None else None
         r["stage"] = _stage(r, now)
-        r["assessment"] = assessments.get((r["call_sign"] or "").strip().upper())
+        r["assessment"] = _assessment_for(r, assessments)
         items.append(r)
 
     return {

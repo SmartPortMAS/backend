@@ -18,7 +18,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.orchestrator.schemas import OrchestratorResult, OverallDecision
-from app.agents.safety.schemas import RiskLevel
+from app.agents.safety.schemas import RiskLevel, risk_level_rank
 from app.agents.weather.schemas import WorkStatus
 from app.models.assessment_history import (
     AssessmentAction,
@@ -68,9 +68,20 @@ _ACTION_BY_STAGE = {
 }
 
 
+_SUBJECT_BY_SOURCE = {"AIS": "지금 접안한 선석", "PORT-MIS": "배정된 선석"}
+
+
 def level_from_decision(result: OrchestratorResult) -> tuple[AssessmentLevel, str]:
-    """오케스트레이터 귀결 → 판정 등급. 두 번째 값은 사람이 읽는 한 줄."""
+    """오케스트레이터 귀결 → 판정 등급. 두 번째 값은 사람이 읽는 한 줄.
+
+    [2026-09-29] 주어를 "배정된 선석"에서 출처대로 바꿨다. 판정 대상은 대개 AIS 로 본 실제
+    접안 부두인데 PORT-MIS 는 아직 정박지로 적고 있어(실측 27척 중 26척), "배정된"은 사실과
+    달랐다. 등급 비교(_same_as_last)는 문구를 보지 않으므로 이 변경으로 기록 행이 새로 생기지 않는다.
+    같은 날 PORT-MIS 출처는 "배정된 선석"으로 다시 바꿨다 — 아직 붙지 않은 배의 사전배정 자리이고,
+    배정(PORT-MIS)과 접안(AIS)은 다른 사실이다. 정박지 신고는 판정 대상이 아니라 여기 오지 않는다.
+    """
     decision = result.overall_decision
+    subject = _SUBJECT_BY_SOURCE.get(result.target_source, "이 선석")
 
     if decision is OverallDecision.APPROVED:
         # 기상이 '정상'이 아니면 통과라도 주의다 — 하역중단 임계를 넘지 않았을 뿐
@@ -79,21 +90,31 @@ def level_from_decision(result: OrchestratorResult) -> tuple[AssessmentLevel, st
         if weather.status is WorkStatus.UNKNOWN:
             return AssessmentLevel.UNKNOWN, "기상 관측이 없거나 오래돼 판단할 수 없습니다"
         if weather.status is not WorkStatus.NORMAL:
-            return AssessmentLevel.CAUTION, f"배정된 선석은 조건에 맞으나 기상이 '{weather.status.value}'입니다"
+            return AssessmentLevel.CAUTION, f"{subject}은 조건에 맞으나 기상이 '{weather.status.value}'입니다"
         # [2026-09-26] 오케스트레이터는 혼재 '배정불가'만 탈락시키므로 여기 온 결과의
         # 혼재 등급은 안전·주의·위험 중 하나다. 예전엔 이 등급을 보지 않아 위험이어도
         # '적합'으로 기록됐다(실측: 적합인데 혼재 주의 2건). 위험·주의는 '주의'로 둔다 —
         # 배정불가만 막고 나머지는 경고로 보인다는 safety/service.py 의 설계를 따른다.
         safety = result.safety_assessment
         if safety is not None and safety.risk_level in (RiskLevel.DANGER, RiskLevel.CAUTION):
+            # [2026-09-28] 같은 선박 화물끼리 충돌해도 '주의'가 된다 — 어느 쪽인지 문장에 적는다.
+            adjacent_level = max(
+                (v.risk_level for v in safety.cargo_verdicts),
+                key=risk_level_rank, default=safety.risk_level,
+            )
+            if safety.onboard_conflicts and risk_level_rank(adjacent_level) < risk_level_rank(safety.risk_level):
+                return (
+                    AssessmentLevel.CAUTION,
+                    f"{subject}은 조건에 맞으나 같은 선박 화물끼리 혼재 충돌이 있습니다 — 격리 적재 확인 필요",
+                )
             return (
                 AssessmentLevel.CAUTION,
-                f"배정된 선석은 조건에 맞으나 인접 화물 혼재 등급이 '{safety.risk_level.value}'입니다",
+                f"{subject}은 조건에 맞으나 인접 화물 혼재 등급이 '{safety.risk_level.value}'입니다",
             )
         if result.conditions:
             # 교차 확인 조건(체류 중 기상 악화 예보 등). 등급은 적합 그대로다(결정 7-1).
-            return AssessmentLevel.FIT, "배정된 선석이 이 선박·화물 조건에 맞습니다(조건부 — 체류 중 악화 예보)"
-        return AssessmentLevel.FIT, "배정된 선석이 이 선박·화물 조건에 맞습니다"
+            return AssessmentLevel.FIT, f"{subject}이 이 선박·화물 조건에 맞습니다(조건부 — 체류 중 악화 예보)"
+        return AssessmentLevel.FIT, f"{subject}이 이 선박·화물 조건에 맞습니다"
 
     if decision is OverallDecision.WEATHER_BLOCKED:
         if result.evidence_missing:
@@ -118,12 +139,12 @@ def level_from_decision(result: OrchestratorResult) -> tuple[AssessmentLevel, st
         detail = result.assignment_trace[0] if result.assignment_trace else None
         if result.evidence_missing:
             return AssessmentLevel.UNKNOWN, detail or "판정에 필요한 근거가 없습니다"
-        return AssessmentLevel.UNFIT, detail or "배정된 선석이 이 선박 조건에 맞지 않습니다"
+        return AssessmentLevel.UNFIT, detail or f"{subject}이 이 선박 조건에 맞지 않습니다"
 
     if decision is OverallDecision.ALL_CANDIDATES_UNSAFE:
         # 검증모드에서 이 귀결은 "다른 선석이 없다"가 아니라 **"배정된 그 선석이
         # 이 배에 안 맞는다"** 는 뜻이다. 대상이 한 곳뿐이기 때문이다.
-        return AssessmentLevel.UNFIT, "배정된 선석이 이 선박·화물 조건에 맞지 않습니다"
+        return AssessmentLevel.UNFIT, f"이웃 화물과 혼재 충돌이 있어 {subject}이 이 화물에 맞지 않습니다"
 
     return AssessmentLevel.UNKNOWN, f"판정 결과를 해석할 수 없습니다({decision.value})"
 
@@ -168,6 +189,8 @@ def _axes_from_result(result: OrchestratorResult) -> dict:
                 }
                 for v in s.cargo_verdicts
             ],
+            # [2026-09-28] 같은 선박 화물끼리의 혼재 충돌(격리 적재 확인 필요).
+            "onboard": [c.model_dump() for c in s.onboard_conflicts],
         }
 
     # [2026-09-27] 도구별 의견(등급 · 확인한 것 · 못 본 것)과 교차 확인 조건. condition_key 는
@@ -228,6 +251,10 @@ def _reasons_from_result(result: OrchestratorResult, headline: str) -> list[str]
             for v in verdicts
         )
         reasons.append(f"화물 {len(verdicts)}종 혼재 판정: {parts}")
+    onboard = result.safety_assessment.onboard_conflicts if result.safety_assessment else []
+    if onboard:
+        pairs = ", ".join(sorted({f"{c.cargo_a_name}↔{c.cargo_b_name}" for c in onboard}))
+        reasons.append(f"같은 선박 화물 혼재 충돌: {pairs} — 격리 적재 확인 필요")
     if result.suggested_alternatives:
         names = ", ".join(
             f"{c.wharf_name}(여유 {c.draught_margin_m:.1f}m)"
@@ -236,6 +263,8 @@ def _reasons_from_result(result: OrchestratorResult, headline: str) -> list[str]
         reasons.append(f"대체 선석 제안: {names} — 제안이며 배정이 아닙니다")
     elif result.suggestion_note:
         reasons.append(f"대체 선석을 제안하지 못했습니다: {result.suggestion_note}")
+    # [2026-09-29] 판정에 쓰지 못한 근거 — 맨 뒤에 둔다(앞 줄을 읽는 화면·챗봇의 순서를 바꾸지 않게).
+    reasons.extend(f"확인 필요: {m}" for m in result.needs_check)
     # 중복 제거하되 순서는 유지한다(관제사가 읽는 순서가 근거의 우선순위다).
     seen: set[str] = set()
     return [r for r in reasons if r and not (r in seen or seen.add(r))]
@@ -250,7 +279,9 @@ _QUERY_LAST = text("""
                ''
            ) AS suggested_key,
            -- 교차 확인 조건(예보 등급 등). 시각은 넣지 않은 요약이다.
-           COALESCE(axes->>'condition_key', '') AS condition_key
+           COALESCE(axes->>'condition_key', '') AS condition_key,
+           -- [2026-09-29] 어느 입항 건의 판정인가. 입항 건이 바뀌면 등급이 같아도 새로 기록한다.
+           COALESCE(input_snapshot->>'port_call_key', '') AS port_call_key
     FROM assessment_history
     WHERE call_sign = :call_sign
     ORDER BY assessed_at_utc DESC
@@ -259,11 +290,18 @@ _QUERY_LAST = text("""
 
 
 def _same_as_last(last, stage_value: str, level: AssessmentLevel,
-                  action_value: str | None, suggested_key: str, condition_key: str = "") -> bool:
-    """직전 기록과 시점·등급·조치안·제안·조건이 모두 같은가 — 같으면 새로 기록하지 않는다."""
+                  action_value: str | None, suggested_key: str, condition_key: str = "",
+                  port_call_key: str = "") -> bool:
+    """직전 기록과 시점·등급·조치안·제안·조건·입항 건이 모두 같은가 — 같으면 새로 기록하지 않는다.
+
+    [2026-09-29] 입항 건(port_call_key)을 더했다. 새 입항 건인데 등급이 같으면 기록이 생기지 않아,
+    화면이 새 입항 건 옆에 지난 입항 건 판정을 붙여 보였다(실측 12h 밖 기록 7척 전부 화물이 달랐다).
+    키를 모르는 호출(빈 값)은 입항 건을 비교하지 않는다.
+    """
     return last is not None and last["stage"] == stage_value and last["level"] == level.value \
         and last["action"] == action_value and last["suggested_key"] == suggested_key \
-        and last["condition_key"] == condition_key
+        and last["condition_key"] == condition_key \
+        and (not port_call_key or last["port_call_key"] == port_call_key)
 
 
 async def record_assessment(
@@ -300,7 +338,8 @@ async def record_assessment(
     action_value = action.value if action is not None else None
 
     last = (await db.execute(_QUERY_LAST, {"call_sign": call_sign})).mappings().first()
-    if _same_as_last(last, stage_value, level, action_value, suggested_key, condition_key):
+    if _same_as_last(last, stage_value, level, action_value, suggested_key, condition_key,
+                     (input_snapshot or {}).get("port_call_key") or ""):
         return False
 
     recipient = _RECIPIENT_BY_STAGE.get(stage) if (stage is not None and action is not None) else None
@@ -345,6 +384,7 @@ async def is_unchanged_from_last(
     call_sign: str,
     stage: AssessmentStage | None,
     result: OrchestratorResult,
+    port_call_key: str = "",
 ) -> bool:
     """이 결과를 record_from_orchestrator 에 넘기면 '변화 없음'으로 기록이 생략되는가.
 
@@ -356,7 +396,7 @@ async def is_unchanged_from_last(
     stage_value = stage.value if stage is not None else AssessmentStage.BEFORE_ARRIVAL.value
     last = (await db.execute(_QUERY_LAST, {"call_sign": call_sign})).mappings().first()
     return _same_as_last(last, stage_value, level, action.value if action is not None else None,
-                         _suggested_key(result), result.condition_key)
+                         _suggested_key(result), result.condition_key, port_call_key)
 
 
 async def record_from_orchestrator(
