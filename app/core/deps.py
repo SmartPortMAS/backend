@@ -7,6 +7,7 @@ from app.llm.embeddings import EmbeddingClient
 from app.llm.factory import get_chatbot_llm_client as _get_chatbot_llm_client
 from app.llm.factory import get_embedding_client as _get_embedding_client
 from app.llm.factory import get_llm_client as _get_llm_client
+from app.llm.factory import get_safety_llm_client as _get_safety_llm_client
 
 
 async def get_session(session: AsyncSession = Depends(get_db)) -> AsyncSession:
@@ -19,6 +20,10 @@ def get_llm_client() -> LLMClient:
 
 def get_chatbot_llm_client() -> LLMClient:
     return _get_chatbot_llm_client()
+
+
+def get_safety_llm_client() -> LLMClient:
+    return _get_safety_llm_client()
 
 
 def get_embedding_client() -> EmbeddingClient:
