@@ -176,7 +176,8 @@ async def assess_and_record(
     result = await _orchestrate_or_http(db, llm_client, base)
 
     live = (await db.execute(_QUERY_LIVE_STATE, {"call_sign": request.call_sign})).mappings().first()
-    stage = stage_from_nav_status(live["nav_status_code"] if live else None)
+    stage = stage_from_nav_status(live["nav_status_code"] if live else None,
+                                  target_source=result.target_source)
     port_call_key = request.port_call_key or (
         await db.execute(_QUERY_CURRENT_CALL_KEY, {"call_sign": request.call_sign})
     ).scalar()
