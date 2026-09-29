@@ -87,7 +87,7 @@ async def test_llm_only_called_when_result_changes(db, monkeypatch):
 
     # 결과가 같다 → 규칙 판정 한 번, LLM 없음, None
     monkeypatch.setattr(arrival_watcher, "orchestrate",
-                        lambda d, dr, l, r: fake_orchestrate(d, dr, l, r, True))
+                        lambda d, dr, l, r, **kw: fake_orchestrate(d, dr, l, r, True))
     got = await arrival_watcher.judge_with_llm_on_change(
         db, None, real_llm, None, call_sign=CALL_SIGN, stage=stage)
     assert got is None
@@ -96,7 +96,7 @@ async def test_llm_only_called_when_result_changes(db, monkeypatch):
     # 결과가 바뀌었다 → 규칙 판정 뒤 실제 LLM 으로 다시
     used.clear()
     monkeypatch.setattr(arrival_watcher, "orchestrate",
-                        lambda d, dr, l, r: fake_orchestrate(d, dr, l, r, False))
+                        lambda d, dr, l, r, **kw: fake_orchestrate(d, dr, l, r, False))
     got = await arrival_watcher.judge_with_llm_on_change(
         db, None, real_llm, None, call_sign=CALL_SIGN, stage=stage)
     assert got is not None and got.evidence_missing is False

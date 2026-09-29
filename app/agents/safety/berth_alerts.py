@@ -227,6 +227,9 @@ async def _segregation_alerts(rows: list[dict], driver: AsyncDriver) -> list[dic
         }
 
         name_of = {c["chem_id"]: (c["cargo_name"] or c["chem_id"]) for c in identified}
+        carriers = {}
+        for c in identified:
+            carriers.setdefault(c["chem_id"], set()).add(c["callsgn"])
         for raw in raw_conflicts + raw_imdg + unconfirmed_imdg + raw_bulk:
             other_id = raw["chem_id"]
             floor = pair_floor[other_id]
@@ -238,14 +241,29 @@ async def _segregation_alerts(rows: list[dict], driver: AsyncDriver) -> list[dic
                 continue
             seen.add(pair)
 
+            # [2026-09-29] 두 화물을 **한 배만** 싣고 있으면 부두 안의 두 배가 아니라 선내 적재다.
+            #   안전 에이전트(service._compute_onboard_conflicts)와 같이 '주의 — 격리 적재 확인'으로
+            #   둔다(IBC Code 3.1.3: 격리해 실으면 한 선박 적재는 허용). 예전엔 같은 배 화물끼리도
+            #   '→ 배정불가'로 올라, 같은 카드에 '배정불가'와 판정 '주의'가 나란히 떴다(GOLDEN DENISE).
+            ships = carriers.get(target["chem_id"], set()) | carriers.get(other_id, set())
+            onboard_only = (
+                len(ships) == 1 and None not in ships
+                and carriers.get(target["chem_id"]) == carriers.get(other_id)
+            )
+            if onboard_only:
+                floor = RiskLevel.CAUTION
+
             target_name = target["cargo_name"] or target["chem_id"]
             other_name = raw.get("name_ko") or name_of.get(other_id, other_id)
             if "segregation_code" in raw:
                 why = f"IMDG 격리코드 {raw['segregation_code']}"
             elif "reason" in raw:
-                why = f"벌크호환성그룹(참고) — {raw['reason']}"
+                # 46 CFR 150 호환성은 안전 에이전트 판정의 근거다(verdict_basis) — '참고'가 아니다.
+                why = f"46 CFR 150 호환성 그룹 — {raw['reason']}"
             else:
                 why = f"혼재금지({raw.get('category', '분류 미상')})"
+            if onboard_only:
+                why += " (같은 선박 적재 — 격리 적재 확인 필요)"
 
             pairs_by_berth.setdefault(berth, []).append({
                 "level": _RISK_TO_ALERT[floor],
@@ -450,15 +468,25 @@ async def _draught_alerts(db: AsyncSession) -> list[dict]:
 # 관제사가 알아야 하는 건 '배정 실패'가 아니라 **'지금 자리가 조건에 안 맞는 배'** 다.
 #
 # 배 1척당 최신 판정 1건만 본다. 이력 전체를 펼치면 같은 배가 화면에 여러 번 뜬다.
+#
+# [2026-09-29] 최신 판정을 **먼저** 고른 뒤 '적합'을 거른다. 예전엔 거꾸로라, 판정불가 → 적합으로
+# 바뀐 배의 옛 판정불가가 경고로 남았다(실측: STI SUPREME — 선박 판정 표는 '적합', 경고는 '판정불가').
+# '현재'의 조건은 approvals._QUERY_PENDING 과 같다 — 항내에 있거나 24시간 안에 판정된 배.
 _QUERY_ACTIVE_ASSESSMENTS = text("""
-    SELECT DISTINCT ON (call_sign)
-           call_sign, vessel_name, stage, wharf_name, level, action, recipient,
-           reasons, assessed_at_utc
-    FROM assessment_history
+    WITH latest AS (
+        SELECT DISTINCT ON (call_sign)
+               call_sign, vessel_name, stage, wharf_name, level, action, recipient,
+               reasons, assessed_at_utc
+        FROM assessment_history
+        ORDER BY call_sign, assessed_at_utc DESC
+    ), present AS (
+        SELECT DISTINCT upper(btrim(callsgn)) AS cs FROM mart.vessel_presence
+    )
+    SELECT * FROM latest l
     WHERE level <> '적합'
-      -- 오래된 판정은 경고가 아니라 이력이다. 그 배는 이미 떠났을 수 있다.
-      AND assessed_at_utc > now() - interval '24 hours'
-    ORDER BY call_sign, assessed_at_utc DESC
+      -- 오래된 판정은 경고가 아니라 이력이다 — 그 배가 아직 항내에 있을 때만 남긴다.
+      AND (assessed_at_utc > now() - interval '24 hours'
+           OR EXISTS (SELECT 1 FROM present p WHERE p.cs = upper(btrim(l.call_sign))))
 """)
 
 # 판정 등급 -> 경고 심각도. '판정불가'를 WARNING 으로 두는 것이 핵심이다 —
@@ -491,7 +519,9 @@ async def _assessment_alerts(db: AsyncSession) -> list[dict]:
     for row in rows:
         who = row["vessel_name"] or row["call_sign"]
         where = row["wharf_name"] or "계류시설 미상"
-        head = (row["reasons"] or [""])[0]
+        # 9/29 이전 판정 문장은 "배정된 선석은…"이다(주어를 출처대로 바꾸기 전). 판정은 바뀔 때만
+        # 기록되므로 그대로인 배는 옛 문장이 남는다 — 우리는 배정하지 않으므로 보일 때만 고친다(기록은 그대로).
+        head = (row["reasons"] or [""])[0].replace("배정된 선석", "이 선석")
         # 조치안이 있으면 받을 곳까지 적는다. 우리가 실행하지 않는다는 뜻이 문장에 남는다.
         tail = f" → {row['action']} 검토 필요({row['recipient']})" if row["action"] else ""
         out.append({

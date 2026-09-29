@@ -344,8 +344,9 @@ async def _answer_operations(
     return ChatResponse(
         answer=_enforce_assessment_level(llm_answer.answer, assessment, llm_answer.conclusion_level),
         intent=Intent.OPERATIONS,
-        confidence=(
-            Confidence.LOW if llm_answer.data_insufficient or not found_any else Confidence.HIGH
+        confidence=_operational_confidence(
+            found_any=found_any, has_assessment=assessment is not None,
+            data_insufficient=llm_answer.data_insufficient,
         ),
         chemicals_resolved=resolved,
         safety_actions=llm_answer.safety_actions,
@@ -356,6 +357,20 @@ async def _answer_operations(
         operational_evidence=evidence,
         tools_used=tools_used,
     )
+
+
+def _operational_confidence(*, found_any: bool, has_assessment: bool, data_insufficient: bool) -> Confidence:
+    """운영 질문의 신뢰도 (2026-09-29, _compute_confidence 와 같은 원칙).
+
+    규칙 엔진 판정이 있으면 결론의 근거는 확정돼 있다 — 가상의 배("가솔린 실은 배 옆에 질산")처럼 현황에서
+    배를 못 찾았어도 '낮음'이 아니다. 판정 칸은 '규정 기준으로 확정'인데 바로 아래가 '신뢰도 낮음(근거 부족)'
+    이라 서로 반대로 읽혔다(실측). 모델이 자료 부족이라 하면 '보통'까지만 내린다.
+    """
+    if not (found_any or has_assessment):
+        return Confidence.LOW
+    if data_insufficient:
+        return Confidence.MEDIUM if has_assessment else Confidence.LOW
+    return Confidence.HIGH
 
 
 async def _operational_segregation(
@@ -762,8 +777,13 @@ def _compute_confidence(
 ) -> Confidence:
     """근거의 종류로 신뢰도를 정한다. LLM에게 자기 확신도를 묻지 않는다 —
     환각한 답변일수록 스스로 high를 주는 경향이 있어 신호로 쓸 수 없다."""
-    if data_insufficient or not (chunks or assessment or groups):
+    if not (chunks or assessment or groups):
         return Confidence.LOW
+    # [2026-09-29] 모델이 '자료 부족'이라 해도 규칙 엔진 판정(assessment·혼재금지 그룹)이 있으면 결론의
+    #   근거는 확정돼 있다 — 판정 칸은 '규칙으로 확정'인데 바로 아래가 '신뢰도 낮음(근거 부족)'이라 서로
+    #   반대로 읽혔다(실측: 가솔린↔질산). 서술 쪽 자료가 부족하다는 뜻으로 '보통'까지만 내린다.
+    if data_insufficient:
+        return Confidence.MEDIUM if (assessment is not None or groups) else Confidence.LOW
 
     # 물질 해석이 흔들리면 그 위에 쌓인 모든 근거가 흔들린다.
     weak_match = any(

@@ -1,137 +1,63 @@
 """오케스트레이터 최종 종합 의견 프롬프트.
 
-의사결정 자체(선석 선택, 배정불가 재탐색, 기상 중단)는 이미 결정적 로직으로
-끝난 뒤에 호출된다 — LLM은 그 결과를 관제사가 읽기 좋은 문장으로 요약할 뿐,
-승인/거부 판단을 새로 내리지 않는다.
+의사결정(선석 확인, 기상 중단, 혼재 부적합)은 이미 결정적 로직으로 끝난 뒤에 호출된다 —
+LLM 은 그 결과를 관제사가 읽기 좋은 문장으로 다시 정리할 뿐, 판단을 새로 내리지 않는다.
+
+[2026-09-29] 입력을 '확정된 판정 사실'로만 바꿨다. 예전엔 순위·배정 경로·탈락 후보·점유 상태를
+넘기고 "선석 추천 이유를 설명하라"고 시켜, 31건 중 28건에 "최적 배정 확정" 같은 없는 사실이
+나왔고 혼재 '주의'의 원인을 화물 유해성으로 바꿔 썼다. 지금은 등급·등급 이유(코드)·축별 결론·
+확인 필요·조건·대체 제안만 넘긴다. 비어 있는 칸은 아예 넘기지 않는다 — 넘기면 "(해당 없음)"을
+문장에 옮겨 적었다(실측).
 """
 
-from datetime import timedelta, timezone
-
-from app.agents.safety.schemas import SafetyAssessmentResult
-from app.agents.scheduling.schemas import BerthCandidate, VesselSpec
-from app.agents.weather.schemas import WeatherAssessmentResult
-
-from .schemas import RejectedCandidate
-
-_KST = timezone(timedelta(hours=9))
+from .schemas import OrchestratorRequest, OrchestratorResult
 
 SYSTEM_PROMPT = """\
-당신은 울산항 액체화물 하역 관제를 보조하는 AI입니다.
-스케줄링·안전관제·기상분석 세 에이전트가 이미 결정한 결과가 아래에 주어집니다.
-당신은 새로운 판단을 내리지 말고, 주어진 결과만 근거로 아래 두 가지를 JSON으로 작성하세요.
-
-1. summary — 관제사가 바로 읽을 수 있는 1~2문단 한국어 종합 의견. 선석 추천 이유,
-   위험등급과 핵심 사유, 기상 상태(및 예보 악화 경고가 있다면 그 내용)를 자연스럽게
-   엮어서 설명하세요.
-
-2. berth_match_summary — 선석 배정현황 화면에서 "이 선석이 왜 이 배와 맞는가"만
-   보여줄 별도의 짧은 한 문장. [최종 추천 선석]·[선박 정보]·[배정 경로]·
-   [재탐색 과정에서 탈락한 후보]·[기상 상태]를 전부 활용해서, 수심 대비 흘수가
-   얼마나 여유 있는지뿐 아니라 전용/대체 중 어느 경로로 확정됐는지, 대체라면
-   원래 선석은 왜 안 됐는지, 기상 임계값을 통과했는지까지 근거를 다양하게
-   엮으세요. **수심 얘기 하나로 문장을 끝내지 마세요** — 주어진 항목 중 최소
-   2가지 이상을 언급해야 합니다. **[안전관제 결과]는 이 문장에 절대 쓰지 마세요**
-   — 화학물질 이름·위험등급·유해성 언급이 하나라도 들어가면 안 됩니다. 그
-   정보는 summary에만 담깁니다.
+당신은 울산항 액체화물 하역 관제 화면의 '종합 의견' 문장을 쓰는 보조자입니다.
+[판정 사실]은 규칙 엔진이 확정한 내용입니다. 새로 판단하지 말고 관제사가 한눈에 읽도록 정리만 하세요.
+1. 1~2문장, 120자 이내 한국어. 존댓말 평서문.
+2. 등급 단어('적합'·'주의' 등)나 '최종 등급'으로 시작하지 마세요 — 화면이 등급을 따로 크게 보여줍니다.
+   첫 문장은 [등급 이유]를 그대로 풀어 쓰세요. 이유를 바꾸거나 더하지 마세요.
+3. [확인 필요]가 주어지면 그 항목을 빠짐없이 관제사가 확인할 일로 한 문장에 담으세요.
+4. 주어진 사실과 숫자만 쓰세요. 없는 원인·조치·예측을 만들지 마세요.
+5. 선석을 추천·선정하는 말('추천', '최적', '확정', '선정', '배정')을 쓰지 말고 다른 선석으로 옮기라고 권하지 마세요.
+   단 [등급 이유]의 '배정된 선석'(PORT-MIS 사전배정 사실)은 그대로 옮겨도 됩니다.
+   [대체 선석 제안]이 주어졌을 때만 '제안'으로 언급하세요.
+6. 화물 자체의 일반 유해성(인화성·독성 등)은 쓰지 마세요 — 화면의 별도 칸에 있습니다.
+7. 문제가 없는 축은 하나하나 나열하지 말고 '선석·기상·혼재 모두 기준 안'처럼 묶으세요.
+   적합인 축의 수치(흘수 여유·풍속 등)는 다시 적지 마세요 — 화면이 축별로 이미 보여줍니다.
+   단 근거가 '비교 대상 없음'인 축은 기준 안으로 묶지 말고 비교할 대상이 없었다고 그대로 쓰세요.
+8. 입력의 대괄호 제목([등급 이유] 등)을 문장에 옮겨 적지 마세요.
 """
 
 
-def _format_weather(weather: WeatherAssessmentResult, *, is_global_fallback: bool = False) -> str:
-    label = "현재 상태(전역 기본값 — 이 후보의 배정 실패 사유가 아닐 수 있음)" if is_global_fallback else "현재 상태"
-    lines = [f"{label}: {weather.status.value}"]
-    if weather.forecast_warning:
-        fw = weather.forecast_warning
-        if fw.will_deteriorate:
-            deteriorate_at_kst = (
-                fw.earliest_deterioration_at_utc.astimezone(_KST).strftime("%m월 %d일 %H:%M")
-                if fw.earliest_deterioration_at_utc
-                else "미상"
-            )
-            lines.append(
-                f"예보 경고: {deteriorate_at_kst}(KST)부터 {fw.worst_status.value} 수준으로 악화 예상"
-            )
-        else:
-            lines.append("예보 경고: 하역 완료 예정 시각까지 악화 없음")
+# 위 규칙 5의 금지어. 우리는 선석을 배정·추천하지 않고 검증만 한다 — 프롬프트로 막아도 모델이 가끔
+# "최종 추천 선석인 ○○는"처럼 쓴다(9/28 판정 기록 실측). 이 말이 든 문장은 코드가 템플릿으로 바꾼다.
+ASSIGNMENT_WORDS = ("추천", "최적", "확정", "선정", "배정")
+
+
+def _axis_level(o) -> str:
+    # 이웃 화물이 없어 비교를 못 한 혼재 축은 '적합'이 아니라 '비교 대상 없음'으로 넘긴다 — '적합'으로
+    # 넘기면 규칙으로 막아도 "혼재 모두 기준 안"으로 묶었다(실측 10건 중 4건).
+    if o.level == "적합" and any("비교 대상 없음" in e for e in o.evidence):
+        return "비교 대상 없음"
+    return o.level
+
+
+def build_user_prompt(result: OrchestratorResult, request: OrchestratorRequest) -> str:
+    lines = [
+        f"[대상] {request.vessel.name_hint or '선박'} / {request.assigned_wharf_name}",
+        f"[등급] {result.level}",
+        f"[등급 이유] {result.headline}",
+        "[축별 결론]",
+        *(f"- {o.axis}: {_axis_level(o)} — {' · '.join(o.evidence[:3]) or '근거 없음'}" for o in result.opinions),
+    ]
+    if result.needs_check:
+        lines += ["[확인 필요]", *(f"- {m}" for m in result.needs_check)]
+    if result.conditions:
+        lines += ["[조건]", *(f"- {c}" for c in result.conditions)]
+    if result.suggested_alternatives:
+        lines += ["[대체 선석 제안]", ", ".join(
+            f"{c.wharf_name}(흘수 여유 {c.draught_margin_m:.1f}m)" for c in result.suggested_alternatives
+        )]
     return "\n".join(lines)
-
-
-def _format_safety(safety: SafetyAssessmentResult | None) -> str:
-    if safety is None:
-        return "(안전관제 미실시)"
-    return (
-        f"위험등급: {safety.risk_level.value}\n"
-        f"핵심 유해성: {', '.join(safety.key_hazards) if safety.key_hazards else '없음'}\n"
-        f"판단 근거: {safety.reasoning}"
-    )
-
-
-def _format_rejected(rejected: list[RejectedCandidate]) -> str:
-    if not rejected:
-        return "(없음)"
-    return "\n".join(f"  - {r.rank}순위 {r.berth_id}: {r.reason}" for r in rejected)
-
-
-def _format_vessel(vessel: VesselSpec | None) -> str:
-    if vessel is None:
-        return "(정보 없음)"
-    parts = [f"흘수 {vessel.draught_m}m"]
-    if vessel.dwt_t is not None:
-        parts.append(f"DWT {vessel.dwt_t:,.0f}t")
-    if vessel.name_hint:
-        parts.append(vessel.name_hint)
-    return " · ".join(parts)
-
-
-def build_user_prompt(
-    *,
-    selected_berth: BerthCandidate | None,
-    safety: SafetyAssessmentResult | None,
-    weather: WeatherAssessmentResult,
-    rejected_candidates: list[RejectedCandidate],
-    vessel: VesselSpec | None = None,
-    assignment_trace: list[str] | None = None,
-    is_global_fallback_weather: bool = False,
-) -> str:
-    # berth_match_summary가 "수심 얘기만" 나오던 원인이 여기였다(2026-08-19 지적) —
-    # 예전엔 이 함수가 draught_margin_m 하나만 문장으로 만들어 넘겼다. LLM은 준
-    # 것만 쓸 수 있으므로, 선석 스펙 전체(수심·정원·기상그룹)와 선박 스펙,
-    # 전용/대체 판단 경로까지 전부 명시적으로 넘긴다.
-    if selected_berth:
-        berth_lines = [
-            f"{selected_berth.rank}순위 {selected_berth.wharf_name}"
-            f"({selected_berth.port_name or '항만 미상'})",
-            f"수심 {selected_berth.depth_m}m · 흘수여유 {selected_berth.draught_margin_m:.1f}m"
-            f" · 배정 전 상태 {selected_berth.occupancy_status.value}",
-        ]
-        if selected_berth.berth_group:
-            berth_lines.append(f"기상 임계값 그룹: {selected_berth.berth_group}")
-        if selected_berth.unload_capacity is not None:
-            berth_lines.append(f"하역능력: {selected_berth.unload_capacity}")
-        berth_desc = "\n".join(berth_lines)
-    else:
-        berth_desc = "(추천 선석 없음)"
-
-    trace_desc = " → ".join(assignment_trace) if assignment_trace else "(단일 후보, 재탐색 없음)"
-
-    return f"""\
-[최종 추천 선석]
-{berth_desc}
-
-[선박 정보]
-{_format_vessel(vessel)}
-
-[배정 경로]
-{trace_desc}
-
-[안전관제 결과]
-{_format_safety(safety)}
-
-[기상 상태]
-{_format_weather(weather, is_global_fallback=is_global_fallback_weather)}
-
-[재탐색 과정에서 탈락한 후보]
-{_format_rejected(rejected_candidates)}
-
-위 정보를 종합해 summary와 berth_match_summary를 JSON으로 응답하세요.
-berth_match_summary에는 [안전관제 결과] 내용을 쓰지 마세요.
-"""

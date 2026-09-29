@@ -47,6 +47,25 @@ async def resolve_cargo(db: AsyncSession, ref: CargoRef) -> MsdsChemical:
     return await get_by_chem_id(db, ref.chem_id)
 
 
+def ghs_classification(msds_payload: dict | None) -> list[tuple[str, str]]:
+    """MSDS 2절 '유해성·위험성 분류'(B02)를 [(분류명, 구분), ...] 로 (2026-09-29).
+
+    원문 예: "인화성 액체 : 구분3|발암성 : 구분2|특정표적장기 독성(1회 노출) : 구분3(호흡기 자극)".
+    """
+    data = ((msds_payload or {}).get("detail02") or {}).get("data") or []
+    for item in data:
+        if item.get("msdsItemCode") != "B02":
+            continue
+        out = []
+        for part in (item.get("itemDetail") or "").split("|"):
+            # 마지막 콜론으로 자른다 — 분류명 자체에 콜론이 있다("급성 독성(흡입: 증기) : 구분4").
+            name, _, grade = part.rpartition(":")
+            if name.strip() and grade.strip():
+                out.append((name.strip(), grade.strip()))
+        return out
+    return []
+
+
 def summarize_hazard_sections(msds_payload: dict) -> dict[str, list[str]]:
     """관련 섹션에서 itemDetail 텍스트만 뽑아 { 섹션키: [문장, ...] } 형태로 반환."""
     summary: dict[str, list[str]] = {}

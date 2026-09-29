@@ -49,9 +49,14 @@ PORT-MIS 신고 선석을 넣으세요. [2026-09-27] 선석을 새로 고르는 
 배정은 항만공사 선석회의가 하고, 우리는 그 배정이 조건에 맞는지 확인합니다. 다른 자리가
 필요하면 `POST /scheduling/alternatives`(대체 선석 제안)를 쓰세요.
 
-**`overall_decision`** 은 아직 배정 주체의 어휘(`승인가능`/`적합선석없음` …)로 나옵니다.
-화면에 그대로 쓰지 마세요 — `assessment_history.level`(적합/주의/부적합/판정불가)로
-옮겨진 값을 쓰거나, `/orchestrator/assess-and-record` 를 부르면 그 변환까지 끝납니다.
+**`overall_decision`** 은 아직 배정 주체의 어휘(`적합`/`적합선석없음` …)로 나옵니다.
+화면에 그대로 쓰지 마세요 — **`level`**(적합/주의/부적합/판정불가)을 쓰세요. 판정 기록
+(`assessment_history.level`)과 같은 함수로 정한 값입니다. `headline` 은 그 등급의 이유,
+`needs_check` 는 판정에 쓰지 못한 근거(확인 필요)입니다.
+
+`target_source`(AIS/PORT-MIS)를 주면 판정 문구가 "지금 접안한 선석"/"배정된 선석"으로
+갈립니다. `vessel.call_sign` 을 주면 PORT-MIS 신고 계류시설을 읽어 실제 접안 부두와 다를 때
+판정 경로에 한 줄 남깁니다.
 
 `assignment_trace`는 판단 경로를 사람이 읽는 문장으로 담습니다.
 
@@ -68,6 +73,12 @@ _RESPONSES: dict = {
 async def _orchestrate_or_http(
     db: AsyncSession, llm_client: LLMClient, request: OrchestratorRequest,
 ) -> OrchestratorResult:
+    # [2026-09-29] 실제 접안 부두로 판정할 때 PORT-MIS 신고 계류시설을 함께 넘긴다 — 둘이 다르면
+    # 판정 경로에 신고값이 한 줄 남는다. 콘솔은 신고값을 모르므로 호출부호로 여기서 읽는다.
+    if request.reported_wharf_name is None and request.vessel.call_sign:
+        live = (await db.execute(_QUERY_LIVE_STATE, {"call_sign": request.vessel.call_sign})).mappings().first()
+        if live and live["facility_name"]:
+            request = request.model_copy(update={"reported_wharf_name": live["facility_name"]})
     try:
         return await orchestrate(db, neo4j_client.driver, llm_client, request)
     except MsdsNotFoundError as e:
@@ -107,6 +118,11 @@ async def assess(
 class AssessAndRecordRequest(OrchestratorRequest):
     call_sign: str = Field(description="선박 호출부호 — 판정 행의 식별 키")
     vessel_name: str | None = None
+    port_call_key: str | None = Field(
+        default=None,
+        description="[2026-09-29] 어느 입항 건의 판정인가(예: 'DSPC6_2026_011'). 입항 판정 화면의 행이 넘긴다. "
+        "비우면 mart.vessel_current_call 의 지금 입항 건. 화면은 같은 입항 건의 기록만 그 행에 붙인다.",
+    )
 
 
 # 시점(stage)은 AIS 항해상태로만 정한다 — 프런트가 보낸 값을 믿지 않고 여기서 읽는다.
@@ -129,6 +145,10 @@ _QUERY_LIVE_STATE = text("""
     ORDER BY dc.received_at_utc DESC NULLS LAST
     LIMIT 1
 """)
+
+_QUERY_CURRENT_CALL_KEY = text(
+    "SELECT port_call_key FROM mart.vessel_current_call WHERE callsgn = upper(btrim(:call_sign))"
+)
 
 
 class AssessAndRecordResult(BaseModel):
@@ -157,6 +177,9 @@ async def assess_and_record(
 
     live = (await db.execute(_QUERY_LIVE_STATE, {"call_sign": request.call_sign})).mappings().first()
     stage = stage_from_nav_status(live["nav_status_code"] if live else None)
+    port_call_key = request.port_call_key or (
+        await db.execute(_QUERY_CURRENT_CALL_KEY, {"call_sign": request.call_sign})
+    ).scalar()
 
     recorded = await record_from_orchestrator(
         db,
@@ -176,6 +199,7 @@ async def assess_and_record(
             ),
             "draught_m": float(request.vessel.draught_m) if request.vessel.draught_m else None,
             "requested_at_utc": datetime.now(timezone.utc).isoformat(),
+            "port_call_key": port_call_key,
         },
     )
     await db.commit()
