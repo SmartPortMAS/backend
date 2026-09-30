@@ -424,14 +424,20 @@ async def find_assessability_facts(
 #   가장 가까운 거리만 남긴다(min) — 같은 부두쌍이 여러 줄로 불어나지 않게.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# [2026-09-30] 대상(부두·화물)마다 한 번씩 부르던 것을 대상 목록 한 번으로 묶었다 — 운영(Aura)은
+#   왕복이 약 300ms 라 대상 74개가 캐시 빈 관제 경고를 7.6초 붙잡았다. 대상 하나의 탐색·반환 행·
+#   정렬 키는 예전 그대로이고, 결과를 대상 순번(i)으로 나눠 돌려준다.
 _CYPHER_ADJACENT_BERTH_CONFLICTS = """
-MATCH (here:Berth {wharf_name: $wharf_name})-[adj:ADJACENT_TO]->(nb:Berth)
-WHERE nb.wharf_name <> $wharf_name
-WITH nb.wharf_name AS neighbor_wharf, min(adj.distance_m) AS distance_m
+UNWIND range(0, size($targets) - 1) AS i
+CALL (i) {
+WITH $targets[i].wharf_name AS wharf_name, $targets[i].target AS target
+MATCH (here:Berth {wharf_name: wharf_name})-[adj:ADJACENT_TO]->(nb:Berth)
+WHERE nb.wharf_name <> wharf_name
+WITH wharf_name, target, nb.wharf_name AS neighbor_wharf, min(adj.distance_m) AS distance_m
 UNWIND $neighbor_cargo AS nc
-WITH neighbor_wharf, distance_m, nc
+WITH wharf_name, target, neighbor_wharf, distance_m, nc
 WHERE nc.wharf_name = neighbor_wharf
-MATCH (a:Chemical {id: $target})
+MATCH (a:Chemical {id: target})
 MATCH (b:Chemical {id: nc.chem_id})
 // 충돌 근거 세 갈래를 한 서브쿼리로 합친다. 근거가 다른 신호라 어느 하나로
 // 대체할 수 없다 — MSDS 텍스트 마이닝 2방향(비대칭이라 양쪽을 다 봐야 한다.
@@ -462,7 +468,7 @@ RETURN DISTINCT
     via                                  AS via,
     code                                 AS segregation_code,
     direction                            AS direction,
-    $wharf_name + ' —인접(' +
+    wharf_name + ' —인접(' +
         CASE WHEN distance_m IS NULL THEN '거리 미상'
              ELSE toString(toInteger(round(distance_m))) + 'm' END +
         ')→ ' + neighbor_wharf +
@@ -471,21 +477,25 @@ RETURN DISTINCT
                    WHEN 'MSDS_INCOMPATIBLE' THEN '혼재금지(' + via + ')'
                    ELSE 'IMDG격리(' + via + ' → ' + coalesce(code, '?') + ')'
                END +
-        '→ ' + coalesce(a.name_ko, $target)  AS path_text
+        '→ ' + coalesce(a.name_ko, target)  AS path_text
+}
+RETURN i, neighbor_wharf, distance_m, chem_id, name_ko, callsgn, basis, via,
+       segregation_code, direction, path_text
 // 거리 미상(SK5~8 처럼 좌표 없이 부두번호로 이은 쌍)은 맨 뒤로. Cypher 는
 // ORDER BY ... NULLS LAST 를 안 받아서 정렬 키를 직접 만든다.
-ORDER BY coalesce(distance_m, 1000000.0), neighbor_wharf, chem_id
+ORDER BY i, coalesce(distance_m, 1000000.0), neighbor_wharf, chem_id
 """
 
 
 async def find_adjacent_berth_conflicts(
     driver: AsyncDriver,
     *,
-    wharf_name: str,
-    target_chem_id: str,
+    targets: list[tuple[str, str]],
     neighbor_cargo: list[dict],
-) -> list[dict]:
-    """대상 화물 하나에 대해 **인접 부두** 재항 화물과의 충돌을 한 번에 찾는다.
+) -> list[list[dict]]:
+    """대상 (부두, 화물) 각각에 대해 **인접 부두** 재항 화물과의 충돌을 한 번에 찾는다.
+
+    반환은 targets 와 같은 순서·같은 길이의 목록이고, 각 원소가 그 대상의 충돌 행이다.
 
     neighbor_cargo 는 호출부가 이미 읽어 둔 재항 현황 그대로 넘긴다 —
     각 항목은 최소한 {"wharf_name", "chem_id"} 를 갖고, "callsgn"·"cargo_name"
@@ -494,8 +504,15 @@ async def find_adjacent_berth_conflicts(
     반환 행에는 `path_text`(그래프가 만든 경로 문장)가 들어 있다. 화면·프롬프트는
     이 문장을 그대로 쓰면 되고, 근거를 다시 조립하지 않는다.
     """
-    if not wharf_name or not target_chem_id or not neighbor_cargo:
-        return []
+    out: list[list[dict]] = [[] for _ in targets]
+    # 부두나 화물이 빈 대상은 예전처럼 조회 없이 빈 결과
+    query_targets = [
+        {"wharf_name": w, "target": t, "idx": n}
+        for n, (w, t) in enumerate(targets)
+        if w and t
+    ]
+    if not query_targets or not neighbor_cargo:
+        return out
 
     payload = [
         {
@@ -508,17 +525,19 @@ async def find_adjacent_berth_conflicts(
         if c.get("wharf_name") and c.get("chem_id")
     ]
     if not payload:
-        return []
+        return out
 
     async with driver.session() as session:
 
         async def _tx(tx):
             result = await tx.run(
                 _CYPHER_ADJACENT_BERTH_CONFLICTS,
-                wharf_name=wharf_name,
-                target=target_chem_id,
+                targets=query_targets,
                 neighbor_cargo=payload,
             )
             return [record.data() async for record in result]
 
-        return await session.execute_read(_tx)
+        rows = await session.execute_read(_tx)
+    for row in rows:
+        out[query_targets[row.pop("i")]["idx"]].append(row)
+    return out
