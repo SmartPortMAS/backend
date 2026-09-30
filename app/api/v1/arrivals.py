@@ -32,11 +32,28 @@ _QUERY_UPCOMING = text("""
                pv.agency_name, pv.prev_port_nm, pv.entry_purpose_nm,
                pv.arrival_at_utc, pv.departure_sched_utc, pv.arrival_report_type,
                pv.arrival_facility_cd, pv.arrival_facility_nm, pv.collected_at_utc,
-               pv.entry_year, pv.entry_count
+               pv.entry_year, pv.entry_count,
+               CASE WHEN pv.entry_year IS NOT NULL AND pv.entry_count IS NOT NULL
+                    THEN upper(btrim(pv.callsgn)) || '_' || pv.entry_year::text || '_' || lpad(pv.entry_count::text, 3, '0')
+               END AS port_call_key
         FROM portmis_vessel pv
         WHERE pv.is_liquid_cargo_vessel
           AND pv.arrival_at_utc BETWEEN now() - make_interval(hours => :past_hours)
                                     AND now() + make_interval(hours => :ahead_hours)
+    ),
+    -- [2026-09-25] 이 입항 건(콜사인·입항연도·입항횟수)에 단 화물 전부. 입항 후
+    -- 위치 화면(mart.vessel_current_call 경유)과 같은 키라 같은 화물이 나온다.
+    -- [2026-09-30] 행마다 LATERAL 로 cargo_msds 를 다시 훑던 것(100건 × 23ms)을 한 번 집계로 바꿈.
+    cg AS (
+        SELECT cm.port_call_key,
+               json_agg(json_build_object(
+                   'name', coalesce(cm.msds_name_ko, cm.cargo_name_raw),
+                   'un_no', cm.dg_un_no, 'chem_id', cm.chem_id,
+                   'cas_no', cm.cas_no, 'is_synthetic', cm.is_synthetic
+               ) ORDER BY (cm.chem_id IS NULL), cm.bl_no) AS cargos
+        FROM mart.cargo_msds cm
+        WHERE cm.port_call_key IN (SELECT port_call_key FROM arr)
+        GROUP BY cm.port_call_key
     ),
     fac AS (
         SELECT DISTINCT ON (source_name) source_name, wharf_name, facility_type
@@ -85,30 +102,18 @@ _QUERY_UPCOMING = text("""
            a.collected_at_utc,
            cg.cargos,
            -- [2026-09-29] 이 행의 입항 건 키와 판정 잡이 지금 보는 입항 건 키. 판정 기록은 같은 입항 건 것만 붙인다.
-           CASE WHEN a.entry_year IS NOT NULL AND a.entry_count IS NOT NULL
-                THEN upper(btrim(a.callsgn)) || '_' || a.entry_year::text || '_' || lpad(a.entry_count::text, 3, '0')
-           END AS port_call_key,
-           (SELECT vc.port_call_key FROM mart.vessel_current_call vc
-            WHERE vc.callsgn = upper(btrim(a.callsgn))) AS current_call_key
+           a.port_call_key,
+           vc.port_call_key AS current_call_key
     FROM arr a
     LEFT JOIN fac f ON f.source_name = a.arrival_facility_nm
     LEFT JOIN berth b ON b.wharf_name = f.wharf_name
     LEFT JOIN pos p ON p.cs = upper(btrim(a.callsgn))
     LEFT JOIN draught d ON d.cs = upper(btrim(a.callsgn))
     LEFT JOIN spec s ON s.cs = upper(btrim(a.callsgn))
-    -- [2026-09-25] 이 입항 건(콜사인·입항연도·입항횟수)에 단 화물 전부. 입항 후
-    -- 위치 화면(mart.vessel_current_call 경유)과 같은 키라 같은 화물이 나온다.
-    LEFT JOIN LATERAL (
-        SELECT json_agg(json_build_object(
-                   'name', coalesce(cm.msds_name_ko, cm.cargo_name_raw),
-                   'un_no', cm.dg_un_no, 'chem_id', cm.chem_id,
-                   'cas_no', cm.cas_no, 'is_synthetic', cm.is_synthetic
-               ) ORDER BY (cm.chem_id IS NULL), cm.bl_no) AS cargos
-        FROM mart.cargo_msds cm
-        WHERE a.entry_year IS NOT NULL AND a.entry_count IS NOT NULL
-          AND cm.port_call_key = upper(btrim(a.callsgn)) || '_' || a.entry_year::text
-                                 || '_' || lpad(a.entry_count::text, 3, '0')
-    ) cg ON true
+    LEFT JOIN cg ON cg.port_call_key = a.port_call_key
+    -- [2026-09-30] 상관 서브쿼리로 행마다 뷰를 다시 계산하던 것(100건 × 20ms)을 조인으로 바꿈.
+    --   vessel_current_call 은 콜사인당 1행(스칼라 서브쿼리였으므로)이라 행 수가 늘지 않는다.
+    LEFT JOIN mart.vessel_current_call vc ON vc.callsgn = upper(btrim(a.callsgn))
     ORDER BY a.arrival_at_utc
 """)
 

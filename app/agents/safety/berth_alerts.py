@@ -24,15 +24,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .bulk_compatibility import build_bulk_conflicts
-from .graph_queries import (
-    find_adjacent_berth_conflicts,
-    find_bulk_exceptions,
-    find_bulk_group_conflicts,
-    find_bulk_groups,
-    find_imdg_no_segregation_required,
-    find_imdg_segregation_conflicts,
-    find_incompatible_conflicts,
-)
+from .graph_queries import find_adjacent_berth_conflicts
+from .graph_snapshot import get_snapshot
 from .rule_engine import (
     compute_bulk_compatibility_floor,
     compute_imdg_berth_adjacency_floor,
@@ -86,26 +79,22 @@ _NEO4J_CONCURRENCY = 8
 async def _segregation_facts(
     driver: AsyncDriver, sem: asyncio.Semaphore, target_id: str, other_ids: list[str]
 ) -> tuple:
-    """대상 화물 하나의 혼재 판정에 필요한 그래프 조회 결과(판정은 하지 않는다)."""
-    async with sem:
-        return (
-            await find_incompatible_conflicts(
-                driver, target_chem_id=target_id, adjacent_chem_ids=other_ids
-            ),
-            await find_imdg_segregation_conflicts(
-                driver, target_chem_id=target_id, adjacent_chem_ids=other_ids
-            ),
-            await find_imdg_no_segregation_required(
-                driver, target_chem_id=target_id, adjacent_chem_ids=other_ids
-            ),
-            await find_bulk_group_conflicts(
-                driver, target_chem_id=target_id, adjacent_chem_ids=other_ids
-            ),
-            await find_bulk_groups(driver, chem_ids=[target_id, *other_ids]),
-            await find_bulk_exceptions(
-                driver, target_chem_id=target_id, adjacent_chem_ids=other_ids
-            ),
-        )
+    """대상 화물 하나의 혼재 판정에 필요한 그래프 조회 결과(판정은 하지 않는다).
+
+    [2026-09-30] Neo4j 조회 6개 → 메모리 사본(graph_snapshot). service.assess_safety 가 9/29 에
+    옮겨 간 것과 같은 사본·같은 답이다(tests/test_graph_snapshot_20260929.py). 운영(Aura)에서
+    대상 수십 개 × 조회 6개가 캐시 빈 첫 화면을 30초 붙잡았다. sem 은 테스트가 바꿔 끼우는
+    시그니처를 지키려고 남겨 둔다(쓰지 않음).
+    """
+    graph = await get_snapshot(driver)
+    return (
+        graph.incompatible_conflicts(target_id, other_ids),
+        graph.imdg_segregation_conflicts(target_id, other_ids),
+        graph.imdg_no_segregation_required(target_id, other_ids),
+        graph.bulk_group_conflicts(target_id, other_ids),
+        graph.bulk_groups([target_id, *other_ids]),
+        graph.bulk_exceptions(target_id, other_ids),
+    )
 
 
 async def _segregation_alerts(rows: list[dict], driver: AsyncDriver) -> list[dict]:
@@ -349,21 +338,15 @@ async def _adjacent_berth_alerts(rows: list[dict], driver: AsyncDriver) -> list[
     seen: set[frozenset] = set()
     alerts: list[dict] = []
 
-    # 조회는 동시에, 판정은 원래 순서대로(_segregation_alerts 와 같은 이유)
+    # 조회는 한 번에(대상 전부), 판정은 원래 순서대로(_segregation_alerts 와 같은 이유)
     targets = [
         (wharf, target)
         for wharf, cargos in by_wharf.items()
         for target in {c["chem_id"]: c for c in cargos}.values()
     ]
-    sem = asyncio.Semaphore(_NEO4J_CONCURRENCY)
-
-    async def _hits(wharf: str, target_id: str) -> list[dict]:
-        async with sem:
-            return await find_adjacent_berth_conflicts(
-                driver, wharf_name=wharf, target_chem_id=target_id, neighbor_cargo=cargo
-            )
-
-    all_hits = await asyncio.gather(*(_hits(w, t["chem_id"]) for w, t in targets))
+    all_hits = await find_adjacent_berth_conflicts(
+        driver, targets=[(w, t["chem_id"]) for w, t in targets], neighbor_cargo=cargo
+    )
 
     for (wharf, target), hits in zip(targets, all_hits):
         for hit in hits:
